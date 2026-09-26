@@ -524,6 +524,10 @@ class WindowManager {
         actionDispatcher.refocusScratchpad = { [weak self] in
             self?.scratchpad.refocusMember(reason: "ensureInvariant-scratchpad")
         }
+        actionDispatcher.admitToScratchpad = { [weak self] w in self?.scratchpad.admitNewWindow(w) ?? false }
+        actionDispatcher.scratchpadDiscovery = { [weak self] gone, returned in
+            self?.scratchpad.noteDiscovery(goneIDs: gone, returned: returned)
+        }
         actionDispatcher.saveLayout = { [weak self] in self?.saveLayoutSnapshot(manual: true) }
         actionDispatcher.restoreLayout = { [weak self] in self?.restoreLayoutSnapshot(manual: true) }
 
@@ -1019,7 +1023,7 @@ class WindowManager {
             if self.scratchpad.isVisible {
                 let cgPoint = CGPoint(x: downNS.x,
                                       y: self.displayManager.primaryScreenHeight - downNS.y)
-                self.scratchpad.handleMouseDown(atCG: cgPoint)
+                self.scratchpad.handleMouseDown(atCG: cgPoint, synthetic: Self.isOwnSyntheticEvent(event))
             }
         }
         // when the user drags a floating window, its frame changes 60Hz but our
@@ -1628,6 +1632,10 @@ class WindowManager {
             case .focusFloating:
                 scratchpad.cycleSummoned()
                 return
+            case .launchApp(let bundleID):
+                // an app with a member up: focus the member. activating the
+                // app would bring its other windows forward over the scrim
+                if scratchpad.focusMember(ofBundleID: bundleID) { return }
             default:
                 break
             }
@@ -2226,7 +2234,7 @@ class WindowManager {
 
     private func visibleFloatingWindows() -> [HyprWindow] {
         stateCache.floatingWindowIDs.compactMap { id in
-            guard workspaceManager.isWindowVisible(id) else { return nil }
+            guard isInteractive(id) else { return nil }
             return stateCache.cachedWindows[id]
         }
     }
@@ -3128,7 +3136,7 @@ private extension WindowManager {
     private func makeTiledDragHandler() -> TiledDragHandler {
         TiledDragHandler(
             capture: { [weak self] point, publish in
-                guard let self, self.isRunning, !self.scratchpad.isVisible,
+                guard let self, self.isRunning,
                       let screen = self.exactScreen(containing: point) else {
                     return .ineligible(.noTarget)
                 }
@@ -3141,9 +3149,9 @@ private extension WindowManager {
                         let matches = self.displayManager.screens.filter {
                             self.tiledDragDisplayID($0) == displayID
                         }
-                        guard matches.count == 1, let screen = matches.first else { return nil }
-                        return (self.workspaceManager.workspaceForScreen(screen), screen,
-                                self.stateCache.floatingWindowIDs)
+                        guard matches.count == 1, let screen = matches.first,
+                              let workspace = self.tiledDragWorkspace(on: screen) else { return nil }
+                        return (workspace, screen, self.stateCache.floatingWindowIDs)
                     },
                     onCapturedFrames: publish)
             },
@@ -3180,11 +3188,22 @@ private extension WindowManager {
             tiledDragDisplayID($0) == snapshot.context.physicalDisplayID
         }
         guard screens.count == 1, let screen = screens.first,
-              workspaceManager.workspaceForScreen(screen) == snapshot.context.workspace,
+              tiledDragWorkspace(on: screen) == snapshot.context.workspace,
               snapshot.context.memberIDs.allSatisfy({
                   workspaceManager.workspaceFor($0) == snapshot.context.workspace
               }) else { return nil }
         return (snapshot.context.workspace, screen, stateCache.floatingWindowIDs)
+    }
+
+    /// The workspace a tiled drag on `screen` works in: the scratchpad's
+    /// tree while it's up on that monitor, nil on the other monitors then
+    /// (their tiles are under the scrim), else the screen's workspace.
+    private func tiledDragWorkspace(on screen: NSScreen) -> Int? {
+        if let layer = scratchpad.visibleLayer {
+            guard tiledDragDisplayID(layer.screen) == tiledDragDisplayID(screen) else { return nil }
+            return ScratchpadController.workspace
+        }
+        return workspaceManager.workspaceForScreen(screen)
     }
 
     private func tiledDragDisplayID(_ screen: NSScreen) -> CGDirectDisplayID {
@@ -3235,6 +3254,9 @@ private extension WindowManager {
         switch completion.outcome {
         case .superseded, .ignored: return
         case .committed, .rejectedRestored, .degraded: break
+        }
+        if completion.snapshot.context.workspace == ScratchpadController.workspace {
+            scratchpad.syncTiledFrames()
         }
         // the same per-window decisions the tiled-position cache just
         // applied, so the two cannot drift apart

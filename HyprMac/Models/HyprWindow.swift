@@ -287,6 +287,12 @@ class HyprWindow: Equatable, Hashable {
         AXUIElementPerformAction(element, kAXRaiseAction as CFString)
     }
 
+    /// Make this the app's main window without raising or activating, so
+    /// a later activation brings this window forward and not another one.
+    func makeMain() {
+        AXUIElementSetAttributeValue(element, kAXMainAttribute as CFString, kCFBooleanTrue)
+    }
+
     /// Bring this window forward and give it keyboard focus, raising
     /// it above the other windows of its app and activating the app
     /// itself if it is not already frontmost.

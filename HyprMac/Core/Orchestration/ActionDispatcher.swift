@@ -98,6 +98,10 @@ final class ActionDispatcher {
     var scratchpadLayoutChanged: () -> Void = {}
     // focus a summoned member (the scratchpad's own fallback)
     var refocusScratchpad: () -> Void = {}
+    // a new window the scratchpad takes (a member app's Cmd-N)
+    var admitToScratchpad: (HyprWindow) -> Bool = { _ in false }
+    // members closed, minimized or came back
+    var scratchpadDiscovery: (Set<CGWindowID>, [HyprWindow]) -> Void = { _, _ in }
     var saveLayout: () -> Void = {}
     var restoreLayout: () -> Void = {}
 
@@ -155,6 +159,12 @@ final class ActionDispatcher {
             tilingEngine.forgetAdmittedIdentity(windowID: w.windowID)
         }
 
+        // a member app's new window joins the scratchpad while it's up. the
+        // admission below skips ws-0 windows
+        for w in changes.newWindows where !changes.newOnDisabledMonitor.contains(w.windowID) {
+            _ = admitToScratchpad(w)
+        }
+
         // workspace assignment for new windows that didn't auto-float onto a
         // disabled monitor. assigning by physical screen — cursor-based was
         // unreliable under multi-monitor + display-reconfig churn.
@@ -177,6 +187,9 @@ final class ActionDispatcher {
         for id in changes.goneIDs {
             tilingEngine.removeWindowID(id)
         }
+        // the workspace retile below skips the scratchpad's tree, so the layer
+        // re-lays its own members here
+        scratchpadDiscovery(changes.goneIDs, changes.returned)
 
         // apply cross-screen drift reassignments.
         for drift in changes.screenDrift {

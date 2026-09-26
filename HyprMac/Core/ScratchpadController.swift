@@ -120,6 +120,114 @@ final class ScratchpadController {
         w.focus()
         focusController.recordFocus(w.windowID, reason: reason)
         updateFocusBorder(w)
+        restackLayer()
+    }
+
+    /// Hypr+Return and friends for an app that has a member on screen:
+    /// focus that member. Activating the app would bring its other windows
+    /// forward over the scrim. Returns false when the app has no member up.
+    func focusMember(ofBundleID bundleID: String) -> Bool {
+        guard isVisible else { return false }
+        let pids = Set(NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+            .map(\.processIdentifier))
+        let owners = stateCache.windowOwners
+        let owned = { (id: CGWindowID) in owners[id].map(pids.contains) ?? false }
+        let id = mruOrder.first { summonedIDs.contains($0) && owned($0) }
+            ?? summonedIDs.sorted().first(where: owned)
+        guard let id, let w = stateCache.cachedWindows[id] else { return false }
+        w.focus()
+        noteFocus(id)
+        focusController.recordFocus(id, reason: "scratchpad-launch-focus")
+        updateFocusBorder(w)
+        restackLayer()
+        return true
+    }
+
+    /// A window a member app opened while the layer is up (Cmd-N) joins the
+    /// layer, as it would join the focused workspace. Same entry rule as a
+    /// send: tiled when tile-by-default is on and it fits, else floating.
+    /// Returns false when the window stays with the ordinary admission.
+    func admitNewWindow(_ window: HyprWindow) -> Bool {
+        guard isVisible, !window.isQuickLookPanel, memberPIDs.contains(window.ownerPID),
+              !contains(window.windowID) else { return false }
+        let id = window.windowID
+        workspaceManager.assignWindow(id, toWorkspace: Self.workspace)
+        summonedIDs.insert(id)
+        let autoFloated = stateCache.floatingWindowIDs.contains(id)
+        if tileNewMembers && !autoFloated {
+            saveFreeFormFrame(window, fallback: window.frame)
+            window.isFloating = false
+            if !tileIntoVisibleLayer(window) {
+                stateCache.floatingWindowIDs.insert(id)
+                window.isFloating = true
+                hyprLog(.notice, .lifecycle, "scratchpad: no slot for new '\(window.title ?? "?")' (\(id)) — floating")
+            }
+        } else {
+            stateCache.floatingWindowIDs.insert(id)
+            window.isFloating = true
+        }
+        if !isTiled(id), let frame = window.frame {
+            lastShownFrames[id] = frame
+        }
+        window.raise()
+        noteFocus(id)
+        focusController.recordFocus(id, reason: "scratchpad-new-window")
+        updateFocusBorder(window)
+        restackLayer()
+        hyprLog(.notice, .lifecycle, "scratchpad: new window '\(window.title ?? "?")' (\(id)) joined the layer")
+        return true
+    }
+
+    /// Discovery saw members close, minimize or come back. A gone member
+    /// leaves the layer and the rest re-lay to fill its slot; focus moves to
+    /// another member when it was the focused one. A returning member rejoins
+    /// the layer while it's up, and goes back to its park spot while it's
+    /// down.
+    func noteDiscovery(goneIDs: Set<CGWindowID>, returned: [HyprWindow]) {
+        let returning = returned.filter { contains($0.windowID) }
+        if !isVisible {
+            if let parkScreen = displayManager.screens.first {
+                for w in returning { workspaceManager.hideInCorner(w, on: parkScreen) }
+            }
+            return
+        }
+        let goneMembers = summonedIDs.intersection(goneIDs)
+        let back = returning.filter { !summonedIDs.contains($0.windowID) }
+        guard !goneMembers.isEmpty || !back.isEmpty else { return }
+
+        let focusedGone = goneMembers.contains(focusController.lastFocusedID)
+            || goneMembers.contains(focusBorder.trackedWindowID ?? 0)
+        summonedIDs.subtract(goneMembers)
+        for id in goneMembers { lastShownFrames.removeValue(forKey: id) }
+
+        let screen = layerScreen()
+        for w in back {
+            summonedIDs.insert(w.windowID)
+            if !isTiled(w.windowID), let screen {
+                let base = workspaceManager.savedFloatingFrame(for: w.windowID) ?? w.frame ?? .zero
+                if base != .zero {
+                    lastShownFrames[w.windowID] = w.placeFloating(
+                        carriedRect(base, to: displayManager.cgRect(for: screen)),
+                        reason: "scratchpad return", on: screen, displayManager: displayManager)
+                }
+            }
+            w.raise()
+        }
+
+        if summonedIDs.isEmpty {
+            // every member closed: nothing left to show
+            workspaceManager.scratchpadVisible = false
+            lastShownFrames = [:]
+            shownScreen = nil
+            updatePositionCache()
+            refocusUnderCursor()
+            hyprLog(.notice, .lifecycle, "scratchpad: last member closed — layer dropped")
+            return
+        }
+        retileLayer()
+        if focusedGone { refocusMember(reason: "scratchpad-member-closed") } else { restackLayer() }
+        updatePositionCache()
+        hyprLog(.notice, .lifecycle, "scratchpad: members gone=\(goneMembers.sorted()) back=\(back.map(\.windowID).sorted()) — layer re-laid")
     }
     var members: Set<CGWindowID> { workspaceManager.windowIDs(onWorkspace: Self.workspace) }
     func contains(_ id: CGWindowID) -> Bool {
@@ -255,6 +363,9 @@ final class ScratchpadController {
             let pid = w.ownerPID
             guard pid != headPID, !activatedPIDs.contains(pid) else { continue }
             activatedPIDs.insert(pid)
+            // activation brings the app's main window forward. make that the
+            // member, not one of the app's windows on the workspace behind
+            w.makeMain()
             NSRunningApplication(processIdentifier: pid)?
                 .activate(options: [.activateIgnoringOtherApps])
         }
@@ -602,9 +713,13 @@ final class ScratchpadController {
     /// the same runloop tick so the click lands on the tile it was aimed
     /// at. Containment is judged against the placed frame as well as the
     /// live read — right after show() the live read still lags.
-    func handleMouseDown(atCG point: CGPoint) {
+    func handleMouseDown(atCG point: CGPoint, synthetic: Bool) {
         guard isVisible else { return }
-        guard Date().timeIntervalSince(shownAt) > showGraceSec else { return }
+        // HyprMac's own clicks (hover focus) are never the user leaving.
+        // a real click outside is, even during the show grace: the scrim
+        // lets it through, and the window it lands on would take focus
+        // with the layer still up
+        guard !synthetic else { return }
         for id in summonedIDs {
             if let f = stateCache.cachedWindows[id]?.frame, f.contains(point) {
                 noteFocus(id)
@@ -625,7 +740,12 @@ final class ScratchpadController {
         guard isVisible else { return }
         guard pid != ProcessInfo.processInfo.processIdentifier else { return }
         guard bundleID != "com.apple.dock" else { return }
-        guard !ownsPID(pid) else { return }
+        guard !ownsPID(pid) else {
+            // a member app came forward, possibly with one of its windows
+            // from the workspace behind
+            restackLayer()
+            return
+        }
         guard Date().timeIntervalSince(shownAt) > showGraceSec else { return }
         hide(reason: .activationChange)
     }
@@ -675,14 +795,52 @@ final class ScratchpadController {
         guard isVisible, !summonedIDs.isEmpty else { return }
         guard let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID)
                 as? [[String: Any]] else { return }
+        let ownPID = ProcessInfo.processInfo.processIdentifier
         var backmost: CGWindowID?
+        // a member app's other window stacked above a member, which the scrim
+        // would leave lit. raise that app's members back over it
+        var intruderPIDs = Set<pid_t>()
+        var pending = Set<pid_t>()
         for w in info {
             guard let layer = w[kCGWindowLayer as String] as? Int, layer == 0,
-                  let id = w[kCGWindowNumber as String] as? CGWindowID else { continue }
+                  let id = w[kCGWindowNumber as String] as? CGWindowID,
+                  let pid = (w[kCGWindowOwnerPID as String] as? Int).map(pid_t.init),
+                  pid != ownPID else { continue }
             // front→back list: the last summoned id seen is the backmost
-            if summonedIDs.contains(id) { backmost = id }
+            if summonedIDs.contains(id) {
+                backmost = id
+                intruderPIDs.formUnion(pending)
+                pending = []
+            } else if memberPIDs.contains(pid),
+                      let ws = workspaceManager.workspaceFor(id), ws != Self.workspace {
+                // a managed window of a regular workspace. unmanaged panels of
+                // a member app (a settings window) are left where they are
+                pending.insert(pid)
+            }
+        }
+        if !intruderPIDs.isEmpty {
+            for id in mruOrder.reversed() where summonedIDs.contains(id) {
+                guard let w = stateCache.cachedWindows[id], intruderPIDs.contains(w.ownerPID) else { continue }
+                w.raise()
+            }
+            hyprLog(.notice, .lifecycle, "scratchpad: raised members over their apps' other windows (pids \(intruderPIDs.sorted()))")
         }
         if let backmost { lowerScrimBelow(backmost) }
+    }
+
+    /// Owners of the members on screen.
+    private var memberPIDs: Set<pid_t> {
+        Set(summonedIDs.compactMap { stateCache.windowOwners[$0] })
+    }
+
+    /// Re-run the stacking settle a few times. Activations and raises land
+    /// asynchronously, so one pass can run before the reorder it answers.
+    func restackLayer() {
+        for delay in [0.05, 0.3, 0.8] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.settleScrimBelowMembers()
+            }
+        }
     }
 
     /// The monitor the tiled region and layer retiles key off. Prefers the

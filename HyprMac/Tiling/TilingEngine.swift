@@ -732,7 +732,8 @@ class TilingEngine {
         return TiledDragOccluderContext(
             workspace: location.workspace,
             physicalDisplayID: displayID,
-            usableFrame: displayManager.cgRect(for: screen),
+            usableFrame: layoutRect(for: TilingKey(workspace: location.workspace, screen: screen),
+                                    screen: screen),
             floatingIDs: location.floatingIDs)
     }
 
@@ -822,7 +823,7 @@ class TilingEngine {
         return TiledDragContext(
             workspace: workspace,
             physicalDisplayID: physicalDisplayID(for: currentScreen),
-            usableFrame: displayManager.cgRect(for: currentScreen),
+            usableFrame: layoutRect(for: key, screen: currentScreen),
             gap: gapSize,
             padding: outerPadding,
             maxDepth: maxDepth(for: currentScreen),

@@ -21,7 +21,6 @@ enum TiledDragMode {
 enum TiledDragRejection: Equatable {
     case notTiled
     case floating
-    case scratchpad
     case invalidTarget
     case maxDepthExceeded
     case noTarget
@@ -84,9 +83,6 @@ struct TiledDragTransaction {
         guard currentContext() == context,
               tree.structuralFingerprint() == context.fingerprint else {
             return .unknown(.superseded)
-        }
-        guard context.workspace != TilingEngine.scratchpadWorkspace else {
-            return .ineligible(.scratchpad)
         }
         guard context.floatingIDs.isDisjoint(with: context.memberIDs) else {
             return .ineligible(.floating)
@@ -154,9 +150,6 @@ struct TiledDragTransaction {
         guard currentContext() == context,
               tree.structuralFingerprint() == context.fingerprint else {
             return .unknown(.superseded)
-        }
-        guard context.workspace != TilingEngine.scratchpadWorkspace else {
-            return .ineligible(.scratchpad)
         }
         guard !context.floatingIDs.contains(draggedID) else {
             return .ineligible(.floating)
