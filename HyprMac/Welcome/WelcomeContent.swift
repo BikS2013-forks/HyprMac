@@ -26,15 +26,31 @@ enum WhatsNewFeatures {
     // update this before each release — see docs/release.md
     static let current: [WhatsNewFeature] = [
         WhatsNewFeature(
-            icon: "square.and.arrow.down.on.square",
-            title: "Saved Layouts",
-            description: "Hypr+Ctrl+S saves which workspace every window is on and how each one is split, across all your monitors. Hypr+Ctrl+R puts it back, and plugging a saved display setup back in restores it on its own.",
-            credit: "@joops"
+            icon: "rectangle.split.2x2",
+            title: "Steadier Tiling",
+            description: "Windows land in their tiles far more reliably. A move between monitors sizes the window first, a window that doesn't fit goes back where it was, and nothing gets shuffled while your Mac is locked or asleep."
         ),
         WhatsNewFeature(
             icon: "keyboard",
-            title: "A Balanced Keybind List",
-            description: "Hypr+K now spreads its shortcuts evenly: window management on the left, apps and system in the middle, workspaces and focus on the right."
+            title: "A Searchable Keybind List",
+            description: "Hypr+K opens one scrolling list with a search bar. Start typing to find a shortcut, or use the arrow keys to scroll."
+        ),
+        WhatsNewFeature(
+            icon: "arrow.up.right.square.fill",
+            title: "Move and Follow",
+            description: "Hypr+Ctrl+Shift+N moves the focused window to workspace N and takes you there with it."
+        ),
+        WhatsNewFeature(
+            icon: "square.stack",
+            title: "A Scratchpad That Tiles",
+            description: "The scratchpad works like its own workspace. Focus, swaps, resizes and drags stay inside it, and the windows behind it can't take focus.",
+            tint: .magenta
+        ),
+        WhatsNewFeature(
+            icon: "macwindow.on.rectangle",
+            title: "Floaters Stay on Top",
+            description: "Floating windows stay above the tile you click, and Quick Look previews float instead of tiling.",
+            tint: .magenta
         ),
     ]
 }

@@ -3,17 +3,22 @@ import XCTest
 import Carbon
 
 final class WelcomeContentTests: XCTestCase {
-    func testWhatsNewDescribesOnlyThe0150Changes() {
+    func testWhatsNewDescribesOnlyThe0160Changes() {
         let features = WhatsNewFeatures.current
 
         XCTAssertEqual(features.map(\.title), [
-            "Saved Layouts",
-            "A Balanced Keybind List"
+            "Steadier Tiling",
+            "A Searchable Keybind List",
+            "Move and Follow",
+            "A Scratchpad That Tiles",
+            "Floaters Stay on Top"
         ])
-        XCTAssertEqual(features[0].credit, "@joops")
-        XCTAssertTrue(features[0].description.contains("Hypr+Ctrl+S"))
-        XCTAssertNil(features[1].credit)
-        XCTAssertFalse(features.map(\.title).contains("A New Look"))
+        XCTAssertTrue(features.allSatisfy { $0.credit == nil })
+        XCTAssertTrue(features[1].description.contains("Hypr+K"))
+        XCTAssertTrue(features[2].description.contains("Hypr+Ctrl+Shift+N"))
+        XCTAssertEqual(features.filter { $0.tint == .magenta }.map(\.title),
+                       ["A Scratchpad That Tiles", "Floaters Stay on Top"])
+        XCTAssertFalse(features.map(\.title).contains("A Balanced Keybind List"))
         XCTAssertEqual(WelcomeContent.productURL.absoluteString, "https://hyprmac.app/")
     }
 
