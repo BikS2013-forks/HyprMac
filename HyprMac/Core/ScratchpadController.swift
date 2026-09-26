@@ -393,7 +393,9 @@ final class ScratchpadController {
         // scrim panels can beat even an activation reorder. repeatedly tuck
         // the scrim directly below the backmost member until the stack
         // converges — idempotent, own windows only, no activation churn.
-        for delay in [0.15, 0.45, 0.9] {
+        // the first pass lands right after head.focus() re-asserts (50 ms),
+        // so a member left under the previously active app is lifted at once
+        for delay in [0.07, 0.15, 0.45, 0.9] {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 self?.settleScrimBelowMembers()
             }
@@ -798,36 +800,53 @@ final class ScratchpadController {
                 as? [[String: Any]] else { return }
         let ownPID = ProcessInfo.processInfo.processIdentifier
         var backmost: CGWindowID?
-        // a member app's other window stacked above a member, which the scrim
-        // would leave lit. raise that app's members back over it
-        var intruderPIDs = Set<pid_t>()
-        var pending = Set<pid_t>()
+        // managed windows of a regular workspace seen so far, front to back.
+        // one that overlaps a member further down is on top of it, and the
+        // scrim, tucked under the backmost member, would leave it lit there
+        var above: [(id: CGWindowID, bounds: CGRect)] = []
+        var covered: [CGWindowID: [CGWindowID]] = [:]
         for w in info {
             guard let layer = w[kCGWindowLayer as String] as? Int, layer == 0,
                   let id = w[kCGWindowNumber as String] as? CGWindowID,
                   let pid = (w[kCGWindowOwnerPID as String] as? Int).map(pid_t.init),
                   pid != ownPID else { continue }
+            let bounds = (w[kCGWindowBounds as String] as? NSDictionary)
+                .flatMap { CGRect(dictionaryRepresentation: $0 as CFDictionary) } ?? .zero
             // front→back list: the last summoned id seen is the backmost
             if summonedIDs.contains(id) {
                 backmost = id
-                intruderPIDs.formUnion(pending)
-                pending = []
-            } else if memberPIDs.contains(pid),
-                      let ws = workspaceManager.workspaceFor(id), ws != Self.workspace {
-                // a managed window of a regular workspace. unmanaged panels of
-                // a member app (a settings window) are left where they are
-                pending.insert(pid)
+                let over = above.filter { $0.bounds.intersects(bounds) }.map(\.id)
+                if !over.isEmpty { covered[id] = over }
+            } else if let ws = workspaceManager.workspaceFor(id), ws != Self.workspace {
+                // unmanaged windows (a member app's settings panel, system
+                // panels) are left where they are
+                above.append((id, bounds))
             }
         }
-        if !intruderPIDs.isEmpty {
-            for id in mruOrder.reversed() where summonedIDs.contains(id) {
-                guard let w = stateCache.cachedWindows[id], intruderPIDs.contains(w.ownerPID) else { continue }
-                w.raise()
-            }
-            hyprLog(.notice, .lifecycle, "scratchpad: raised members over their apps' other windows (pids \(intruderPIDs.sorted()))")
+        if !covered.isEmpty {
+            let desc = covered.keys.sorted().map { "\($0) under \(covered[$0] ?? [])" }.joined(separator: ", ")
+            hyprLog(.notice, .lifecycle, "scratchpad: \(desc) — raising members")
+            raiseMembers()
             enforceFocus()
         }
         if let backmost { lowerScrimBelow(backmost) }
+    }
+
+    /// Raise every member back to front: tiled under floating, the most
+    /// recent last within each. AXRaise only reorders another app's windows
+    /// for the frontmost app, so while a non-member app is frontmost (the
+    /// window under the cursor when the layer came up, say) the head's app
+    /// is activated first. A member only its app's main window came forward
+    /// with stays under that app until then.
+    private func raiseMembers() {
+        if let front = NSWorkspace.shared.frontmostApplication?.processIdentifier,
+           !memberPIDs.contains(front) {
+            focusTarget?.focus()
+        }
+        let ordered = mruOrder.reversed().filter { summonedIDs.contains($0) }
+        for id in ordered.filter({ isTiled($0) }) + ordered.filter({ !isTiled($0) }) {
+            stateCache.cachedWindows[id]?.raise()
+        }
     }
 
     /// Keystrokes belong to a member while the layer is up. An app can move
