@@ -92,6 +92,12 @@ final class ActionDispatcher {
     }
     var toggleScratchpad: () -> Void = {}
     var moveToScratchpad: () -> Void = {}
+    // the scratchpad layer while it's up. directional actions stay inside it
+    var scratchpadLayer: () -> ScratchpadController.Layer? = { nil }
+    // the engine re-laid the layer's tree
+    var scratchpadLayoutChanged: () -> Void = {}
+    // focus a summoned member (the scratchpad's own fallback)
+    var refocusScratchpad: () -> Void = {}
     var saveLayout: () -> Void = {}
     var restoreLayout: () -> Void = {}
 
@@ -400,6 +406,17 @@ final class ActionDispatcher {
             hyprLog(.notice, .focus, "focus invariant skipped: popup wid=\(popup.windowID) layer=\(popup.layer)")
             return
         }
+        // the screen's workspace is the one under the scrim while the
+        // scratchpad is up. focus stays on a member
+        if let layer = scratchpadLayer() {
+            if let focused = accessibility.getFocusedWindow(), layer.members.contains(focused.windowID) {
+                focusController.recordFocus(focused.windowID, reason: "ensureInvariant-scratchpad")
+                updateFocusBorder(focused)
+            } else {
+                refocusScratchpad()
+            }
+            return
+        }
         let screen = screenUnderCursor()
         guard !workspaceManager.isMonitorDisabled(screen) else { return }
         let workspace = workspaceManager.workspaceForScreen(screen)
@@ -438,12 +455,15 @@ final class ActionDispatcher {
 
     /// Move keyboard focus to the nearest visible tiled window in
     /// `direction`. Floating windows and hidden-corner windows are
-    /// excluded from the candidate set.
+    /// excluded from the candidate set. While the scratchpad is up only its
+    /// tiled members are candidates; the workspace under the scrim is out.
     private func focusInDirection(_ direction: Direction) {
         guard let focused = currentFocusedWindow() else { return }
+        let layer = scratchpadLayer()
         // only consider windows on visible workspaces — hidden corner windows must be excluded
         let windows = accessibility.getAllWindows().filter {
-            workspaceManager.isWindowVisible($0.windowID) && !stateCache.floatingWindowIDs.contains($0.windowID)
+            (layer?.members.contains($0.windowID) ?? workspaceManager.isWindowVisible($0.windowID))
+                && !stateCache.floatingWindowIDs.contains($0.windowID)
         }
 
         // use BSP-computed intended rects so a crammed (oversized) source
@@ -488,18 +508,19 @@ final class ActionDispatcher {
     private func swapInDirection(_ direction: Direction) {
         guard let focused = currentFocusedWindow() else { return }
         guard !stateCache.floatingWindowIDs.contains(focused.windowID) else { return }
-        guard let screen = displayManager.screen(for: focused) ?? displayManager.screens.first else { return }
-        let workspace = workspaceManager.workspaceForScreen(screen)
+        guard let (workspace, screen) = tilingContext(for: focused) else { return }
+        let layer = scratchpadLayer()
         // restrict swap candidates to focused's (workspace, screen) tree.
         // canSwapWindows already requires both windows in the same tree, so
         // a cross-monitor candidate would be rejected anyway — but having
         // the picker pre-filter means it can't drift into a cross-monitor
         // pick when same-monitor candidates are tied (e.g., a full-width
-        // source with two adjacent windows directly below).
-        let windows = accessibility.getAllWindows().filter {
-            workspaceManager.isWindowVisible($0.windowID)
-                && !stateCache.floatingWindowIDs.contains($0.windowID)
-                && displayManager.screen(for: $0) == screen
+        // source with two adjacent windows directly below). in the
+        // scratchpad the tree is the layer's members.
+        let windows = accessibility.getAllWindows().filter { w in
+            !stateCache.floatingWindowIDs.contains(w.windowID)
+                && (layer?.members.contains(w.windowID)
+                    ?? (workspaceManager.isWindowVisible(w.windowID) && displayManager.screen(for: w) == screen))
         }
 
         // intended tile rects — see focusInDirection for rationale.
@@ -522,8 +543,23 @@ final class ActionDispatcher {
             updatePositionCache()
             return
         }
+        if layer != nil { scratchpadLayoutChanged() }
         cursorManager.warpToCenter(of: focused)
         updatePositionCache()
+    }
+
+    /// The `(workspace, screen)` tree `window` tiles in: the scratchpad
+    /// layer's while it's up, else its screen's visible workspace. nil for a
+    /// window outside the layer while the layer is up. Resolving the screen's
+    /// workspace there would act on the tree under the scrim, and a swap
+    /// would report no room because the layer member isn't in that tree.
+    private func tilingContext(for window: HyprWindow) -> (workspace: Int, screen: NSScreen)? {
+        if let layer = scratchpadLayer() {
+            guard layer.members.contains(window.windowID) else { return nil }
+            return (ScratchpadController.workspace, layer.screen)
+        }
+        guard let screen = displayManager.screen(for: window) ?? displayManager.screens.first else { return nil }
+        return (workspaceManager.workspaceForScreen(screen), screen)
     }
 
     /// Beep and flash a red border around `window` when a keyboard swap is
@@ -625,22 +661,22 @@ final class ActionDispatcher {
     private func resizeInDirection(_ direction: Direction) {
         guard let focused = currentFocusedWindow(),
               !stateCache.floatingWindowIDs.contains(focused.windowID),
-              let screen = displayManager.screen(for: focused) ?? displayManager.screens.first else { return }
-        let workspace = workspaceManager.workspaceForScreen(screen)
+              let (workspace, screen) = tilingContext(for: focused) else { return }
 
         tilingEngine.resizeInDirection(focused, direction: direction, onWorkspace: workspace, screen: screen)
+        if workspace == ScratchpadController.workspace { scratchpadLayoutChanged() }
         updatePositionCache()
     }
 
     /// Toggle the BSP split direction at the focused leaf's parent.
     private func toggleSplit() {
         guard let focused = currentFocusedWindow(),
-              let screen = displayManager.screen(for: focused) ?? displayManager.screens.first else { return }
-        let workspace = workspaceManager.workspaceForScreen(screen)
+              let (workspace, screen) = tilingContext(for: focused) else { return }
 
         hyprLog(.debug, .orchestration, "toggleSplit on '\(focused.title ?? "?")'")
 
         tilingEngine.toggleSplit(focused, onWorkspace: workspace, screen: screen)
+        if workspace == ScratchpadController.workspace { scratchpadLayoutChanged() }
         updatePositionCache()
     }
 }

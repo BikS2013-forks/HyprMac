@@ -91,6 +91,36 @@ final class ScratchpadController {
     private var shownScreen: NSScreen?
 
     var isVisible: Bool { workspaceManager.scratchpadVisible }
+
+    /// The layer while it's up: its monitor and the members on screen.
+    /// Directional focus, swap, resize and split stay inside it.
+    struct Layer {
+        let screen: NSScreen
+        let members: Set<CGWindowID>
+    }
+
+    var visibleLayer: Layer? {
+        guard isVisible, let screen = layerScreen() else { return nil }
+        return Layer(screen: screen, members: summonedIDs)
+    }
+
+    /// The member focus belongs to when it has nowhere better to go: the
+    /// most recent summoned member, else any summoned member.
+    var focusTarget: HyprWindow? {
+        guard isVisible else { return nil }
+        let recent = mruOrder.first { summonedIDs.contains($0) && stateCache.cachedWindows[$0] != nil }
+        let id = recent ?? summonedIDs.sorted().first { stateCache.cachedWindows[$0] != nil }
+        return id.flatMap { stateCache.cachedWindows[$0] }
+    }
+
+    /// Put focus back on a member. Anything else would lift a window from
+    /// the workspace under the scrim, or hand macOS the choice.
+    func refocusMember(reason: String) {
+        guard let w = focusTarget else { return }
+        w.focus()
+        focusController.recordFocus(w.windowID, reason: reason)
+        updateFocusBorder(w)
+    }
     var members: Set<CGWindowID> { workspaceManager.windowIDs(onWorkspace: Self.workspace) }
     func contains(_ id: CGWindowID) -> Bool {
         workspaceManager.workspaceFor(id) == Self.workspace
@@ -621,6 +651,11 @@ final class ScratchpadController {
         } else if isVisible && wasSummoned {
             // a tiled member may have died — close the gap in the layer tree.
             retileLayer()
+            // the focused member closed: focus the next member before macOS
+            // promotes the app's next window, which may sit under the scrim
+            if focusController.lastFocusedID == id || focusBorder.trackedWindowID == id {
+                refocusMember(reason: "scratchpad-member-gone")
+            }
             updatePositionCache()
         }
     }
@@ -714,7 +749,15 @@ final class ScratchpadController {
             .filter { isTiled($0) }
             .compactMap { stateCache.cachedWindows[$0] }
         tilingEngine.tileScratchpad(tiledMembers, screen: screen, in: region)
-        let rects = tilingEngine.scratchpadTileRects(screen: screen, in: region)
+        syncTiledFrames()
+    }
+
+    /// Re-read the tiled members' slots after the engine re-laid the layer
+    /// (a retile, swap, resize or split toggle). Click containment and the
+    /// eject read `lastShownFrames`.
+    func syncTiledFrames() {
+        guard isVisible, let screen = layerScreen() else { return }
+        let rects = tilingEngine.scratchpadTileRects(screen: screen, in: tiledRegion(on: screen))
         for id in summonedIDs where isTiled(id) {
             if let r = rects[id] { lastShownFrames[id] = r }
         }
