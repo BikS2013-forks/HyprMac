@@ -150,13 +150,14 @@ final class TiledDragTransactionTests: XCTestCase {
         XCTAssertTrue(fake.writes.isEmpty)
     }
 
-    func testCaptureScratchpadIsIneligibleAndNeverWrites() {
+    func testCaptureInTheScratchpadWorksLikeAnyWorkspaceAndNeverWrites() {
+        // the layer's tiles drag and swap like a workspace's
         let (tree, _, context) = fixture()
         let fake = FakeAX(frames: layoutFrames(tree, context))
         let changed = replacing(context, workspace: TilingEngine.scratchpadWorkspace)
-        guard case .ineligible(.scratchpad) = TiledDragTransaction(ioFactory: fake.factory).capture(
+        guard case .captured = TiledDragTransaction(ioFactory: fake.factory).capture(
             draggedID: 1, tree: tree, context: changed, generation: 1,
-            currentContext: { changed }) else { return XCTFail("scratchpad capture must be ineligible") }
+            currentContext: { changed }) else { return XCTFail("scratchpad capture must be captured") }
         XCTAssertTrue(fake.writes.isEmpty)
     }
 
@@ -249,16 +250,18 @@ final class TiledDragTransactionTests: XCTestCase {
         XCTAssertEqual(fake.reads, 0)
     }
 
-    func testPointerCaptureRejectsScratchpadContext() {
+    func testPointerCaptureInTheScratchpadContext() {
         let (tree, _, base) = fixture()
         let context = replacing(base, workspace: TilingEngine.scratchpadWorkspace)
-        let fake = FakeAX(frames: layoutFrames(tree, context))
-        guard case .ineligible(.scratchpad) = TiledDragTransaction(ioFactory: fake.factory).capture(
-            pointer: CGPoint(x: 100, y: 100), tree: tree, context: context,
+        let frames = layoutFrames(tree, context)
+        let fake = FakeAX(frames: frames)
+        guard case let .captured(snapshot) = TiledDragTransaction(ioFactory: fake.factory).capture(
+            pointer: center(frames[1]!), tree: tree, context: context,
             occludingWindows: [], generation: 1, currentContext: { context }) else {
-            return XCTFail("scratchpad context must be rejected")
+            return XCTFail("scratchpad context must capture")
         }
-        XCTAssertEqual(fake.reads, 0)
+        XCTAssertEqual(snapshot.draggedID, 1)
+        XCTAssertTrue(fake.writes.isEmpty)
     }
 
     func testPointerCaptureRejectsDuplicateAcrossTilesAndOccludersBeforeReads() {

@@ -285,6 +285,8 @@ class WindowManager {
         }
         self.workspaceOverview.onSelectWindow = { [weak self] workspace, windowID in
             guard let self, self.config.enabled else { return }
+            // a workspace action, like the ones handleAction routes
+            self.scratchpad.hide(reason: .workspaceAction)
             self.workspaceOrchestrator.switchWorkspace(workspace, preferredWindowID: windowID)
         }
         self.scratchpad = ScratchpadController(
@@ -382,13 +384,17 @@ class WindowManager {
         mouseTracker.primaryScreenHeight = { [weak self] in self?.displayManager.primaryScreenHeight ?? 0 }
         mouseTracker.screenAt = { [weak self] pt in self?.displayManager.screen(at: pt) }
         mouseTracker.floatingWindowIDs = { [weak self] in self?.stateCache.floatingWindowIDs ?? [] }
-        mouseTracker.isWindowVisible = { [weak self] wid in self?.workspaceManager.isWindowVisible(wid) ?? false }
+        mouseTracker.isWindowVisible = { [weak self] wid in self?.isInteractive(wid) ?? false }
         mouseTracker.cachedWindow = { [weak self] wid in self?.stateCache.cachedWindows[wid] }
-        mouseTracker.tiledPositions = { [weak self] in self?.stateCache.tiledPositions ?? [:] }
+        mouseTracker.tiledPositions = { [weak self] in
+            guard let self else { return [:] }
+            // the background tiles and the layer's tiles overlap
+            guard self.scratchpad.isVisible else { return self.stateCache.tiledPositions }
+            return self.stateCache.tiledPositions.filter { self.scratchpad.isSummoned($0.key) }
+        }
         mouseTracker.onFocusForFFM = { [weak self] w in self?.focusForFFM(w) }
         mouseTracker.onUpdateFocusBorder = { [weak self] w in self?.updateFocusBorder(for: w) }
         mouseTracker.isMouseFocusSuppressed = { [weak self] in self?.suppressions.isSuppressed("mouse-focus") ?? false }
-        mouseTracker.isScratchpadVisible = { [weak self] in self?.scratchpad.isVisible ?? false }
         mouseTracker.lastFocusedID = { [weak self] in self?.focusController.lastFocusedID ?? 0 }
         mouseTracker.recordFocus = { [weak self] id, reason in self?.focusController.recordFocus(id, reason: reason) }
         mouseTracker.onHideFocusBorder = { [weak self] in
@@ -435,7 +441,7 @@ class WindowManager {
         tiledFocusRouter.visibleFloaterIDs = { [weak self] in
             guard let self else { return [] }
             return self.stateCache.floatingWindowIDs.union(self.admissionRecovery.pendingWindowIDs)
-                .filter { self.workspaceManager.isWindowVisible($0) }
+                .filter { self.isInteractive($0) }
         }
         tiledFocusRouter.isTiled = { [weak self] wid in self?.isRoutedTile(wid) ?? false }
         tiledFocusRouter.lastFocusedID = { [weak self] in self?.focusController.lastFocusedID ?? 0 }
@@ -513,6 +519,16 @@ class WindowManager {
         }
         actionDispatcher.toggleScratchpad = { [weak self] in self?.scratchpad.toggle() }
         actionDispatcher.moveToScratchpad = { [weak self] in self?.scratchpad.sendFocusedWindow() }
+        actionDispatcher.scratchpadLayer = { [weak self] in self?.scratchpad.visibleLayer }
+        actionDispatcher.scratchpadLayoutChanged = { [weak self] in self?.scratchpad.syncTiledFrames() }
+        actionDispatcher.refocusScratchpad = { [weak self] in
+            self?.scratchpad.refocusMember(reason: "ensureInvariant-scratchpad")
+        }
+        actionDispatcher.admitToScratchpad = { [weak self] w in self?.scratchpad.admitNewWindow(w) ?? false }
+        actionDispatcher.scratchpadDiscovery = { [weak self] gone, returned in
+            self?.scratchpad.noteDiscovery(goneIDs: gone, returned: returned)
+        }
+        actionDispatcher.enforceScratchpadFocus = { [weak self] in self?.scratchpad.enforceFocus() }
         actionDispatcher.saveLayout = { [weak self] in self?.saveLayoutSnapshot(manual: true) }
         actionDispatcher.restoreLayout = { [weak self] in self?.restoreLayoutSnapshot(manual: true) }
 
@@ -1008,7 +1024,7 @@ class WindowManager {
             if self.scratchpad.isVisible {
                 let cgPoint = CGPoint(x: downNS.x,
                                       y: self.displayManager.primaryScreenHeight - downNS.y)
-                self.scratchpad.handleMouseDown(atCG: cgPoint)
+                self.scratchpad.handleMouseDown(atCG: cgPoint, synthetic: Self.isOwnSyntheticEvent(event))
             }
         }
         // when the user drags a floating window, its frame changes 60Hz but our
@@ -1026,7 +1042,9 @@ class WindowManager {
             // only hide for floating windows — tiled windows can't be free-dragged
             guard self.stateCache.floatingWindowIDs.contains(tid) else { return }
             self.preDragFocusedID = tid
-            self.focusBorder.hide(); self.dimmingOverlay.hideAll()
+            self.focusBorder.hide()
+            // the scrim stays: re-shown later it would come back above the members
+            if !self.scratchpad.isVisible { self.dimmingOverlay.hideAll() }
         }
         mouseUpMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseUp) { [weak self] event in
             let shouldDetectDrag = self?.mouseDraggedSinceDown ?? false
@@ -1190,7 +1208,7 @@ class WindowManager {
     private func focusForFFM(_ window: HyprWindow) {
         // while the scratchpad is up, hovering the dimmed tiles behind it
         // must not steal focus — the layer is quasimodal
-        if scratchpad.isVisible && !scratchpad.contains(window.windowID) { return }
+        if scratchpad.isVisible && !scratchpad.isSummoned(window.windowID) { return }
         suppressions.suppress("activation-switch", for: 0.5)
         tiledFocusRouter.focus(window, reason: "ffm", fallback: .activateAndClick)
         updateFocusBorder(for: window)
@@ -1482,6 +1500,8 @@ class WindowManager {
             if scratchpad.isSummoned(current), let w = stateCache.cachedWindows[current] {
                 w.focusWithoutRaise()
                 updateFocusBorder(for: w)
+            } else {
+                scratchpad.refocusMember(reason: "ensureFocus-scratchpad")
             }
             return
         }
@@ -1605,14 +1625,19 @@ class WindowManager {
             case .toggleFloating:
                 // Hypr+T on a summoned member toggles it tiled<->floating
                 // within the layer (membership stays sticky — only Shift+S /
-                // Shift+N take a member out). non-member focus while the layer
-                // is up still treats the key as a send.
+                // Shift+N take a member out). while the layer is up only a
+                // member can be the focused window, so the send below only
+                // beeps when there is none.
                 if scratchpad.toggleTilingOfFocusedMember() { return }
                 scratchpad.sendFocusedWindow()
                 return
             case .focusFloating:
                 scratchpad.cycleSummoned()
                 return
+            case .launchApp(let bundleID):
+                // an app with a member up: focus the member. activating the
+                // app would bring its other windows forward over the scrim
+                if scratchpad.focusMember(ofBundleID: bundleID) { return }
             default:
                 break
             }
@@ -2137,8 +2162,20 @@ class WindowManager {
             return focused
         }
 
+        // nothing focused inside the layer: act on its most recent member
+        if let member = scratchpad.focusTarget {
+            hyprLog(.debug, .focus, "currentFocused → scratchpad member=\(member.windowID) (border=\(bid) last=\(lid))")
+            return member
+        }
+
         hyprLog(.debug, .focus, "currentFocused → nil ws=\(workspace) screen=\(screen.localizedName) (border=\(bid) last=\(lid))")
         return nil
+    }
+
+    /// `true` when `id` may take focus now. While the scratchpad is up only
+    /// its summoned members do; the workspace under the scrim is out.
+    private func isInteractive(_ id: CGWindowID) -> Bool {
+        scratchpad.isVisible ? scratchpad.isSummoned(id) : workspaceManager.isWindowVisible(id)
     }
 
     /// `true` when `windowID` is a valid focus target right now: either
@@ -2148,7 +2185,8 @@ class WindowManager {
         // whether floating or tiled-within-the-layer. tiled members aren't in
         // floatingWindowIDs, so without this the untile (Hypr+T) resolver
         // can't find them and the toggle silently no-ops.
-        if scratchpad.isVisible && scratchpad.isSummoned(windowID) { return true }
+        // and while it's up nothing else is: the workspace under the scrim is out
+        if scratchpad.isVisible { return scratchpad.isSummoned(windowID) }
         if workspaceWindows.contains(windowID) { return true }
         return stateCache.floatingWindowIDs.contains(windowID) && workspaceManager.isWindowVisible(windowID)
     }
@@ -2198,7 +2236,7 @@ class WindowManager {
 
     private func visibleFloatingWindows() -> [HyprWindow] {
         stateCache.floatingWindowIDs.compactMap { id in
-            guard workspaceManager.isWindowVisible(id) else { return nil }
+            guard isInteractive(id) else { return nil }
             return stateCache.cachedWindows[id]
         }
     }
@@ -2384,7 +2422,9 @@ class WindowManager {
             focusController.recordFocus(0, reason: "forgetWindow")
         }
         if focusBorder.trackedWindowID == id {
-            focusBorder.hide(); dimmingOverlay.hideAll()
+            focusBorder.hide()
+            // the scrim stays: re-shown later it would come back above the members
+            if !scratchpad.isVisible { dimmingOverlay.hideAll() }
         }
         focusBorder.hideFloatingBorder(for: id)
         WindowCornerRadius.forget(id)
@@ -3098,7 +3138,7 @@ private extension WindowManager {
     private func makeTiledDragHandler() -> TiledDragHandler {
         TiledDragHandler(
             capture: { [weak self] point, publish in
-                guard let self, self.isRunning, !self.scratchpad.isVisible,
+                guard let self, self.isRunning,
                       let screen = self.exactScreen(containing: point) else {
                     return .ineligible(.noTarget)
                 }
@@ -3111,9 +3151,9 @@ private extension WindowManager {
                         let matches = self.displayManager.screens.filter {
                             self.tiledDragDisplayID($0) == displayID
                         }
-                        guard matches.count == 1, let screen = matches.first else { return nil }
-                        return (self.workspaceManager.workspaceForScreen(screen), screen,
-                                self.stateCache.floatingWindowIDs)
+                        guard matches.count == 1, let screen = matches.first,
+                              let workspace = self.tiledDragWorkspace(on: screen) else { return nil }
+                        return (workspace, screen, self.stateCache.floatingWindowIDs)
                     },
                     onCapturedFrames: publish)
             },
@@ -3150,11 +3190,22 @@ private extension WindowManager {
             tiledDragDisplayID($0) == snapshot.context.physicalDisplayID
         }
         guard screens.count == 1, let screen = screens.first,
-              workspaceManager.workspaceForScreen(screen) == snapshot.context.workspace,
+              tiledDragWorkspace(on: screen) == snapshot.context.workspace,
               snapshot.context.memberIDs.allSatisfy({
                   workspaceManager.workspaceFor($0) == snapshot.context.workspace
               }) else { return nil }
         return (snapshot.context.workspace, screen, stateCache.floatingWindowIDs)
+    }
+
+    /// The workspace a tiled drag on `screen` works in: the scratchpad's
+    /// tree while it's up on that monitor, nil on the other monitors then
+    /// (their tiles are under the scrim), else the screen's workspace.
+    private func tiledDragWorkspace(on screen: NSScreen) -> Int? {
+        if let layer = scratchpad.visibleLayer {
+            guard tiledDragDisplayID(layer.screen) == tiledDragDisplayID(screen) else { return nil }
+            return ScratchpadController.workspace
+        }
+        return workspaceManager.workspaceForScreen(screen)
     }
 
     private func tiledDragDisplayID(_ screen: NSScreen) -> CGDirectDisplayID {
@@ -3205,6 +3256,9 @@ private extension WindowManager {
         switch completion.outcome {
         case .superseded, .ignored: return
         case .committed, .rejectedRestored, .degraded: break
+        }
+        if completion.snapshot.context.workspace == ScratchpadController.workspace {
+            scratchpad.syncTiledFrames()
         }
         // the same per-window decisions the tiled-position cache just
         // applied, so the two cannot drift apart
