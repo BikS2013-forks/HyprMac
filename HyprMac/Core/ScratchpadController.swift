@@ -117,6 +117,7 @@ final class ScratchpadController {
     /// the workspace under the scrim, or hand macOS the choice.
     func refocusMember(reason: String) {
         guard let w = focusTarget else { return }
+        hyprLog(.notice, .focus, "scratchpad: focus → member '\(w.title ?? "?")' (\(w.windowID)) reason=\(reason)")
         w.focus()
         focusController.recordFocus(w.windowID, reason: reason)
         updateFocusBorder(w)
@@ -824,8 +825,22 @@ final class ScratchpadController {
                 w.raise()
             }
             hyprLog(.notice, .lifecycle, "scratchpad: raised members over their apps' other windows (pids \(intruderPIDs.sorted()))")
+            enforceFocus()
         }
         if let backmost { lowerScrimBelow(backmost) }
+    }
+
+    /// Keystrokes belong to a member while the layer is up. An app can move
+    /// focus on its own to one of its windows on the workspace behind
+    /// (Cmd-`, a Dock click, a promoted window); pull it back to a member.
+    /// Unmanaged windows (menus, panels, settings) are left alone.
+    func enforceFocus() {
+        guard isVisible, Date().timeIntervalSince(shownAt) > showGraceSec,
+              let focused = accessibility.getFocusedWindow(),
+              !summonedIDs.contains(focused.windowID),
+              let ws = workspaceManager.workspaceFor(focused.windowID), ws != Self.workspace else { return }
+        hyprLog(.notice, .focus, "scratchpad: focus escaped to '\(focused.title ?? "?")' (\(focused.windowID)) on ws\(ws)")
+        refocusMember(reason: "scratchpad-focus-escaped")
     }
 
     /// Owners of the members on screen.

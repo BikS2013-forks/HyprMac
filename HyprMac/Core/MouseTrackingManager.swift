@@ -83,8 +83,6 @@ class MouseTrackingManager {
     var onHideFocusBorder: () -> Void = {}
     // routed to SuppressionRegistry["mouse-focus"] by WindowManager
     var isMouseFocusSuppressed: () -> Bool = { false }
-    // true while the scratchpad layer is up — FFM must not reach through the
-    // scrim to hover-focus a background tile (would dismiss the quasimodal layer)
     // minimum spacing between eligible checks. skipped events are not replayed.
     // WindowManager derives this from the user-configured response rate.
     var hoverThrottleInterval: () -> CFAbsoluteTime = { Tuning.throttleInterval }

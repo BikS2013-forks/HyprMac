@@ -528,6 +528,7 @@ class WindowManager {
         actionDispatcher.scratchpadDiscovery = { [weak self] gone, returned in
             self?.scratchpad.noteDiscovery(goneIDs: gone, returned: returned)
         }
+        actionDispatcher.enforceScratchpadFocus = { [weak self] in self?.scratchpad.enforceFocus() }
         actionDispatcher.saveLayout = { [weak self] in self?.saveLayoutSnapshot(manual: true) }
         actionDispatcher.restoreLayout = { [weak self] in self?.restoreLayoutSnapshot(manual: true) }
 
@@ -1624,8 +1625,9 @@ class WindowManager {
             case .toggleFloating:
                 // Hypr+T on a summoned member toggles it tiled<->floating
                 // within the layer (membership stays sticky — only Shift+S /
-                // Shift+N take a member out). non-member focus while the layer
-                // is up still treats the key as a send.
+                // Shift+N take a member out). while the layer is up only a
+                // member can be the focused window, so the send below only
+                // beeps when there is none.
                 if scratchpad.toggleTilingOfFocusedMember() { return }
                 scratchpad.sendFocusedWindow()
                 return

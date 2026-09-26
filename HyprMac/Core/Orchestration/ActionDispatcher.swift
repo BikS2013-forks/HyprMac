@@ -102,6 +102,8 @@ final class ActionDispatcher {
     var admitToScratchpad: (HyprWindow) -> Bool = { _ in false }
     // members closed, minimized or came back
     var scratchpadDiscovery: (Set<CGWindowID>, [HyprWindow]) -> Void = { _, _ in }
+    // keystrokes stay on a member while the scratchpad is up
+    var enforceScratchpadFocus: () -> Void = {}
     var saveLayout: () -> Void = {}
     var restoreLayout: () -> Void = {}
 
@@ -220,6 +222,10 @@ final class ActionDispatcher {
 
         // catch-all: ensure something on the active workspace has focus + border.
         ensureFocusInvariant()
+        // with the scratchpad up, an app that moved focus to its window on the
+        // workspace behind gets it pulled back. the invariant above returns
+        // early while the border still shows on the member
+        enforceScratchpadFocus()
 
         // periodically re-raise floating windows so they don't get stuck behind
         // full-screen tiled windows (no activation event to trigger raise).

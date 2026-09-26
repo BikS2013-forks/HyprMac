@@ -978,11 +978,24 @@ class TilingEngine {
             .subtracting(trees[key]?.allWindows.map(\.windowID) ?? [])
         let outcome = applyVerifiedLayout(tree, in: rect, generation: generation,
                                           originalFrames: originalFrames,
-                                          restorationUsableFrame: restorationUsableFrame,
+                                          restorationUsableFrame: restorationUsableFrame
+                                              ?? scratchpadRestorationFrame(for: key),
                                           topologyRecoveryMaxDepth: topologyRecoveryMaxDepth,
                                           newcomerIDs: newcomers)
         noteGeometry(outcome, for: key, generation: generation, inserted: inserted)
         return outcome
+    }
+
+    /// The layer lays out in its inset region, but a member whose app would
+    /// not shrink can sit past it. A rejected layout still rolls such a
+    /// member back, so restoration uses the whole monitor, as tileScratchpad
+    /// does. nil for every other key.
+    private func scratchpadRestorationFrame(for key: TilingKey) -> CGRect? {
+        guard key.workspace == Self.scratchpadWorkspace,
+              let screen = displayManager.screens.first(where: {
+                  TilingKey(workspace: key.workspace, screen: $0) == key
+              }) else { return nil }
+        return displayManager.cgRect(for: screen)
     }
 
     /// `newcomerIDs` are windows the caller just inserted that are neither
