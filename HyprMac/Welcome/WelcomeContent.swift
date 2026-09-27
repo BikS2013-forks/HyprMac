@@ -26,30 +26,24 @@ enum WhatsNewFeatures {
     // update this before each release — see docs/release.md
     static let current: [WhatsNewFeature] = [
         WhatsNewFeature(
-            icon: "rectangle.split.2x2",
-            title: "Steadier Tiling",
-            description: "Windows land in their tiles far more reliably. A move between monitors sizes the window first, a window that doesn't fit goes back where it was, and nothing gets shuffled while your Mac is locked or asleep."
+            icon: "pin",
+            title: "Pin Apps to Workspaces",
+            description: "Settings → General → Pin apps to workspaces sends an app's new windows to the workspace you choose, and takes you there with them."
         ),
         WhatsNewFeature(
-            icon: "keyboard",
-            title: "A Searchable Keybind List",
-            description: "Hypr+K opens one scrolling list with a search bar. Start typing to find a shortcut, or use the arrow keys to scroll."
+            icon: "rectangle.on.rectangle",
+            title: "Drag Between Monitors",
+            description: "Drop a tiled window on another monitor and it tiles where you let go. A highlight shows where it will land before you drop."
         ),
         WhatsNewFeature(
-            icon: "arrow.up.right.square.fill",
-            title: "Move and Follow",
-            description: "Hypr+Ctrl+Shift+N moves the focused window to workspace N and takes you there with it."
-        ),
-        WhatsNewFeature(
-            icon: "square.stack",
-            title: "A Scratchpad That Tiles",
-            description: "The scratchpad works like its own workspace. Focus, swaps, resizes and drags stay inside it, and the windows behind it can't take focus.",
-            tint: .magenta
+            icon: "rectangle.3.group",
+            title: "Retile All on Hypr+R",
+            description: "Hypr+R retiles every workspace and moves pinned apps back to their workspaces."
         ),
         WhatsNewFeature(
             icon: "macwindow.on.rectangle",
-            title: "Floaters Stay on Top",
-            description: "Floating windows stay above the tile you click, and Quick Look previews float instead of tiling.",
+            title: "Never Tile Means Never",
+            description: "Apps in Never tile stay floating. Hypr+T on one says so instead of tiling it, and a pinned one still floats on its workspace.",
             tint: .magenta
         ),
     ]
