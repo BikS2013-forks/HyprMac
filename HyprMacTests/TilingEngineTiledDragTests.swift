@@ -493,7 +493,7 @@ final class TilingEngineTiledDragTests: XCTestCase {
                        [10, 11, 1])
     }
 
-    func testCrossMonitorDropPastTheTargetMaxSplitsRestoresBothTreesAndVerifiesFrames() throws {
+    func testCrossMonitorDropPastTheTargetMaxSplitsRestoresOnlyTheSource() throws {
         let fixture = makeCrossFixture { engine, wide in
             engine.maxSplitsPerMonitor[wide.localizedName] = 1
         }
@@ -508,19 +508,18 @@ final class TilingEngineTiledDragTests: XCTestCase {
         let outcome = dropCross(fixture, snapshot,
                                 at: CGPoint(x: slot.minX + 5, y: slot.midY), swap: false)
 
-        guard case let .acrossTrees(.rejectedRestored(reason, frames), cross) = outcome else {
-            return XCTFail("expected a verified rollback of both trees, got \(outcome)")
+        guard case let .rejectedRestored(reason, frames) = outcome else {
+            return XCTFail("expected an ordinary verified restore, got \(outcome)")
         }
         XCTAssertEqual(reason, .preflight(.maxDepthExceeded))
-        XCTAssertTrue(cross.moves.isEmpty)
-        XCTAssertNil(cross.targetCandidate)
         XCTAssertEqual(fixture.trace.frames, originals)
-        XCTAssertEqual(frames, originals)
-        // the rollback wrote and verified every original on both screens
-        XCTAssertEqual(Set(fixture.trace.writes), [1, 2, 3, 10, 11])
+        XCTAssertEqual(Set(frames.keys), [1, 2, 3])
+        // refused before any write, so the release screen was never touched
+        XCTAssertEqual(Set(fixture.trace.writes), [1, 2, 3])
         XCTAssertTrue(fixture.engine.existingTree(forWorkspace: 1, screen: fixture.tall) === sourceTree)
         XCTAssertTrue(fixture.engine.existingTree(forWorkspace: 2, screen: fixture.wide) === targetTree)
-        XCTAssertEqual(Set(fixture.engine.unverifiedLayouts.map(\.workspace)), [1, 2])
+        XCTAssertEqual(Set(fixture.engine.unverifiedLayouts.map(\.workspace)), [1],
+                       "the release screen's key still speaks for its geometry")
     }
 
     func testCrossMonitorRollsBackBothTreesWhenATargetFrameIsRefused() throws {
@@ -728,10 +727,25 @@ final class TilingEngineTiledDragTests: XCTestCase {
                                                   release: .source),
             swap: false, target: nil), "a gap on the source")
         fixture.trace.frames[1]?.origin = CGPoint(x: 300, y: 200)
-        guard case .acrossTrees(.rejectedRestored, _) = dropCross(fixture, snapshot, at: point,
-                                                                  swap: false) else {
+        guard case .rejectedRestored(reason: .preflight(.maxDepthExceeded), _) = dropCross(
+            fixture, snapshot, at: point, swap: false) else {
             return XCTFail("the drop past max splits must restore")
         }
+    }
+
+    func testPreviewTargetGoesStaleWithAnyLayoutSinceThePress() throws {
+        let fixture = makeCrossFixture()
+        let snapshot = try captureCross(fixture)
+        let target = try XCTUnwrap(fixture.engine.tiledDragPreviewTarget(
+            for: snapshot, location: (2, fixture.wide, [])))
+        XCTAssertEqual(target.currentContext(), target.context)
+
+        fixture.engine.beginLayoutGeneration()
+
+        XCTAssertNil(target.currentContext(), "a cached target is dropped")
+        XCTAssertNil(fixture.engine.tiledDragPreviewTarget(for: snapshot,
+                                                           location: (2, fixture.wide, [])),
+                     "and nothing replaces it: the drop is superseded")
     }
 
     func testPreviewTargetIsDeclinedWhereTheDropWouldBe() throws {

@@ -71,13 +71,6 @@ struct TiledDragPressResolver {
     }
 }
 
-extension TiledDragTargetResolver {
-    static func resolve(pointer: CGPoint, snapshot: TiledDragSnapshot) -> TiledDragTarget? {
-        resolve(pointer: pointer, draggedID: snapshot.draggedID,
-                intendedSlots: snapshot.originalFrames)
-    }
-}
-
 /// Which workspace a tiled drag released on another monitor lands in: the
 /// one visible there. A disabled monitor tiles nothing, and while the
 /// scratchpad layer is up its scrim covers every other monitor's tiles, so
@@ -192,7 +185,7 @@ struct TiledDragFeedbackPolicy {
     }
 }
 
-struct TiledDragFeedbackKey: Equatable {
+struct TiledDragFeedbackKey: Hashable {
     let workspace: Int
     let displayID: CGDirectDisplayID
 }
@@ -212,21 +205,37 @@ enum TiledDragDeferredFeedbackAction: Equatable {
 }
 
 struct TiledDragFeedbackReconciler {
+    private struct Waiting {
+        /// ids a verified layout under this key must publish
+        var ids: Set<CGWindowID>
+        /// the newest generation heard from this key
+        var generation: UInt64
+    }
+
     private struct Pending {
+        /// the key the feedback is shown and cancelled under: the drop's source
         let key: TiledDragFeedbackKey
         var generation: UInt64
-        var affectedIDs: Set<CGWindowID>
+        /// every key the drop touched that has not been cleared yet. a drop
+        /// across monitors waits on the release screen's key as well
+        var awaiting: [TiledDragFeedbackKey: Waiting]
         var shownGeneration: UInt64?
     }
 
     private var pending: Pending?
     var hasPendingFeedback: Bool { pending != nil }
-    func isPending(for key: TiledDragFeedbackKey) -> Bool { pending?.key == key }
+    func isPending(for key: TiledDragFeedbackKey) -> Bool { pending?.awaiting[key] != nil }
     var pendingKey: TiledDragFeedbackKey? { pending?.key }
+    /// every key the pending feedback still waits on
+    var pendingKeys: [TiledDragFeedbackKey] { pending.map { Array($0.awaiting.keys) } ?? [] }
     var shownGeneration: UInt64? { pending?.shownGeneration }
 
+    /// `alsoAwaiting` names other keys the drop touched, each with the ids a
+    /// verified layout there must publish before the feedback is cancelled.
     mutating func beginDegraded(key: TiledDragFeedbackKey, generation: UInt64,
-                                affectedIDs: Set<CGWindowID>) -> [TiledDragDeferredFeedbackAction] {
+                                affectedIDs: Set<CGWindowID>,
+                                alsoAwaiting: [TiledDragFeedbackKey: Set<CGWindowID>] = [:])
+        -> [TiledDragDeferredFeedbackAction] {
         if let pending, pending.key == key, generation <= pending.generation {
             return []
         }
@@ -236,8 +245,11 @@ struct TiledDragFeedbackReconciler {
         } else {
             actions = []
         }
-        pending = Pending(key: key, generation: generation,
-                          affectedIDs: affectedIDs, shownGeneration: nil)
+        var awaiting = [key: Waiting(ids: affectedIDs, generation: generation)]
+        for (other, ids) in alsoAwaiting where other != key {
+            awaiting[other] = Waiting(ids: ids, generation: generation)
+        }
+        pending = Pending(key: key, generation: generation, awaiting: awaiting, shownGeneration: nil)
         return actions
     }
 
@@ -252,30 +264,28 @@ struct TiledDragFeedbackReconciler {
             key = eventKey
             generation = eventGeneration
         case let .terminalFailure(eventKey):
-            guard eventKey == pending.key else { return [] }
+            guard pending.awaiting[eventKey] != nil else { return [] }
             return showOnce()
         case .noResult:
             return showOnce()
         }
-        guard key == pending.key, generation > pending.generation else { return [] }
+        guard let waiting = pending.awaiting[key], generation > waiting.generation else { return [] }
 
         switch event {
         case let .accepted(_, _, publishedIDs, expectedIDs):
-            if publishedIDs == expectedIDs,
-               publishedIDs.isSuperset(of: pending.affectedIDs) {
+            if publishedIDs == expectedIDs, publishedIDs.isSuperset(of: waiting.ids) {
+                self.pending?.awaiting[key] = nil
+                // every key the drop touched has to come back verified
+                guard self.pending?.awaiting.isEmpty == true else { return [] }
                 self.pending = nil
                 return [.cancelDegraded(key: pending.key)]
             }
-            self.pending?.generation = generation
+            heard(generation, from: key)
             return showOnce()
         case let .failed(_, _, requiredIDs, recoveryPending):
-            self.pending?.affectedIDs.formUnion(requiredIDs)
-            guard !recoveryPending else {
-                self.pending?.generation = generation
-                return []
-            }
-            self.pending?.generation = generation
-            return showOnce()
+            self.pending?.awaiting[key]?.ids.formUnion(requiredIDs)
+            heard(generation, from: key)
+            return recoveryPending ? [] : showOnce()
         case .terminalFailure, .noResult:
             return []
         }
@@ -284,18 +294,25 @@ struct TiledDragFeedbackReconciler {
     mutating func reconcileNewest(_ events: [TiledDragFeedbackReconciliation],
                                   activeRetry: Bool) -> [TiledDragDeferredFeedbackAction] {
         guard let pending else { return [] }
-        let matching = events.compactMap { event -> (UInt64, TiledDragFeedbackReconciliation)? in
+        var newest: [TiledDragFeedbackKey: (generation: UInt64, event: TiledDragFeedbackReconciliation)] = [:]
+        for event in events {
             switch event {
             case let .accepted(key, generation, _, _), let .failed(key, generation, _, _):
-                return key == pending.key ? (generation, event) : nil
+                guard pending.awaiting[key] != nil,
+                      newest[key].map({ generation > $0.generation }) ?? true else { continue }
+                newest[key] = (generation, event)
             case .terminalFailure, .noResult:
-                return nil
+                continue
             }
         }
-        if let newest = matching.max(by: { $0.0 < $1.0 })?.1 {
-            return reconcile(newest)
+        var actions: [TiledDragDeferredFeedbackAction] = []
+        for (_, entry) in newest.sorted(by: { $0.value.generation < $1.value.generation }) {
+            actions += reconcile(entry.event)
         }
-        return activeRetry ? [] : reconcile(.noResult)
+        // a key the pass never reached cannot be verified by it
+        guard let still = self.pending,
+              still.awaiting.keys.contains(where: { newest[$0] == nil }) else { return actions }
+        return activeRetry ? actions : actions + reconcile(.noResult)
     }
 
     mutating func cancel() {
@@ -304,6 +321,13 @@ struct TiledDragFeedbackReconciler {
 
     mutating func feedbackFinished(generation: UInt64) {
         if pending?.shownGeneration == generation { pending = nil }
+    }
+
+    private mutating func heard(_ generation: UInt64, from key: TiledDragFeedbackKey) {
+        pending?.awaiting[key]?.generation = generation
+        if let current = pending?.generation, generation > current {
+            pending?.generation = generation
+        }
     }
 
     private mutating func showOnce() -> [TiledDragDeferredFeedbackAction] {

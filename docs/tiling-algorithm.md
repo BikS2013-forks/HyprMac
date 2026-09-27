@@ -853,17 +853,32 @@ takes the engine's write order, and two displays with different backing
 scales get the scale-change budget. Both trees publish together, and only
 after every frame on both screens was accepted.
 
-A call that times out on either screen gets its one longer try first; Messages
-took 101 ms to answer a position write right after crossing displays, just
-past the 100 ms call timeout. A refusal or a sizing failure after the release
-screen was read puts both trees back, even when nothing was written there yet. The source's captured
-originals go first, the dragged window's among them, then the release
-screen's. Each set is verified against its own screen. Neither topology
-changes, and every key that has a tree is marked unverified. A release screen
-with no tree has no key to mark. Superseded work writes nothing more, on
+A call that times out on either screen gets its one longer try first.
+Messages took 101 ms to answer a position write right after crossing
+displays, just past the 100 ms call timeout. All of a drop's attempts share
+one 2.5-second budget (`TiledDragBudget`). Once it is spent, a timeout gets
+no longer try and the drop goes straight to its plain outcome. That caps a
+drop that could otherwise hold the main thread for over ten seconds. The cut
+logs `frame attempt AX timeout recovery skipped`.
+
+A refusal before the first write puts back only the source. The release
+screen was read but never written. These refusals are no target, no room,
+Max Splits, and an invalid candidate, and they report as an ordinary
+same-tree restore that marks only the source key.
+
+A sizing failure after the writes began puts both trees back. The source's
+captured originals go first, the dragged window's among them, then the
+release screen's. Each set is verified against its own screen. Neither
+topology changes, and every key that has a tree is marked unverified. A
+release screen with no tree has no key to mark. So does a commit whose frames
+were accepted but whose setters did not all return success
+(`unverifiedCommit`). The dragged window may already stand on the release
+screen, and publishing nothing while it stays there would leave the source's
+tree and membership claiming it. Superseded work writes nothing more, on
 either screen, as on a same-tree drop: a newer operation owns the geometry.
 A failure whose drop went stale before the rollback is reported degraded
-without one. The cache rules above cover both trees' members.
+without one. The cache rules above cover both trees' members, and deferred
+degraded feedback waits for both keys to verify again.
 
 Workspace membership changes only on a commit, through
 `WorkspaceManager.moveWindow`, for the dragged window and for a swapped one.
@@ -919,8 +934,11 @@ Preview and drop cannot disagree, because both come from the same parts:
 - The rect comes from `TiledDragTransaction.previewFrame`, which builds the
   same candidates as `drop` and `dropAcrossTrees`.
 
-No AX call runs while the pointer moves. Another monitor's tree is looked up
-once per drag, the first time the pointer reaches it. Updates come at most 60
+No AX call runs while the pointer moves. Another monitor's tree is kept
+between updates only while its workspace is still the one visible there and
+the tree is unchanged. A workspace switch, the scratchpad, or any layout since
+the press (which supersedes the drop) shows through at the next update. A
+workspace change or a hotkey action also asks again straight away. Updates come at most 60
 times a second. A move inside that interval is held and applied when it ends,
 so the last position always shows. The panel redraws only when the rect
 changes. A Hypr press or an Option change asks again at the last point. The

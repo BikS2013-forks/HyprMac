@@ -55,6 +55,9 @@ singleton except `UserConfig.shared` and `MenuBarState.shared`.
 | `WindowStacking` | Pure rules over the CG window list: the frontmost app's open popup, pointer hit-test, floaters above or below a tile, and the tiles covering each floater. |
 | `TiledDragHandler` | Owns captured press/release state, cancellation, and verified cache updates. |
 | `TiledDragTransaction` | Builds isolated insertion, swap, or resize candidates, within one tree or across two monitors' trees, and verifies frames before commit. |
+| `TiledDropPlanner` | Picks a tiled drop's target tile and edge. The drop and its live preview both call it, so they cannot disagree. |
+| `TiledDragPreviewSession` | Throttles the live drop preview: at most 60 updates a second, the last move held, a redraw only when the landing rect changes. |
+| `TiledDropPreviewPanel` | The click-through, floating-tier panel that draws the drop preview in the user's focus color. |
 | `FrameSizingAttempt` | Bounded AX writes and complete frame readback through an injected clock and IO surface. |
 | `FocusBorder` | Visual focus indicator. Persistent panels at `.floating` level with occlusion masking. |
 | `FocusBrackets` | Corner brackets shown around the focus target while the Hypr key is held. |

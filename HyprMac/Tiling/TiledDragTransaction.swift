@@ -175,16 +175,52 @@ struct TiledDragCrossTarget {
     let currentContext: () -> TiledDragContext?
 }
 
+/// One drop's time on the main thread. Once it is spent, a call that times
+/// out gets no longer try; the plain attempts and rollbacks still run. The
+/// worst case with every retry was over ten seconds.
+final class TiledDragBudget {
+    static let defaultLimit: TimeInterval = 2.5
+
+    let limit: TimeInterval
+    private var startedAt: TimeInterval?
+
+    init(limit: TimeInterval = TiledDragBudget.defaultLimit) {
+        self.limit = limit
+    }
+
+    /// The drop began at `now`. Only the first call counts.
+    func start(at now: TimeInterval) {
+        if startedAt == nil { startedAt = now }
+    }
+
+    func allowsRecovery(at now: TimeInterval) -> Bool {
+        start(at: now)
+        return now - (startedAt ?? now) < limit
+    }
+}
+
 struct TiledDragTransaction {
     typealias IOFactory = ([CGWindowID: HyprWindow], @escaping () -> UInt64) -> FrameSizingIO
 
     let ioFactory: IOFactory
     let minimumSize: (HyprWindow?) -> CGSize
+    /// shared by every attempt of the drop this transaction runs
+    let budget: TiledDragBudget
 
     init(ioFactory: @escaping IOFactory,
-         minimumSize: @escaping (HyprWindow?) -> CGSize = { _ in .zero }) {
+         minimumSize: @escaping (HyprWindow?) -> CGSize = { _ in .zero },
+         budget: TiledDragBudget = TiledDragBudget()) {
         self.ioFactory = ioFactory
         self.minimumSize = minimumSize
+        self.budget = budget
+    }
+
+    /// A sizing transaction for this drop: one longer try for a call that
+    /// times out, while the drop's budget lasts.
+    private func sizing(_ attempt: FrameSizingAttempt) -> FrameSizingTransaction {
+        let budget = self.budget
+        return FrameSizingTransaction(attempt: attempt, recoversTimeouts: true,
+                                      recoveryAllowed: { budget.allowsRecovery(at: attempt.io.now()) })
     }
 
     func capture(pointer: CGPoint, tree: BSPTree, context: TiledDragContext,
@@ -319,6 +355,7 @@ struct TiledDragTransaction {
                 ? snapshot.generation : snapshot.generation &+ 1
         }
         let attempt = FrameSizingAttempt(io: io)
+        budget.start(at: io.now())
 
         guard let mode else {
             return restore(snapshot, reason: .preflight(.noTarget), attempt: attempt)
@@ -334,7 +371,7 @@ struct TiledDragTransaction {
             return restore(snapshot, reason: .preflight(.invalidTarget), attempt: attempt)
         }
         guard isCurrent(snapshot, currentContext: currentContext) else { return .superseded }
-        let transaction = FrameSizingTransaction(attempt: attempt, recoversTimeouts: true)
+        let transaction = sizing(attempt)
         let result = transaction.apply(
             targets: layouts.map { .init(windowID: $0.0.windowID, frame: $0.1) },
             originalFrames: snapshot.originalFrames,
@@ -373,8 +410,8 @@ struct TiledDragTransaction {
                 ? snapshot.generation : snapshot.generation &+ 1
         }
         let attempt = FrameSizingAttempt(io: io)
-        let classified = FrameSizingTransaction(attempt: attempt, recoversTimeouts: true)
-            .capture(windowIDs: [snapshot.draggedID], generation: snapshot.generation)
+        budget.start(at: io.now())
+        let classified = sizing(attempt).capture(windowIDs: [snapshot.draggedID], generation: snapshot.generation)
         guard case .accepted = classified.verdict,
               let frame = classified.actualFrames[snapshot.draggedID] else {
             let failure: FrameSizingFailure
@@ -465,6 +502,7 @@ struct TiledDragTransaction {
             isCurrent() ? snapshot.generation : snapshot.generation &+ 1
         }
         let attempt = FrameSizingAttempt(io: io, configuration: configuration)
+        budget.start(at: io.now())
         let targetIDs = targetWindows.map(\.windowID)
         guard byID.count == sourceWindows.count + targetWindows.count,
               Set(targetIDs) == target.context.memberIDs,
@@ -473,8 +511,7 @@ struct TiledDragTransaction {
             return restore(snapshot, reason: .preflight(.invalidTarget), attempt: attempt)
         }
 
-        let captured = FrameSizingTransaction(attempt: attempt, recoversTimeouts: true)
-            .capture(windowIDs: targetIDs, generation: snapshot.generation)
+        let captured = sizing(attempt).capture(windowIDs: targetIDs, generation: snapshot.generation)
         guard case .accepted = captured.verdict, captured.actualFrames.count == targetIDs.count else {
             let failure = Self.failure(of: captured.verdict)
                 ?? .windowUnavailable(targetIDs.first ?? snapshot.draggedID)
@@ -492,8 +529,9 @@ struct TiledDragTransaction {
                           reason: reason, attempt: attempt, candidate: candidate, cross: untouched)
         }
 
-        // the target comes from the tree's own slots, as the live preview's
-        // does, never from the frames just read
+        // a refusal before the first write puts back only the source: the
+        // release screen was read, never written. the target comes from the
+        // tree's own slots, as the live preview's does, not the frames read
         var hit: TiledDragTarget?
         if !targetIDs.isEmpty {
             let slots = TiledDropPlanner.slots(of: target.tree, in: target.context.usableFrame,
@@ -504,7 +542,9 @@ struct TiledDragTransaction {
                     + "point=cg(\(Self.traced(pointer.x)),\(Self.traced(pointer.y))) "
                     + "tiles=[\(TiledDragTargetResolver.trace(pointer: pointer, slots: slots))] "
                     + "chosen=\(hit.map { "\($0.windowID) \($0.edge)" } ?? "none")")
-            guard hit != nil else { return restoreBoth(.preflight(.noTarget)) }
+            guard hit != nil else {
+                return restore(snapshot, reason: .preflight(.noTarget), attempt: attempt)
+            }
         }
         let built: CrossCandidates
         switch crossCandidates(snapshot, into: target, hit: hit, swap: swapRequested) {
@@ -513,7 +553,7 @@ struct TiledDragTransaction {
             hyprLog(.notice, .tiling, "tiled drag across monitors: dragged=\(dragged.windowID) "
                     + "ws\(snapshot.context.workspace) → ws\(target.context.workspace) "
                     + "refused: \(rejection)")
-            return restoreBoth(.preflight(rejection))
+            return restore(snapshot, reason: .preflight(rejection), attempt: attempt)
         }
         hyprLog(.notice, .tiling, "tiled drag across monitors: dragged=\(dragged.windowID) "
                 + "ws\(snapshot.context.workspace) → ws\(target.context.workspace) "
@@ -530,9 +570,9 @@ struct TiledDragTransaction {
         case let .noRoom(window, slot):
             hyprLog(.notice, .tiling, "tiled drag across monitors: no room for \(window.windowID) "
                     + "min=\(minimumSize(window)) slot=\(slot.size)")
-            return restoreBoth(.preflight(.noRoom))
+            return restore(snapshot, reason: .preflight(.noRoom), attempt: attempt)
         case .invalid:
-            return restoreBoth(.preflight(.invalidTarget))
+            return restore(snapshot, reason: .preflight(.invalidTarget), attempt: attempt)
         }
         guard isCurrent() else { return .superseded }
 
@@ -547,7 +587,7 @@ struct TiledDragTransaction {
             var screenAttempt = attempt
             screenAttempt.configuration.positionSettleWindowIDs =
                 positionFirst(standing, layouts, context.usableFrame)
-            let result = FrameSizingTransaction(attempt: screenAttempt, recoversTimeouts: true)
+            let result = sizing(screenAttempt)
                 .candidate(targets: layouts.map { .init(windowID: $0.0.windowID, frame: $0.1) },
                            usableFrame: context.usableFrame, gap: context.gap,
                            generation: snapshot.generation)
@@ -557,6 +597,15 @@ struct TiledDragTransaction {
             if failure != nil { break }
         }
         let candidateProgress = progress ?? FrameSizingAttempt.Progress()
+        // accepted frames the setters did not all confirm cannot publish. the
+        // dragged window may already stand on the release screen, so put both
+        // trees back rather than leave membership claiming the source
+        if failure == nil, let unverified = Self.unverifiedCommit(candidateProgress) {
+            hyprLog(.notice, .tiling, "tiled drag across monitors accepted but not fully written: "
+                    + "\(unverified.trace) — restoring both trees")
+            guard isCurrent() else { return .superseded }
+            return restoreBoth(.sizing(unverified), candidate: candidateProgress)
+        }
         guard let reason = failure else {
             guard isCurrent() else { return .superseded }
             return .acrossTrees(
@@ -767,7 +816,7 @@ struct TiledDragTransaction {
 
     private func restore(_ snapshot: TiledDragSnapshot, reason: TiledDragFailure,
                          attempt: FrameSizingAttempt) -> TiledDragDropOutcome {
-        let result = FrameSizingTransaction(attempt: attempt, recoversTimeouts: true).restore(
+        let result = sizing(attempt).restore(
             originalFrames: snapshot.originalFrames,
             usableFrame: snapshot.context.usableFrame,
             gap: snapshot.context.gap,
@@ -797,7 +846,7 @@ struct TiledDragTransaction {
                                attempt: FrameSizingAttempt,
                                candidate: FrameSizingAttempt.Progress?,
                                cross: TiledDragCrossTree) -> TiledDragDropOutcome {
-        let restorer = FrameSizingTransaction(attempt: attempt, recoversTimeouts: true)
+        let restorer = sizing(attempt)
         let source = restorer.restore(originalFrames: snapshot.originalFrames,
                                       usableFrame: snapshot.context.usableFrame,
                                       gap: snapshot.context.gap,
@@ -874,6 +923,18 @@ struct TiledDragTransaction {
 
     private static func traced(_ rect: CGRect) -> String {
         "(\(traced(rect.minX)),\(traced(rect.minY)),\(traced(rect.width)),\(traced(rect.height)))"
+    }
+
+    /// Why accepted frames may not publish: a target whose setters did not
+    /// all return success, or a readback that was not complete and stable.
+    /// nil when the progress can publish. `FrameSizingAttempt` does not
+    /// accept either today; this holds the drop to the same gate the trees use.
+    static func unverifiedCommit(_ progress: FrameSizingAttempt.Progress) -> FrameSizingFailure? {
+        guard !FrameSizingProgressReport(candidate: progress).candidateVerified else { return nil }
+        if let unwritten = progress.targetIDs.first(where: { !progress.writesCompleted.contains($0) }) {
+            return .writeFailed(unwritten, .failure)
+        }
+        return .attemptsExhausted
     }
 
     private static func failure(of verdict: FrameSizingAttempt.Verdict) -> FrameSizingFailure? {

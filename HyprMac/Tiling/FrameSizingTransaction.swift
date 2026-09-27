@@ -980,6 +980,9 @@ struct FrameSizingTransaction {
     /// timeout to answer (Messages, live: a position write refused at 101 ms,
     /// then the rollback's first read refused at 101 ms too).
     var recoversTimeouts = false
+    /// Whether a longer try may still run. A tiled drag spends one budget
+    /// across all of its attempts, so this asks the drop, not the attempt.
+    var recoveryAllowed: () -> Bool = { true }
 
     /// A frame read, with its one timeout retry.
     func capture(windowIDs: [CGWindowID], generation: UInt64) -> FrameSizingAttempt.Result {
@@ -1044,6 +1047,11 @@ struct FrameSizingTransaction {
         }
         guard reason.isDirectCannotComplete, first.progress.timeoutShapedCannotComplete,
               attempt.io.currentGeneration() == generation else { return first }
+        guard recoveryAllowed() else {
+            hyprLog(.notice, .tiling, "frame attempt AX timeout recovery skipped: phase=\(phase.rawValue) "
+                    + "reason=\(reason.trace) ids=\(ids) — the drop's time budget is spent")
+            return first
+        }
         var relaxed = attempt
         relaxed.configuration = attempt.configuration.withTimeoutRecoveryBudget
         hyprLog(.notice, .tiling, "frame attempt AX timeout recovery: phase=\(phase.rawValue) "

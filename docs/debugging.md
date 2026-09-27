@@ -940,7 +940,7 @@ in this order. Points and frames are global CG coordinates (top-left origin).
   tile.
 - `tiled drag mode: dragged=<id> swap=<bool> mode=<insert(<id> <edge>)|swap(<id>)|crossMonitor|none …>`.
 - For `crossMonitor`, WindowManager may log `tiled drag across monitors
-  refused on '<name>': <reason>` (a disabled monitor, the scratchpad). The
+  refused on <name>: <reason>` (a disabled monitor, the scratchpad). The
   engine then logs either `tiled drag across monitors declined: …
   reason=<…>`, and the release restores, or `tiled drag across monitors
   target: … ws<N> on '<name>' members=[…]`.
@@ -966,8 +966,11 @@ Failure reasons print raw AX codes, for example `writeFailed(77705, -25204)`
 (`-25204` is `kAXErrorCannotComplete`, what an AX messaging timeout
 returns). A drag call that times out gets one longer try, logged as `frame
 attempt AX timeout recovery: phase=<capture|candidate|restoration>
-reason=<trace> ids=[…] timeout=250ms deadline=750ms`, then `… accepted` or
-`… refused: reason=<trace>`.
+reason=<trace> ids=[…] timeout=250ms deadline=<ms>`, then `… accepted` or
+`… refused: reason=<trace>`. The deadline is 750ms, or 1000ms when the drop
+runs under the scale-change budget. Once the drop's 2.5-second budget is
+spent, the longer try is cut instead: `frame attempt AX timeout recovery
+skipped: phase=<…> reason=<trace> ids=[…] — the drop's time budget is spent`.
 
 ### Tab detach followed by a false restoration warning
 

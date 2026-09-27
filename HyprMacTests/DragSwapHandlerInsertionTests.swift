@@ -670,6 +670,57 @@ final class DragSwapHandlerInsertionTests: XCTestCase {
         ), newer)
     }
 
+    func testDegradedFeedbackAcrossMonitorsWaitsForBothKeys() {
+        var reconciler = TiledDragFeedbackReconciler()
+        let source = TiledDragFeedbackKey(workspace: 1, displayID: 2)
+        let release = TiledDragFeedbackKey(workspace: 2, displayID: 4)
+        XCTAssertEqual(reconciler.beginDegraded(key: source, generation: 10, affectedIDs: [1, 2],
+                                                alsoAwaiting: [release: [10, 11]]), [])
+        XCTAssertEqual(Set(reconciler.pendingKeys), [source, release])
+
+        // the source verified on its own is not enough
+        XCTAssertEqual(reconciler.reconcile(.accepted(key: source, generation: 11,
+                                                      publishedIDs: [1, 2], expectedIDs: [1, 2])), [])
+        XCTAssertTrue(reconciler.hasPendingFeedback)
+        XCTAssertEqual(reconciler.pendingKeys, [release])
+        XCTAssertEqual(reconciler.reconcile(.accepted(key: release, generation: 12,
+                                                      publishedIDs: [10, 11], expectedIDs: [10, 11])),
+                       [.cancelDegraded(key: source)])
+        XCTAssertFalse(reconciler.hasPendingFeedback)
+    }
+
+    func testDegradedFeedbackAcrossMonitorsShowsWhenTheReleaseScreenFails() {
+        var reconciler = TiledDragFeedbackReconciler()
+        let source = TiledDragFeedbackKey(workspace: 1, displayID: 2)
+        let release = TiledDragFeedbackKey(workspace: 2, displayID: 4)
+        _ = reconciler.beginDegraded(key: source, generation: 10, affectedIDs: [1, 2],
+                                     alsoAwaiting: [release: [10, 11]])
+        XCTAssertEqual(reconciler.reconcile(.failed(key: release, generation: 11, requiredIDs: [10],
+                                                    recoveryPending: false)),
+                       [.showDegraded(key: source, generation: 11)])
+        XCTAssertEqual(reconciler.reconcile(.terminalFailure(key: release)), [], "shown once")
+    }
+
+    func testANewestPassMustReachEveryAwaitedKey() {
+        let source = TiledDragFeedbackKey(workspace: 1, displayID: 2)
+        let release = TiledDragFeedbackKey(workspace: 2, displayID: 4)
+        let pass: [TiledDragFeedbackReconciliation] = [
+            .accepted(key: source, generation: 11, publishedIDs: [1, 2], expectedIDs: [1, 2])
+        ]
+        var reconciler = TiledDragFeedbackReconciler()
+        _ = reconciler.beginDegraded(key: source, generation: 10, affectedIDs: [1, 2],
+                                     alsoAwaiting: [release: [10, 11]])
+        XCTAssertEqual(reconciler.reconcileNewest(pass, activeRetry: false),
+                       [.showDegraded(key: source, generation: 10)],
+                       "the release screen was never retiled, so nothing verified it")
+
+        var waiting = TiledDragFeedbackReconciler()
+        _ = waiting.beginDegraded(key: source, generation: 10, affectedIDs: [1, 2],
+                                  alsoAwaiting: [release: [10, 11]])
+        XCTAssertEqual(waiting.reconcileNewest(pass, activeRetry: true), [])
+        XCTAssertEqual(waiting.pendingKeys, [release])
+    }
+
     func testCachePolicyAcrossTreesTakesTheReleaseScreensMembersToo() {
         let existing: [CGWindowID: CGRect] = [
             1: CGRect(x: 1, y: 1, width: 10, height: 10),
@@ -1091,7 +1142,10 @@ final class DragSwapHandlerInsertionTests: XCTestCase {
                              142: actualTarget], generation: 1)
         let point = CGPoint(x: actualTarget.maxX - 2, y: actualTarget.midY)
 
-        let resolved = TiledDragTargetResolver.resolve(pointer: point, snapshot: snapshot)
+        // the drop's own resolution, as WindowManager asks it at release
+        let resolved = TiledDropPlanner.sameTreeTarget(
+            pointer: point, draggedID: snapshot.draggedID,
+            sourceTiles: snapshot.context.usableFrame, sourceSlots: snapshot.originalFrames)
 
         XCTAssertEqual(resolved, TiledDragTarget(windowID: 142, edge: .right))
     }

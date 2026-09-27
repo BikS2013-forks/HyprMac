@@ -974,7 +974,7 @@ final class TiledDragTransactionTests: XCTestCase {
         XCTAssertTrue(context.usableFrame.contains(actual[2]!))
     }
 
-    func testAcrossTreesSwapThatCannotFitAKnownMinimumRestoresBothWithoutCandidateWrites() {
+    func testAcrossTreesSwapThatCannotFitAKnownMinimumRestoresOnlyTheSource() {
         let (tree, context, target, frames) = crossFixture()
         let fake = FakeAX(frames: frames)
         // 10 cannot shrink into the dragged window's slot, even at 0.85
@@ -991,15 +991,15 @@ final class TiledDragTransactionTests: XCTestCase {
             snapshot, into: target, pointer: center(frames[10]!), swapRequested: true,
             releaseFrame: release, currentContext: { context })
 
-        guard case let .acrossTrees(.rejectedRestored(reason, _), cross) = outcome else {
-            return XCTFail("expected a verified rollback of both trees")
+        // refused before the first write: the release screen was only read
+        guard case let .rejectedRestored(reason, restored) = outcome else {
+            return XCTFail("expected an ordinary restore of the source, got \(outcome)")
         }
         XCTAssertEqual(reason, .preflight(.noRoom))
-        XCTAssertNil(cross.targetCandidate)
-        XCTAssertTrue(cross.moves.isEmpty)
         XCTAssertEqual(fake.frames, frames)
-        XCTAssertEqual(fake.writes.count, frames.count * 3,
-                       "only the rollback's resize-move-resize per original")
+        XCTAssertEqual(Set(restored.keys), [1, 2, 3])
+        XCTAssertEqual(Set(fake.writes.map { $0.0 }), [1, 2, 3], "nothing written on the release screen")
+        XCTAssertEqual(fake.writes.count, 3 * 3, "one resize-move-resize per source original")
     }
 
     func testAcrossTreesSourceWriteFailureAfterTheTargetLandedRestoresBothTrees() {
@@ -1182,6 +1182,55 @@ final class TiledDragTransactionTests: XCTestCase {
         }
         XCTAssertEqual(fake.slowCallTimeouts, [0.1, 0.25])
         XCTAssertTrue(fake.writes.isEmpty)
+    }
+
+    func testSpentDropBudgetCutsTheLongerTries() {
+        let (tree, context, target, frames) = crossFixture()
+        let fake = FakeAX(frames: frames)
+        // the first timeout alone spends this budget
+        let transaction = TiledDragTransaction(ioFactory: fake.factory,
+                                               budget: TiledDragBudget(limit: 0.05))
+        guard case let .captured(snapshot) = transaction.capture(
+            draggedID: 1, tree: tree, context: context, generation: 1,
+            currentContext: { context }) else { return XCTFail("capture failed") }
+        let release = CGRect(origin: CGPoint(x: 1300, y: 100), size: frames[1]!.size)
+        fake.frames[1] = release
+        fake.positionWriteAnswer[1] = 0.15
+        let slot = frames[11]!
+
+        let outcome = transaction.dropAcrossTrees(
+            snapshot, into: target, pointer: CGPoint(x: slot.midX, y: slot.maxY - 2),
+            swapRequested: false, releaseFrame: release, currentContext: { context })
+
+        XCTAssertEqual(fake.slowCallTimeouts, [0.1, 0.1],
+                       "the candidate and the rollback each get their plain try, no 250 ms one")
+        guard case .acrossTrees(.degraded, _) = outcome else {
+            return XCTFail("expected the plain outcome, got \(outcome)")
+        }
+    }
+
+    func testDropBudgetCountsFromTheFirstStart() {
+        let budget = TiledDragBudget(limit: 1)
+        budget.start(at: 10)
+        budget.start(at: 20)
+        XCTAssertTrue(budget.allowsRecovery(at: 10.9))
+        XCTAssertFalse(budget.allowsRecovery(at: 11))
+        XCTAssertTrue(TiledDragBudget(limit: 1).allowsRecovery(at: 50), "an unstarted budget starts now")
+        XCTAssertEqual(TiledDragBudget.defaultLimit, 2.5)
+    }
+
+    func testCommitWhoseSettersDidNotAllSucceedCannotPublish() {
+        var progress = FrameSizingAttempt.Progress()
+        progress.targetIDs = [1, 10]
+        progress.writesCompleted = [1, 10]
+        progress.readbackComplete = true
+        progress.readbackStable = true
+        XCTAssertNil(TiledDragTransaction.unverifiedCommit(progress))
+        progress.writesCompleted = [1]
+        XCTAssertEqual(TiledDragTransaction.unverifiedCommit(progress), .writeFailed(10, .failure))
+        progress.writesCompleted = [1, 10]
+        progress.readbackStable = false
+        XCTAssertEqual(TiledDragTransaction.unverifiedCommit(progress), .attemptsExhausted)
     }
 
     func testTimeoutRecoveryIsOptInAndLeavesAnInstantRefusalAlone() {
