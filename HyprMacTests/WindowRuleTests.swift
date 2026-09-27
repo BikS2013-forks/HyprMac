@@ -169,7 +169,7 @@ final class WindowRuleTests: XCTestCase {
         XCTAssertTrue(HotkeyManager.ignoresAutorepeat(.retileAll))
         XCTAssertFalse(HotkeyManager.actionIsAvailable(.retileAll, tilingEnabled: false))
         XCTAssertEqual(KeybindCategory.from(.retileAll), .system)
-        XCTAssertEqual(Keybind(keyCode: 15, modifiers: [.hypr, .shift], action: .retileAll).actionDescription,
+        XCTAssertEqual(Keybind(keyCode: 15, modifiers: .hypr, action: .retileAll).actionDescription,
                        "Retile All Spaces")
     }
 

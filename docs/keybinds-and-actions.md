@@ -145,7 +145,7 @@ Keep every machine sharing a config on a tolerant build.
 
 ## Retile all spaces
 
-`retileAll` defaults to Hypr+Shift+R and encodes as `{"retileAll":{}}`.
+`retileAll` defaults to Hypr+R and encodes as `{"retileAll":{}}`.
 It runs the same pass as the menu bar's "Retile all spaces": it hides the
 scratchpad, redistributes every window, and applies window rules (below).
 It ignores key autorepeat, is unavailable while tiling is paused, and is
@@ -154,7 +154,7 @@ it only onto a free chord. No `ConfigMigration` step is involved.
 
 ```json
 {"retileAll":{}}
-{"action":{"retileAll":{}},"keyCode":15,"modifiers":3}
+{"action":{"retileAll":{}},"keyCode":15,"modifiers":1}
 ```
 
 ## Window rules

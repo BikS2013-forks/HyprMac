@@ -382,21 +382,21 @@ final class DefaultKeybindsTests: XCTestCase {
         XCTAssertEqual(restore.modifiers, [.hypr, .control])
     }
 
-    func testRetileAllDefaultsToHyprShiftR() throws {
+    func testRetileAllDefaultsToHyprR() throws {
         let bind = try XCTUnwrap(Keybind.defaults.first { $0.action == .retileAll })
         XCTAssertEqual(bind.keyCode, UInt16(kVK_ANSI_R))
-        XCTAssertEqual(bind.modifiers, [.hypr, .shift])
+        XCTAssertEqual(bind.modifiers, .hypr)
     }
 
-    // a user who already bound Hypr+Shift+R keeps it; retile stays in the menu
-    func testDefaultMergeDoesNotShadowOccupiedHyprShiftR() {
-        let custom = Keybind(keyCode: UInt16(kVK_ANSI_R), modifiers: [.hypr, .shift],
+    // a user who already bound Hypr+R keeps it; retile stays in the menu
+    func testDefaultMergeDoesNotShadowOccupiedHyprR() {
+        let custom = Keybind(keyCode: UInt16(kVK_ANSI_R), modifiers: .hypr,
                              action: .launchApp(bundleID: "com.apple.reminders"))
 
         let merged = UserConfig.mergeNewDefaults(saved: [custom])
 
         XCTAssertEqual(merged.filter {
-            $0.keyCode == UInt16(kVK_ANSI_R) && $0.modifiers == [.hypr, .shift]
+            $0.keyCode == UInt16(kVK_ANSI_R) && $0.modifiers == .hypr
         }, [custom])
         XCTAssertFalse(merged.contains { $0.action == .retileAll })
     }
