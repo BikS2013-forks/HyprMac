@@ -71,10 +71,19 @@ struct TiledDragPressResolver {
     }
 }
 
-extension TiledDragTargetResolver {
-    static func resolve(pointer: CGPoint, snapshot: TiledDragSnapshot) -> TiledDragTarget? {
-        resolve(pointer: pointer, draggedID: snapshot.draggedID,
-                intendedSlots: snapshot.originalFrames)
+/// Which workspace a tiled drag released on another monitor lands in: the
+/// one visible there. A disabled monitor tiles nothing, and while the
+/// scratchpad layer is up its scrim covers every other monitor's tiles, so
+/// both refuse and the drop restores.
+enum TiledDragReleasePolicy: Equatable {
+    case workspace(Int)
+    case refused(String)
+
+    static func resolve(monitorDisabled: Bool, scratchpadVisible: Bool,
+                        visibleWorkspace: () -> Int) -> TiledDragReleasePolicy {
+        if monitorDisabled { return .refused("monitor disabled") }
+        if scratchpadVisible { return .refused("scratchpad visible") }
+        return .workspace(visibleWorkspace())
     }
 }
 
@@ -121,6 +130,11 @@ struct TiledDragCachePolicy {
             for id in affectedIDs {
                 actions[id] = (written.contains(id) || id == draggedID) ? .invalidate : .preserve
             }
+        case let .acrossTrees(result, cross):
+            // the release screen's tree was captured and possibly written
+            // too, so its members take the same decision
+            return self.actions(for: result, draggedID: draggedID,
+                                affectedIDs: affectedIDs.union(cross.target.memberIDs))
         case .superseded, .ignored:
             break
         }
@@ -163,13 +177,15 @@ struct TiledDragFeedbackPolicy {
             return .rejected
         case .degraded:
             return .degraded
+        case let .acrossTrees(result, _):
+            return feedback(for: result)
         case .committed, .ignored, .superseded:
             return nil
         }
     }
 }
 
-struct TiledDragFeedbackKey: Equatable {
+struct TiledDragFeedbackKey: Hashable {
     let workspace: Int
     let displayID: CGDirectDisplayID
 }
@@ -189,21 +205,42 @@ enum TiledDragDeferredFeedbackAction: Equatable {
 }
 
 struct TiledDragFeedbackReconciler {
+    private struct Waiting {
+        /// ids a verified layout under this key must publish
+        var ids: Set<CGWindowID>
+        /// the newest generation heard from this key
+        var generation: UInt64
+    }
+
     private struct Pending {
+        /// the key the feedback is shown and cancelled under: the drop's source
         let key: TiledDragFeedbackKey
         var generation: UInt64
-        var affectedIDs: Set<CGWindowID>
+        /// every key the drop touched that has not been cleared yet. a drop
+        /// across monitors waits on the release screen's key as well
+        var awaiting: [TiledDragFeedbackKey: Waiting]
         var shownGeneration: UInt64?
     }
 
     private var pending: Pending?
     var hasPendingFeedback: Bool { pending != nil }
-    func isPending(for key: TiledDragFeedbackKey) -> Bool { pending?.key == key }
+    func isPending(for key: TiledDragFeedbackKey) -> Bool { pending?.awaiting[key] != nil }
     var pendingKey: TiledDragFeedbackKey? { pending?.key }
+    /// every key the pending feedback still waits on
+    var pendingKeys: [TiledDragFeedbackKey] { pending.map { Array($0.awaiting.keys) } ?? [] }
     var shownGeneration: UInt64? { pending?.shownGeneration }
 
+    /// `alsoAwaiting` names other keys the drop touched, each with the ids a
+    /// verified layout there must publish before the feedback is cancelled.
+    ///
+    /// A second failure from the same source adds to what the first is still
+    /// waiting for rather than replacing it, so a cross drop's release screen
+    /// is not forgotten. A failure from another source reports the pending
+    /// one first, as before, since its feedback cannot cancel under this key.
     mutating func beginDegraded(key: TiledDragFeedbackKey, generation: UInt64,
-                                affectedIDs: Set<CGWindowID>) -> [TiledDragDeferredFeedbackAction] {
+                                affectedIDs: Set<CGWindowID>,
+                                alsoAwaiting: [TiledDragFeedbackKey: Set<CGWindowID>] = [:])
+        -> [TiledDragDeferredFeedbackAction] {
         if let pending, pending.key == key, generation <= pending.generation {
             return []
         }
@@ -213,8 +250,16 @@ struct TiledDragFeedbackReconciler {
         } else {
             actions = []
         }
-        pending = Pending(key: key, generation: generation,
-                          affectedIDs: affectedIDs, shownGeneration: nil)
+        var touched = alsoAwaiting
+        touched[key, default: []].formUnion(affectedIDs)
+        if let pending, pending.key == key {
+            for (earlier, waiting) in pending.awaiting {
+                touched[earlier, default: []].formUnion(waiting.ids)
+            }
+        }
+        // every key waits for a verified layout newer than this failure
+        let awaiting = touched.mapValues { Waiting(ids: $0, generation: generation) }
+        pending = Pending(key: key, generation: generation, awaiting: awaiting, shownGeneration: nil)
         return actions
     }
 
@@ -229,30 +274,28 @@ struct TiledDragFeedbackReconciler {
             key = eventKey
             generation = eventGeneration
         case let .terminalFailure(eventKey):
-            guard eventKey == pending.key else { return [] }
+            guard pending.awaiting[eventKey] != nil else { return [] }
             return showOnce()
         case .noResult:
             return showOnce()
         }
-        guard key == pending.key, generation > pending.generation else { return [] }
+        guard let waiting = pending.awaiting[key], generation > waiting.generation else { return [] }
 
         switch event {
         case let .accepted(_, _, publishedIDs, expectedIDs):
-            if publishedIDs == expectedIDs,
-               publishedIDs.isSuperset(of: pending.affectedIDs) {
+            if publishedIDs == expectedIDs, publishedIDs.isSuperset(of: waiting.ids) {
+                self.pending?.awaiting[key] = nil
+                // every key the drop touched has to come back verified
+                guard self.pending?.awaiting.isEmpty == true else { return [] }
                 self.pending = nil
                 return [.cancelDegraded(key: pending.key)]
             }
-            self.pending?.generation = generation
+            heard(generation, from: key)
             return showOnce()
         case let .failed(_, _, requiredIDs, recoveryPending):
-            self.pending?.affectedIDs.formUnion(requiredIDs)
-            guard !recoveryPending else {
-                self.pending?.generation = generation
-                return []
-            }
-            self.pending?.generation = generation
-            return showOnce()
+            self.pending?.awaiting[key]?.ids.formUnion(requiredIDs)
+            heard(generation, from: key)
+            return recoveryPending ? [] : showOnce()
         case .terminalFailure, .noResult:
             return []
         }
@@ -261,18 +304,25 @@ struct TiledDragFeedbackReconciler {
     mutating func reconcileNewest(_ events: [TiledDragFeedbackReconciliation],
                                   activeRetry: Bool) -> [TiledDragDeferredFeedbackAction] {
         guard let pending else { return [] }
-        let matching = events.compactMap { event -> (UInt64, TiledDragFeedbackReconciliation)? in
+        var newest: [TiledDragFeedbackKey: (generation: UInt64, event: TiledDragFeedbackReconciliation)] = [:]
+        for event in events {
             switch event {
             case let .accepted(key, generation, _, _), let .failed(key, generation, _, _):
-                return key == pending.key ? (generation, event) : nil
+                guard pending.awaiting[key] != nil,
+                      newest[key].map({ generation > $0.generation }) ?? true else { continue }
+                newest[key] = (generation, event)
             case .terminalFailure, .noResult:
-                return nil
+                continue
             }
         }
-        if let newest = matching.max(by: { $0.0 < $1.0 })?.1 {
-            return reconcile(newest)
+        var actions: [TiledDragDeferredFeedbackAction] = []
+        for (_, entry) in newest.sorted(by: { $0.value.generation < $1.value.generation }) {
+            actions += reconcile(entry.event)
         }
-        return activeRetry ? [] : reconcile(.noResult)
+        // a key the pass never reached cannot be verified by it
+        guard let still = self.pending,
+              still.awaiting.keys.contains(where: { newest[$0] == nil }) else { return actions }
+        return activeRetry ? actions : actions + reconcile(.noResult)
     }
 
     mutating func cancel() {
@@ -281,6 +331,13 @@ struct TiledDragFeedbackReconciler {
 
     mutating func feedbackFinished(generation: UInt64) {
         if pending?.shownGeneration == generation { pending = nil }
+    }
+
+    private mutating func heard(_ generation: UInt64, from key: TiledDragFeedbackKey) {
+        pending?.awaiting[key]?.generation = generation
+        if let current = pending?.generation, generation > current {
+            pending?.generation = generation
+        }
     }
 
     private mutating func showOnce() -> [TiledDragDeferredFeedbackAction] {
@@ -297,14 +354,20 @@ final class TiledDragSessionCoordinator {
     typealias Schedule = (TimeInterval, @escaping () -> Void) -> Void
     typealias Report = (TiledDragCompletion) -> Void
     typealias CaptureFailureReport = (TiledDragCaptureResult) -> Void
+    /// whether a release with no same-tree target landed on another monitor
+    typealias IsCrossMonitor = (CGPoint, TiledDragSnapshot) -> Bool
 
     private(set) var isFinishingDrag = false
+    /// the tiled press being dragged, for the live drop preview. nil once
+    /// the release is finishing
+    var pressSnapshot: TiledDragSnapshot? { isFinishingDrag ? nil : snapshot }
     private let capture: Capture
     private let apply: Apply
     private let resolveTarget: ResolveTarget
     private let schedule: Schedule
     private let report: Report
     private let captureFailureReport: CaptureFailureReport
+    private let isCrossMonitor: IsCrossMonitor
     private var pressEpoch: UInt64 = 0
     private var snapshot: TiledDragSnapshot?
     private var captureFailure: TiledDragCaptureResult?
@@ -314,13 +377,15 @@ final class TiledDragSessionCoordinator {
          resolveTarget: @escaping ResolveTarget,
          schedule: @escaping Schedule,
          report: @escaping Report,
-         captureFailureReport: @escaping CaptureFailureReport = { _ in }) {
+         captureFailureReport: @escaping CaptureFailureReport = { _ in },
+         isCrossMonitor: @escaping IsCrossMonitor = { _, _ in false }) {
         self.capture = capture
         self.apply = apply
         self.resolveTarget = resolveTarget
         self.schedule = schedule
         self.report = report
         self.captureFailureReport = captureFailureReport
+        self.isCrossMonitor = isCrossMonitor
     }
 
     func mouseDown(at pointer: CGPoint) {
@@ -370,9 +435,14 @@ final class TiledDragSessionCoordinator {
                 mode = release.swapRequested
                     ? .swap(targetID: target.windowID)
                     : .insert(targetID: target.windowID, edge: target.edge)
+            } else if self.isCrossMonitor(release.pointer, snapshot) {
+                mode = .crossMonitor(pointer: release.pointer,
+                                     swapRequested: release.swapRequested)
             } else {
                 mode = nil
             }
+            hyprLog(.notice, .tiling, "tiled drag mode: dragged=\(snapshot.draggedID) "
+                    + "swap=\(release.swapRequested) mode=\(Self.describe(mode))")
             let outcome = self.apply(snapshot, mode)
             guard self.pressEpoch == epoch else { return }
             self.report(TiledDragCompletion(snapshot: snapshot, outcome: outcome))
@@ -389,6 +459,16 @@ final class TiledDragSessionCoordinator {
         captureFailure = nil
         isFinishingDrag = false
     }
+
+    private static func describe(_ mode: TiledDragMode?) -> String {
+        switch mode {
+        case let .insert(targetID, edge)?: return "insert(\(targetID) \(edge))"
+        case let .swap(targetID)?: return "swap(\(targetID))"
+        case .resize?: return "resize"
+        case .crossMonitor?: return "crossMonitor"
+        case nil: return "none (no source tile under the point, and not on another monitor)"
+        }
+    }
 }
 
 final class TiledDragHandler {
@@ -399,6 +479,7 @@ final class TiledDragHandler {
 
     private let coordinator: TiledDragSessionCoordinator
     var isFinishingDrag: Bool { coordinator.isFinishingDrag }
+    var pressSnapshot: TiledDragSnapshot? { coordinator.pressSnapshot }
 
     init(capture: @escaping Capture,
          drop: @escaping TiledDragSessionCoordinator.Apply,
@@ -408,7 +489,8 @@ final class TiledDragHandler {
          readCache: @escaping CacheRead,
          writeCache: @escaping CacheWrite,
          completion: @escaping Completion,
-         captureFailure: @escaping TiledDragSessionCoordinator.CaptureFailureReport) {
+         captureFailure: @escaping TiledDragSessionCoordinator.CaptureFailureReport,
+         isCrossMonitor: @escaping TiledDragSessionCoordinator.IsCrossMonitor = { _, _ in false }) {
         coordinator = TiledDragSessionCoordinator(
             capture: { point in capture(point, capturedFrames) },
             apply: drop,
@@ -420,6 +502,8 @@ final class TiledDragHandler {
                     completion(result)
                     return
                 }
+                // a drop across monitors adds the release screen's members
+                // inside the policy
                 let updated = TiledDragCacheUpdate.applying(
                     result.outcome,
                     draggedID: result.snapshot.draggedID,
@@ -429,7 +513,8 @@ final class TiledDragHandler {
                 writeCache(updated)
                 completion(result)
             },
-            captureFailureReport: captureFailure
+            captureFailureReport: captureFailure,
+            isCrossMonitor: isCrossMonitor
         )
     }
 

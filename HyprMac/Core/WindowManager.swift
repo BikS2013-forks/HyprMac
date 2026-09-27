@@ -78,6 +78,18 @@ class WindowManager {
     private var activeTiledDragFeedback: (key: TiledDragFeedbackKey,
                                            layoutGeneration: UInt64, borderToken: Int)?
 
+    // live highlight of where a tiled drag will land. the frames come from
+    // the press capture and the trees, never from AX while the pointer moves
+    private let dropPreviewPanel = TiledDropPreviewPanel()
+    private lazy var dropPreview = TiledDragPreviewSession(presenter: .init(
+        show: { [weak self] rect in self?.dropPreviewPanel.show(rect) },
+        hide: { [weak self] in self?.dropPreviewPanel.hide() }))
+    // per drag: each other display's tree as a drop there would find it,
+    // kept while its workspace and tree stay what they were
+    private var dropPreviewTargets: [CGDirectDisplayID: (workspace: Int, target: TiledDragCrossTarget)] = [:]
+    private var dragOptionDown = false
+    private var dragFlagsMonitor: Any?
+
     // Action → service routing. dispatch(_:) replaces the handleAction switch.
     private var actionDispatcher: ActionDispatcher!
 
@@ -344,6 +356,9 @@ class WindowManager {
             guard self.config.enabled || action == .showKeybinds || action == .showWorkspaceOverview else { return }
             self.suppressions.suppress("mouse-focus", for: 0.15)
             self.handleAction(action)
+            // a workspace switch or the scratchpad mid-drag changes where the
+            // drop would land, even with the pointer standing still
+            self.dropPreview.refresh()
         }
 
         hotkeyManager.onHyprKeyDown = { [weak self] in
@@ -351,6 +366,8 @@ class WindowManager {
             self.hyprHeld = true
             let mousePressActive = self.mouseDragLifecycle.buttonDown
             self.mouseDragLifecycle.noteHyprKeyDown()
+            // a latched Hypr turns the drop into a swap
+            self.dropPreview.refresh()
             // Do not repair focus while a mouse gesture is in flight. A stale
             // tracker can otherwise focus a fallback window and redirect the
             // native title-bar drag when Hypr is pressed mid-gesture.
@@ -830,6 +847,11 @@ class WindowManager {
             self, selector: #selector(screenParametersChanged),
             name: NSApplication.didChangeScreenParametersNotification, object: nil
         )
+        // a workspace that changed under a drag changes where it would land
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(tiledDropPreviewWorkspacesChanged),
+            name: .hyprMacWorkspaceChanged, object: nil
+        )
 
         if LogConfig.persistentFileLog {
             hyprLog(.notice, .lifecycle, "file log: \(DebugLogFile.shared.fileURL.path)")
@@ -857,6 +879,7 @@ class WindowManager {
         dumpStateSignalSource?.cancel()
         dumpStateSignalSource = nil
         tiledDragHandler.cancel()
+        endTiledDropPreview()
         tiledDragFeedback.cancel()
         pendingTiledDragCompletion = nil
         activeTiledDragFeedback = nil
@@ -1044,9 +1067,10 @@ class WindowManager {
         // when the user drags a floating window, its frame changes 60Hz but our
         // border only repositions on the discovery poll — so it lags behind ugly. hide
         // the border for the duration of the drag and restore it on mouseUp.
-        mouseDragMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDragged) { [weak self] _ in
+        mouseDragMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDragged) { [weak self] event in
             guard let self = self else { return }
             self.mouseDragLifecycle.observeDrag(hyprHeld: self.hyprHeld)
+            self.updateTiledDropPreview(event)
             if self.mouseDownFloatingWindowID != 0 {
                 self.focusBorder.hideFloatingBorder(for: self.mouseDownFloatingWindowID)
             }
@@ -1060,11 +1084,20 @@ class WindowManager {
             // the scrim stays: re-shown later it would come back above the members
             if !self.scratchpad.isVisible { self.dimmingOverlay.hideAll() }
         }
+        // Option held during a tiled drag turns its drop into a swap, and the
+        // preview must say so even when the pointer is standing still
+        dragFlagsMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+            guard let self, self.dropPreview.isActive else { return }
+            self.dragOptionDown = event.modifierFlags.contains(.option)
+            self.dropPreview.refresh()
+        }
         mouseUpMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseUp) { [weak self] event in
             let shouldDetectDrag = self?.mouseDraggedSinceDown ?? false
             let draggedFloatingID = self?.mouseDownFloatingWindowID ?? 0
             let draggedFloatingFrame = self?.mouseDownFloatingFrame
             var floaterDragged = false
+            // the drop decides now; the preview has said all it can
+            self?.endTiledDropPreview()
             if let self {
                 let primaryHeight = self.displayManager.primaryScreenHeight
                 let releasePoint = TiledDragEvent.point(event: event, primaryHeight: primaryHeight)
@@ -1147,10 +1180,13 @@ class WindowManager {
         if let m = mouseDownMonitor { NSEvent.removeMonitor(m) }
         if let m = mouseDragMonitor { NSEvent.removeMonitor(m) }
         if let m = mouseUpMonitor { NSEvent.removeMonitor(m) }
+        if let m = dragFlagsMonitor { NSEvent.removeMonitor(m) }
         mouseMoveMonitor = nil
         mouseDownMonitor = nil
         mouseDragMonitor = nil
         mouseUpMonitor = nil
+        dragFlagsMonitor = nil
+        endTiledDropPreview()
         mouseDownPointCG = nil
         mouseDownFloatingWindowID = 0
         mouseDownFloatingFrame = nil
@@ -3168,6 +3204,16 @@ class WindowManager {
 
     /// Handler for the `.hyprMacRetileAll` notification posted from the
     /// menu bar's "Retile All" action.
+    @objc private func tiledDropPreviewWorkspacesChanged() {
+        dropPreview.refresh()
+    }
+
+    /// Hide the drop preview and forget the drag's release trees.
+    private func endTiledDropPreview() {
+        dropPreview.end()
+        dropPreviewTargets = [:]
+    }
+
     @objc private func retileAllRequested() {
         hyprLog(.debug, .lifecycle, "retile all spaces requested")
         scratchpad.hide(reason: .workspaceAction)
@@ -3200,14 +3246,35 @@ private extension WindowManager {
             },
             drop: { [weak self] snapshot, mode in
                 guard let self, self.isRunning else { return .superseded }
-                return self.tilingEngine.dropTiledDrag(
+                var releaseLocation: () -> (workspace: Int, screen: NSScreen,
+                                            floatingIDs: Set<CGWindowID>)? = { nil }
+                if case let .crossMonitor(pointer, _) = mode {
+                    releaseLocation = self.tiledDragReleaseLocation(pointer, leaving: snapshot)
+                }
+                let outcome = self.tilingEngine.dropTiledDrag(
                     snapshot,
                     mode: mode,
-                    currentLocation: { [weak self] in self?.tiledDragLocation(for: snapshot) })
+                    currentLocation: { [weak self] in self?.tiledDragLocation(for: snapshot) },
+                    releaseLocation: releaseLocation)
+                // membership moves in the same step the engine published both
+                // trees, so nothing between here and the report can split them
+                if case let .acrossTrees(.committed, cross) = outcome {
+                    for (id, workspace) in cross.moves.sorted(by: { $0.key < $1.key }) {
+                        self.workspaceManager.moveWindow(id, toWorkspace: workspace)
+                        self.minimaRevalidation.cancel(id, reason: "tiled drag across monitors")
+                    }
+                }
+                return outcome
             },
-            resolveTarget: { pointer, snapshot in
-                guard snapshot.context.usableFrame.contains(pointer) else { return nil }
-                return TiledDragTargetResolver.resolve(pointer: pointer, snapshot: snapshot)
+            resolveTarget: { [weak self] pointer, snapshot in
+                let onSourceTiles = snapshot.context.usableFrame.contains(pointer)
+                // the planner the live preview uses, on the same press capture
+                let target = TiledDropPlanner.sameTreeTarget(
+                    pointer: pointer, draggedID: snapshot.draggedID,
+                    sourceTiles: snapshot.context.usableFrame, sourceSlots: snapshot.originalFrames)
+                self?.noteTiledDragRelease(pointer, snapshot: snapshot,
+                                           onSourceTiles: onSourceTiles, target: target)
+                return target
             },
             schedule: { delay, work in
                 DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
@@ -3216,12 +3283,175 @@ private extension WindowManager {
             readCache: { [weak self] in self?.stateCache.tiledPositions ?? [:] },
             writeCache: { [weak self] frames in self?.stateCache.tiledPositions = frames },
             completion: { [weak self] completion in self?.completeTiledDrag(completion) },
-            captureFailure: { [weak self] result in self?.reportTiledDragCaptureFailure(result) })
+            captureFailure: { [weak self] result in self?.reportTiledDragCaptureFailure(result) },
+            isCrossMonitor: { [weak self] pointer, snapshot in
+                guard let self, let screen = self.exactFullScreen(containing: pointer) else {
+                    return false
+                }
+                return self.tiledDragDisplayID(screen) != snapshot.context.physicalDisplayID
+            })
+    }
+
+    /// Start or move the live drop preview. Only a press the tiled capture
+    /// took gets one, once it is past the drag threshold. Whether it shows
+    /// is the drop's own call: see `tiledDropPreviewFrame`.
+    private func updateTiledDropPreview(_ event: NSEvent) {
+        let point = TiledDragEvent.point(event: event, primaryHeight: displayManager.primaryScreenHeight)
+        dragOptionDown = event.modifierFlags.contains(.option)
+        if !dropPreview.isActive {
+            guard isRunning, config.enabled, let snapshot = tiledDragHandler.pressSnapshot,
+                  TiledDragEvent.isDrag(from: mouseDownPointCG, to: point, sawDragEvent: true) else {
+                return
+            }
+            dropPreviewTargets = [:]
+            dropPreviewPanel.primaryScreenHeight = displayManager.primaryScreenHeight
+            dropPreviewPanel.accentColor = config.resolvedDropPreviewColor
+            dropPreviewPanel.cornerRadius = config.windowCornerRadius
+            dropPreview.begin { [weak self] point in
+                self?.tiledDropPreviewFrame(at: point, snapshot: snapshot)
+            }
+        }
+        dropPreview.move(to: point)
+    }
+
+    /// Where the dragged window would land if released at `point`, nil where
+    /// the drop would restore. The drop's own planner and candidates, fed
+    /// the press capture and the trees; no AX.
+    private func tiledDropPreviewFrame(at point: CGPoint, snapshot: TiledDragSnapshot) -> CGRect? {
+        // a drop only acts on a move: an unmoved window is ignored and a
+        // resize resizes. judged by the drop's own rule, on the window list
+        // any layout since the press supersedes the drop, and there is then
+        // nothing to show
+        guard isRunning, tiledDragHandler.pressSnapshot?.generation == snapshot.generation,
+              tilingEngine.currentLayoutGeneration == snapshot.generation,
+              tiledDragGesture(snapshot) == .move else { return nil }
+        let swap = mouseDragLifecycle.releaseRequestsSwap(hyprHeld: hyprHeld, optionDown: dragOptionDown)
+        var release = TiledDropRelease.source
+        var target: TiledDragCrossTarget?
+        if let screen = exactFullScreen(containing: point),
+           tiledDragDisplayID(screen) != snapshot.context.physicalDisplayID {
+            let found = dropPreviewTarget(on: screen, snapshot: snapshot)
+            target = found?.target
+            release = .otherMonitor(slots: found?.slots)
+        }
+        let plan = TiledDropPlanner.plan(pointer: point, draggedID: snapshot.draggedID,
+                                         sourceTiles: snapshot.context.usableFrame,
+                                         sourceSlots: snapshot.originalFrames, release: release)
+        return tilingEngine.tiledDragPreviewFrame(snapshot, plan: plan, swap: swap, target: target)
+    }
+
+    /// Another display's tree as a drop there would find it. The policy is
+    /// asked every time, so a disabled monitor or the scratchpad refuses as
+    /// it would at release, and a cached tree is kept only while its
+    /// workspace is still the visible one and the tree itself is unchanged.
+    private func dropPreviewTarget(on screen: NSScreen, snapshot: TiledDragSnapshot)
+        -> (target: TiledDragCrossTarget, slots: [CGWindowID: CGRect])? {
+        let displayID = tiledDragDisplayID(screen)
+        guard case let .workspace(workspace) = tiledDragReleasePolicy(on: screen) else {
+            dropPreviewTargets[displayID] = nil
+            return nil
+        }
+        if let cached = dropPreviewTargets[displayID], cached.workspace == workspace,
+           cached.target.currentContext() == cached.target.context {
+            return (cached.target, Self.slots(of: cached.target))
+        }
+        guard let found = tilingEngine.tiledDragPreviewTarget(
+            for: snapshot, location: (workspace, screen, stateCache.floatingWindowIDs)) else {
+            dropPreviewTargets[displayID] = nil
+            return nil
+        }
+        dropPreviewTargets[displayID] = (workspace, found)
+        return (found, Self.slots(of: found))
+    }
+
+    private static func slots(of target: TiledDragCrossTarget) -> [CGWindowID: CGRect] {
+        TiledDropPlanner.slots(of: target.tree, in: target.context.usableFrame,
+                               gap: target.context.gap, padding: target.context.padding)
+    }
+
+    /// What the drag is doing to the dragged window right now, by the drop's
+    /// own rule, from the window list rather than AX. A press that selects
+    /// text is `.unmoved`, an edge drag `.resize`.
+    private func tiledDragGesture(_ snapshot: TiledDragSnapshot) -> TiledDragGesture? {
+        var id = UnsafeRawPointer(bitPattern: UInt(snapshot.draggedID))
+        guard let ids = CFArrayCreate(kCFAllocatorDefault, &id, 1, nil),
+              let list = CGWindowListCreateDescriptionFromArray(ids) as? [[String: Any]],
+              let raw = list.first?[kCGWindowBounds as String] as? NSDictionary,
+              let bounds = CGRect(dictionaryRepresentation: raw as CFDictionary) else { return nil }
+        return snapshot.gesture(to: bounds)
     }
 
     private func exactScreen(containing point: CGPoint) -> NSScreen? {
         let matches = displayManager.screens.filter { displayManager.cgRect(for: $0).contains(point) }
         return matches.count == 1 ? matches[0] : nil
+    }
+
+    /// One notice line per tiled release: the point in global CG coordinates,
+    /// the source and release screens, and the same-tree target with every
+    /// source tile it weighed. The drop decision reads from here.
+    private func noteTiledDragRelease(_ pointer: CGPoint, snapshot: TiledDragSnapshot,
+                                      onSourceTiles: Bool, target: TiledDragTarget?) {
+        func describe(_ screen: NSScreen?) -> String {
+            guard let screen else { return "none" }
+            return "'\(screen.localizedName)' display=\(tiledDragDisplayID(screen)) "
+                + "full=\(displayManager.cgFullRect(for: screen))"
+        }
+        let source = displayManager.screens.first {
+            tiledDragDisplayID($0) == snapshot.context.physicalDisplayID
+        }
+        var slots = snapshot.originalFrames
+        slots.removeValue(forKey: snapshot.draggedID)
+        let tiles = onSourceTiles
+            ? " tiles=[\(TiledDragTargetResolver.trace(pointer: pointer, slots: slots))]" : ""
+        hyprLog(.notice, .tiling, "tiled drag release: dragged=\(snapshot.draggedID) "
+                + String(format: "point=cg(%g,%g) ", Double(pointer.x), Double(pointer.y))
+                + "source=ws\(snapshot.context.workspace) on \(describe(source)) "
+                + "sourceTiles=\(snapshot.context.usableFrame) onSourceTiles=\(onSourceTiles) "
+                + "release=\(describe(exactFullScreen(containing: pointer))) "
+                + "sameTree=\(target.map { "\($0.windowID) \($0.edge)" } ?? "none")" + tiles)
+    }
+
+    /// The one screen whose whole display holds `point`, menu bar and Dock
+    /// included, so a release there still counts for that monitor.
+    private func exactFullScreen(containing point: CGPoint) -> NSScreen? {
+        let matches = displayManager.screens.filter { displayManager.cgFullRect(for: $0).contains(point) }
+        return matches.count == 1 ? matches[0] : nil
+    }
+
+    /// Where a tiled drag released over another monitor lands: that screen's
+    /// visible workspace, re-read on every call so the engine can tell when
+    /// it goes stale. A screen that cannot take the window logs why once
+    /// and yields nothing, and the drop restores.
+    private func tiledDragReleaseLocation(_ pointer: CGPoint, leaving snapshot: TiledDragSnapshot)
+        -> () -> (workspace: Int, screen: NSScreen, floatingIDs: Set<CGWindowID>)? {
+        guard let screen = exactFullScreen(containing: pointer) else {
+            hyprLog(.notice, .tiling, "tiled drag across monitors refused: release point on no screen")
+            return { nil }
+        }
+        let displayID = tiledDragDisplayID(screen)
+        guard displayID != snapshot.context.physicalDisplayID else { return { nil } }
+        let policy = tiledDragReleasePolicy(on: screen)
+        guard case let .workspace(workspace) = policy else {
+            if case let .refused(reason) = policy {
+                hyprLog(.notice, .tiling, "tiled drag across monitors refused on "
+                        + "\(screen.localizedName): \(reason)")
+            }
+            return { nil }
+        }
+        return { [weak self] in
+            guard let self, self.isRunning else { return nil }
+            let matches = self.displayManager.screens.filter { self.tiledDragDisplayID($0) == displayID }
+            guard matches.count == 1, let current = matches.first,
+                  self.tiledDragReleasePolicy(on: current) == .workspace(workspace) else { return nil }
+            return (workspace, current, self.stateCache.floatingWindowIDs)
+        }
+    }
+
+    private func tiledDragReleasePolicy(on screen: NSScreen) -> TiledDragReleasePolicy {
+        TiledDragReleasePolicy.resolve(
+            monitorDisabled: workspaceManager.isMonitorDisabled(screen),
+            scratchpadVisible: scratchpad.isVisible,
+            visibleWorkspace: { workspaceManager.workspaceForScreen(screen) })
     }
 
     private func tiledDragLocation(for snapshot: TiledDragSnapshot)
@@ -3256,53 +3486,79 @@ private extension WindowManager {
 
     private func completeTiledDrag(_ completion: TiledDragCompletion) {
         let affected = completion.snapshot.context.memberIDs
+        // a drop onto another monitor wraps the ordinary outcome together
+        // with the release screen's tree
+        var outcome = completion.outcome
+        var crossTree: TiledDragCrossTree?
+        if case let .acrossTrees(result, cross) = completion.outcome {
+            outcome = result
+            crossTree = cross
+        }
         if tiledDragFeedback.hasPendingFeedback {
-            switch completion.outcome {
+            switch outcome {
             case .degraded:
                 // beginDegraded reports the earlier failure before replacing it.
                 break
             case .committed, .rejectedRestored:
-                let key = TiledDragFeedbackKey(
+                // every key this verified drop touched speaks for its members
+                var verified = [(TiledDragFeedbackKey(
                     workspace: completion.snapshot.context.workspace,
-                    displayID: completion.snapshot.context.physicalDisplayID)
-                let actions: [TiledDragDeferredFeedbackAction]
-                if tiledDragFeedback.isPending(for: key) {
-                    actions = tiledDragFeedback.reconcile(.accepted(
-                        key: key, generation: tilingEngine.currentLayoutGeneration,
-                        publishedIDs: affected, expectedIDs: affected))
-                } else {
+                    displayID: completion.snapshot.context.physicalDisplayID), affected)]
+                if let crossTree {
+                    verified.append((TiledDragFeedbackKey(
+                        workspace: crossTree.target.workspace,
+                        displayID: crossTree.target.physicalDisplayID), crossTree.target.memberIDs))
+                }
+                var actions: [TiledDragDeferredFeedbackAction] = []
+                let touched = verified.filter { tiledDragFeedback.isPending(for: $0.0) }
+                if touched.isEmpty {
                     actions = tiledDragFeedback.reconcile(.noResult)
+                }
+                for (key, members) in touched {
+                    actions += tiledDragFeedback.reconcile(.accepted(
+                        key: key, generation: tilingEngine.currentLayoutGeneration,
+                        publishedIDs: members, expectedIDs: members))
                 }
                 applyTiledDragFeedbackActions(actions, completion: pendingTiledDragCompletion)
                 if !tiledDragFeedback.hasPendingFeedback {
                     pendingTiledDragCompletion = nil
                 }
-            case .ignored, .superseded:
+            case .ignored, .superseded, .acrossTrees:
                 break
             }
         }
+        let scope = crossTree == nil ? "" : " across monitors"
         hyprLog(.debug, .tiling, "tiled drag result: dragged=\(completion.snapshot.draggedID) "
-                + "members=\(affected.sorted()) outcome=\(Self.outcomeName(completion.outcome))")
-        switch completion.outcome {
+                + "members=\(affected.union(crossTree?.target.memberIDs ?? []).sorted()) "
+                + "outcome=\(Self.outcomeName(completion.outcome))")
+        switch outcome {
         case let .rejectedRestored(reason, frames):
-            hyprLog(.notice, .tiling, "tiled drag rejected and restored: reason=\(reason) actual=\(frames)")
+            hyprLog(.notice, .tiling, "tiled drag\(scope) rejected and restored: reason=\(reason.trace) actual=\(frames)")
         case let .degraded(candidateReason, restorationReason, frames, progress):
-            let candidate = String(describing: candidateReason)
-            let restoration = String(describing: restorationReason)
+            let candidate = candidateReason?.trace ?? "nil"
+            let restoration = restorationReason?.trace ?? "nil"
             let written = (progress?.possiblyWritten ?? []).sorted()
-            hyprLog(.notice, .tiling, "tiled drag degraded: candidate=\(candidate) restoration=\(restoration) "
+            hyprLog(.notice, .tiling, "tiled drag\(scope) degraded: candidate=\(candidate) restoration=\(restoration) "
                     + "written=\(written) actual=\(frames)")
-        case .committed, .superseded, .ignored: break
+        case .committed, .superseded, .ignored, .acrossTrees: break
         }
-        switch completion.outcome {
+        switch outcome {
         case .superseded, .ignored: return
-        case .committed, .rejectedRestored, .degraded: break
+        case .committed, .rejectedRestored, .degraded, .acrossTrees: break
+        }
+        // the drop already moved membership with the trees
+        var committedAcross: [CGWindowID: CGRect]?
+        if crossTree != nil, case let .committed(_, frames, _) = outcome {
+            focusController.recordFocus(completion.snapshot.draggedID,
+                                        reason: "tiled drag across monitors")
+            committedAcross = frames
         }
         if completion.snapshot.context.workspace == ScratchpadController.workspace {
             scratchpad.syncTiledFrames()
         }
         // the same per-window decisions the tiled-position cache just
-        // applied, so the two cannot drift apart
+        // applied, so the two cannot drift apart. a drop across monitors
+        // brings the release screen's members in through the policy
         let actions = TiledDragCachePolicy.actions(for: completion.outcome,
                                                    draggedID: completion.snapshot.draggedID,
                                                    affectedIDs: affected)
@@ -3327,6 +3583,18 @@ private extension WindowManager {
             case .preserve: break
             }
         }
+        // the dragged window keeps focus on its new monitor. the border goes
+        // on the verified frame: a live AX read lags the write
+        let draggedID = completion.snapshot.draggedID
+        if let frame = committedAcross?[draggedID], config.showFocusBorder,
+           let window = stateCache.cachedWindows[draggedID],
+           !isFullscreenSuppressed(focused: window) {
+            focusBorder.accentCGColor = config.resolvedFocusBorderColor.cgColor
+            focusBorder.show(around: frame, windowID: draggedID)
+        }
+        if committedAcross != nil {
+            NotificationCenter.default.post(name: .hyprMacWorkspaceChanged, object: nil)
+        }
         refreshDimming(tiledRectsOverride: stateCache.tiledPositions)
         switch TiledDragFeedbackPolicy.feedback(for: completion.outcome) {
         case .rejected:
@@ -3339,9 +3607,17 @@ private extension WindowManager {
             let key = TiledDragFeedbackKey(
                 workspace: completion.snapshot.context.workspace,
                 displayID: completion.snapshot.context.physicalDisplayID)
+            // a drop across monitors also waits on the release screen's tree
+            var releaseScreen: [TiledDragFeedbackKey: Set<CGWindowID>] = [:]
+            if let crossTree {
+                releaseScreen[TiledDragFeedbackKey(workspace: crossTree.target.workspace,
+                                                   displayID: crossTree.target.physicalDisplayID)]
+                    = crossTree.target.memberIDs
+            }
             applyTiledDragFeedbackActions(tiledDragFeedback.beginDegraded(
                 key: key, generation: tilingEngine.currentLayoutGeneration,
-                affectedIDs: affected), completion: pendingTiledDragCompletion)
+                affectedIDs: affected, alsoAwaiting: releaseScreen),
+                completion: pendingTiledDragCompletion)
             pendingTiledDragCompletion = completion
             hyprLog(.notice, .tiling, "tiled drag degraded feedback deferred until reconciliation")
             pollingScheduler.schedule()
@@ -3357,6 +3633,8 @@ private extension WindowManager {
         case .rejectedRestored: return "rejectedRestored"
         case .degraded: return "degraded"
         case .superseded: return "superseded"
+        case let .acrossTrees(result, cross):
+            return "acrossTrees(\(outcomeName(result)) ws\(cross.target.workspace))"
         }
     }
 
@@ -3397,11 +3675,12 @@ private extension WindowManager {
                            })
         }
         var activeRetry = false
-        if let key = tiledDragFeedback.pendingKey,
-           let screen = displayManager.screens.first(where: {
-               tiledDragDisplayID($0) == key.displayID
-           }) {
-            activeRetry = admissionRecovery.hasActiveRetry(workspace: key.workspace, screen: screen)
+        for key in tiledDragFeedback.pendingKeys {
+            guard let screen = displayManager.screens.first(where: {
+                tiledDragDisplayID($0) == key.displayID
+            }) else { continue }
+            activeRetry = activeRetry
+                || admissionRecovery.hasActiveRetry(workspace: key.workspace, screen: screen)
         }
         let actions = tiledDragFeedback.reconcileNewest(events, activeRetry: activeRetry)
         if !actions.isEmpty {

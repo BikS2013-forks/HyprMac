@@ -737,11 +737,17 @@ class TilingEngine {
             floatingIDs: location.floatingIDs)
     }
 
+    /// `releaseLocation` is the visible workspace on the screen a
+    /// `.crossMonitor` release landed on, re-read for every staleness check.
+    /// nil there means that screen cannot take the window, and the release
+    /// restores as a drop with no target always has.
     func dropTiledDrag(
         _ snapshot: TiledDragSnapshot,
         mode: TiledDragMode?,
         currentLocation: @escaping () -> (workspace: Int, screen: NSScreen,
-                                          floatingIDs: Set<CGWindowID>)?
+                                          floatingIDs: Set<CGWindowID>)?,
+        releaseLocation: @escaping () -> (workspace: Int, screen: NSScreen,
+                                          floatingIDs: Set<CGWindowID>)? = { nil }
     ) -> TiledDragDropOutcome {
         func currentState() -> (location: (workspace: Int, screen: NSScreen,
                                             floatingIDs: Set<CGWindowID>),
@@ -761,9 +767,37 @@ class TilingEngine {
         guard currentContext() == snapshot.context else { return .superseded }
         let transaction = TiledDragTransaction(ioFactory: frameSizingIOFactory,
                                                minimumSize: minimumSize(for:))
-        let outcome = transaction.dropRelease(snapshot, mode: mode,
+        let outcome: TiledDragDropOutcome
+        var crossTarget: CrossMonitorTarget?
+        if case let .crossMonitor(pointer, swapRequested) = mode {
+            // crossMonitorTarget logs why it declined
+            guard let target = crossMonitorTarget(for: snapshot, currentLocation: currentLocation,
+                                                  releaseLocation: releaseLocation) else {
+                return dropTiledDrag(snapshot, mode: nil, currentLocation: currentLocation)
+            }
+            crossTarget = target
+            outcome = transaction.dropRelease(snapshot, mode: nil,
+                                              currentContext: currentContext) { releaseFrame in
+                transaction.dropAcrossTrees(
+                    snapshot, into: target.drop, pointer: pointer, swapRequested: swapRequested,
+                    releaseFrame: releaseFrame, currentContext: currentContext,
+                    configuration: target.configuration,
+                    positionFirst: { standing, layouts, rect in
+                        self.positionFirstWindowIDs(standing, layouts: layouts, destination: rect)
+                    })
+            }
+        } else {
+            outcome = transaction.dropRelease(snapshot, mode: mode,
                                               currentContext: currentContext)
+        }
         guard currentContext() == snapshot.context else { return .superseded }
+        if case let .acrossTrees(result, cross) = outcome, let crossTarget {
+            guard let state = currentState(), state.context == snapshot.context else {
+                return .superseded
+            }
+            return settleAcrossTrees(result, cross, snapshot: snapshot, target: crossTarget,
+                                     sourceLocation: state.location)
+        }
         guard case let .committed(candidate, actualFrames, progress) = outcome else {
             noteDragGeometry(outcome, snapshot: snapshot)
             return outcome
@@ -800,7 +834,7 @@ class TilingEngine {
     /// geometry until a layout is accepted again.
     private func noteDragGeometry(_ outcome: TiledDragDropOutcome, snapshot: TiledDragSnapshot) {
         switch outcome {
-        case .ignored, .superseded, .committed: return
+        case .ignored, .superseded, .committed, .acrossTrees: return
         case .rejectedRestored, .degraded: break
         }
         guard let key = trees.first(where: { $0.value === snapshot.sourceTree })?.key else { return }
@@ -809,16 +843,210 @@ class TilingEngine {
         mark(key, windowIDs: snapshot.context.memberIDs, insertedIDs: [], restored: restored)
     }
 
+    /// The release screen's side of a cross-monitor drop.
+    private struct CrossMonitorTarget {
+        let drop: TiledDragCrossTarget
+        /// the tree the release key mapped to when the drop started. nil for
+        /// a workspace with no tree, which `drop` stands in for.
+        let live: BSPTree?
+        let location: () -> (workspace: Int, screen: NSScreen, floatingIDs: Set<CGWindowID>)?
+        let configuration: FrameSizingConfiguration
+    }
+
+    /// The tree a cross-monitor release lands in: the visible workspace's on
+    /// the release screen, or an empty stand-in when it has none. nil when
+    /// that screen cannot take the window: no location, the scratchpad on
+    /// either side, the source's own workspace or display, or a tree that
+    /// holds a floater. Logs the answer either way.
+    private func crossMonitorTarget(
+        for snapshot: TiledDragSnapshot,
+        currentLocation: () -> (workspace: Int, screen: NSScreen, floatingIDs: Set<CGWindowID>)?,
+        releaseLocation: @escaping () -> (workspace: Int, screen: NSScreen,
+                                          floatingIDs: Set<CGWindowID>)?
+    ) -> CrossMonitorTarget? {
+        func decline(_ reason: String) -> CrossMonitorTarget? {
+            hyprLog(.notice, .tiling, "tiled drag across monitors declined: dragged=\(snapshot.draggedID) "
+                    + "reason=\(reason) — restoring as a release with no target")
+            return nil
+        }
+        guard let source = currentLocation() else { return decline("the source location is gone") }
+        let target: CrossMonitorTarget
+        switch resolveCrossMonitorTarget(for: snapshot, releaseLocation: releaseLocation) {
+        case let .success(found): target = found
+        case let .failure(declined): return decline(declined.reason)
+        }
+        let context = target.drop.context
+        let release = releaseLocation()
+        hyprLog(.notice, .tiling, "tiled drag across monitors target: dragged=\(snapshot.draggedID) "
+                + "ws\(context.workspace) on '\(release?.screen.localizedName ?? "?")' "
+                + "display=\(context.physicalDisplayID) "
+                + "members=\(target.drop.tree.allWindows.map(\.windowID)) "
+                + "tree=\(target.live == nil ? "none" : "live") usable=\(context.usableFrame)")
+        // the release point is on another display, so a swap or a rollback
+        // carries a window across. a scale change gets the longer budget,
+        // as a verified layout does
+        guard let release else { return decline("the release location is gone") }
+        let from = source.screen.backingScaleFactor
+        let to = release.screen.backingScaleFactor
+        guard from != to else { return target }
+        let configuration = FrameSizingConfiguration().withScaleChangeBudget
+        hyprLog(.notice, .tiling, "tiled drag across monitors scale change: "
+                + "\(Self.scale(from))→\(Self.scale(to)) "
+                + "deadline=\(Int((configuration.deadline * 1000).rounded()))ms")
+        return CrossMonitorTarget(drop: target.drop, live: target.live, location: target.location,
+                                  configuration: configuration)
+    }
+
+    private struct CrossMonitorDecline: Error {
+        let reason: String
+    }
+
+    /// `crossMonitorTarget` without the logging or the scale budget, for the
+    /// drop and its live preview alike. Reads no AX.
+    private func resolveCrossMonitorTarget(
+        for snapshot: TiledDragSnapshot,
+        releaseLocation: @escaping () -> (workspace: Int, screen: NSScreen,
+                                          floatingIDs: Set<CGWindowID>)?
+    ) -> Result<CrossMonitorTarget, CrossMonitorDecline> {
+        func decline(_ reason: String) -> Result<CrossMonitorTarget, CrossMonitorDecline> {
+            .failure(CrossMonitorDecline(reason: reason))
+        }
+        guard snapshot.context.workspace != Self.scratchpadWorkspace else {
+            return decline("the source is the scratchpad")
+        }
+        guard let release = releaseLocation() else {
+            return decline("no release location (see the refusal above)")
+        }
+        guard release.workspace != Self.scratchpadWorkspace else {
+            return decline("the release workspace is the scratchpad")
+        }
+        guard release.workspace != snapshot.context.workspace else {
+            return decline("the release workspace ws\(release.workspace) is the source's")
+        }
+        let live = trees[TilingKey(workspace: release.workspace, screen: release.screen)]
+        let tree = live ?? BSPTree()
+        let generation = snapshot.generation
+        let currentContext: () -> TiledDragContext? = {
+            guard self.layoutGeneration == generation,
+                  let location = releaseLocation() else { return nil }
+            return self.tiledDragContext(workspace: location.workspace, screen: location.screen,
+                                         floatingIDs: location.floatingIDs, sourceTree: tree,
+                                         mapped: live != nil)
+        }
+        guard tree !== snapshot.sourceTree else { return decline("the release tree is the source tree") }
+        guard let context = currentContext() else {
+            return decline("no single screen for display \(physicalDisplayID(for: release.screen)) "
+                           + "or its ws\(release.workspace) tree changed")
+        }
+        guard context.physicalDisplayID != snapshot.context.physicalDisplayID else {
+            return decline("the release display \(context.physicalDisplayID) is the source's")
+        }
+        guard context.floatingIDs.isDisjoint(with: context.memberIDs) else {
+            return decline("floaters \(context.floatingIDs.intersection(context.memberIDs).sorted()) "
+                           + "are in the release tree")
+        }
+        return .success(CrossMonitorTarget(
+            drop: TiledDragCrossTarget(tree: tree, context: context, currentContext: currentContext),
+            live: live, location: releaseLocation, configuration: FrameSizingConfiguration()))
+    }
+
+    // MARK: - live drop preview
+
+    /// The release screen's side of a drop, for the live preview: the same
+    /// tree and context a drop there would use, found the same way, without
+    /// reading AX and without logging. nil when that drop would decline.
+    func tiledDragPreviewTarget(
+        for snapshot: TiledDragSnapshot,
+        location: (workspace: Int, screen: NSScreen, floatingIDs: Set<CGWindowID>)
+    ) -> TiledDragCrossTarget? {
+        guard case let .success(target) = resolveCrossMonitorTarget(
+            for: snapshot, releaseLocation: { location }) else { return nil }
+        return target.drop
+    }
+
+    /// Where the dragged window would land for `plan`, from the candidates
+    /// and layouts the drop itself builds. nil when that drop would restore.
+    func tiledDragPreviewFrame(_ snapshot: TiledDragSnapshot, plan: TiledDropPlan, swap: Bool,
+                               target: TiledDragCrossTarget?) -> CGRect? {
+        TiledDragTransaction(ioFactory: frameSizingIOFactory, minimumSize: minimumSize(for:))
+            .previewFrame(snapshot, plan: plan, swap: swap, target: target)
+    }
+
+    /// Publish a cross-monitor drop, both trees together, or mark both keys
+    /// when it did not commit. Membership is the caller's, and it moves only
+    /// on the committed outcome this returns.
+    private func settleAcrossTrees(
+        _ result: TiledDragDropOutcome, _ cross: TiledDragCrossTree,
+        snapshot: TiledDragSnapshot, target: CrossMonitorTarget,
+        sourceLocation: (workspace: Int, screen: NSScreen, floatingIDs: Set<CGWindowID>)
+    ) -> TiledDragDropOutcome {
+        let sourceKey = TilingKey(workspace: sourceLocation.workspace, screen: sourceLocation.screen)
+        guard case let .committed(sourceCandidate, actualFrames, progress) = result else {
+            // neither tree changed, and neither key speaks for its geometry
+            // until a layout is accepted again
+            var restored = false
+            if case .rejectedRestored = result { restored = true }
+            if trees[sourceKey] === snapshot.sourceTree {
+                mark(sourceKey, windowIDs: snapshot.context.memberIDs, insertedIDs: [],
+                     restored: restored)
+            }
+            if let live = target.live,
+               let targetKey = trees.first(where: { $0.value === live })?.key {
+                mark(targetKey, windowIDs: cross.target.memberIDs, insertedIDs: [],
+                     restored: restored)
+            }
+            return .acrossTrees(result, cross)
+        }
+        guard let release = target.location(),
+              target.drop.currentContext() == cross.target else { return .superseded }
+        let targetKey = TilingKey(workspace: release.workspace, screen: release.screen)
+        guard trees[sourceKey] === snapshot.sourceTree,
+              trees[targetKey] === target.live else { return .superseded }
+        // the same publication gate as a same-tree drop, over both screens
+        guard progress.candidateVerified, let targetCandidate = cross.targetCandidate else {
+            mark(sourceKey, windowIDs: snapshot.context.memberIDs, insertedIDs: [], restored: false)
+            if target.live != nil {
+                mark(targetKey, windowIDs: cross.target.memberIDs, insertedIDs: [], restored: false)
+            }
+            hyprLog(.notice, .tiling, "drag across monitors accepted but not fully written"
+                    + " — trees not published")
+            return .acrossTrees(.degraded(candidateReason: nil, restorationReason: nil,
+                                          actualFrames: actualFrames, progress: progress),
+                                TiledDragCrossTree(target: cross.target, targetCandidate: nil,
+                                                   moves: [:]))
+        }
+        if sourceCandidate.allWindows.isEmpty {
+            trees.removeValue(forKey: sourceKey)
+        } else {
+            trees[sourceKey] = sourceCandidate
+        }
+        trees[targetKey] = targetCandidate
+        unverified.removeValue(forKey: sourceKey)
+        unverified.removeValue(forKey: targetKey)
+        for (id, workspace) in cross.moves {
+            admit([id], toWorkspace: workspace)
+            pendingInsertedWindowIDs[sourceKey]?.removeAll { $0 == id }
+            pendingInsertedWindowIDs[targetKey]?.removeAll { $0 == id }
+        }
+        hyprLog(.notice, .tiling, "tiled drag across monitors committed: "
+                + "ws\(snapshot.context.workspace)=\(sourceCandidate.allWindows.map(\.windowID)) "
+                + "ws\(cross.target.workspace)=\(targetCandidate.allWindows.map(\.windowID)) "
+                + "moves=\(cross.moves.sorted { $0.key < $1.key }.map { "\($0.key)→ws\($0.value)" })")
+        return .acrossTrees(result, cross)
+    }
+
+    /// `mapped` false asks for a workspace with no tree yet: `sourceTree` is
+    /// then an unpublished stand-in and the key must still map to nothing.
     private func tiledDragContext(workspace: Int, screen: NSScreen,
                                   floatingIDs: Set<CGWindowID>,
-                                  sourceTree: BSPTree) -> TiledDragContext? {
+                                  sourceTree: BSPTree, mapped: Bool = true) -> TiledDragContext? {
         let requestedDisplayID = physicalDisplayID(for: screen)
         let matchingScreens = displayManager.screens.filter {
             physicalDisplayID(for: $0) == requestedDisplayID
         }
         guard matchingScreens.count == 1, let currentScreen = matchingScreens.first else { return nil }
         let key = TilingKey(workspace: workspace, screen: currentScreen)
-        guard trees[key] === sourceTree else { return nil }
+        guard trees[key] === (mapped ? sourceTree : nil) else { return nil }
         let memberIDs = sourceTree.allWindows.map(\.windowID)
         return TiledDragContext(
             workspace: workspace,
@@ -952,11 +1180,8 @@ class TilingEngine {
     )
 
     private lazy var timeoutRecoveryPoller: FrameReadbackPoller = {
-        var configuration = FrameSizingConfiguration()
-        configuration.deadline = 0.75
-        configuration.perCallTimeout = 0.25
-        return FrameReadbackPoller(
-            configuration: configuration,
+        FrameReadbackPoller(
+            configuration: FrameSizingConfiguration().withTimeoutRecoveryBudget,
             generation: { [weak self] in self?.layoutGeneration ?? UInt64.max },
             ioFactory: frameSizingIOFactory
         )
@@ -1363,7 +1588,7 @@ class TilingEngine {
         if case .accepted = restored.verdict {
             if terminal.progress.phase == .candidate,
                terminal.progress.timeoutShapedCannotComplete,
-               Self.isDirectCannotComplete(reason),
+               reason.isDirectCannotComplete,
                layoutGeneration == generation {
                 hyprLog(.notice, .tiling, "verified layout AX timeout recovery: reason=\(reason) ids="
                         + "[" + windows.map { String($0.windowID) }.joined(separator: ", ") + "]")
@@ -1417,13 +1642,6 @@ class TilingEngine {
                          restorationAttempted: true,
                          actualFrames: restored.actualFrames,
                          progress: progress)
-    }
-
-    private static func isDirectCannotComplete(_ failure: FrameSizingFailure) -> Bool {
-        switch failure {
-        case .writeFailed(_, .cannotComplete), .readFailed(_, .cannotComplete): true
-        default: false
-        }
     }
 
     /// Rebuild a private batch after its first write taught stricter minima.

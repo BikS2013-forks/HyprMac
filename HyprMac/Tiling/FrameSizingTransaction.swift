@@ -34,6 +34,27 @@ extension FrameSizingFailure {
             return false
         }
     }
+
+    /// A setter or read that AX gave up on itself, not wrapped in a cleanup
+    /// failure. What an AX timeout recovery may try again.
+    var isDirectCannotComplete: Bool {
+        switch self {
+        case .writeFailed(_, .cannotComplete), .readFailed(_, .cannotComplete): true
+        default: false
+        }
+    }
+
+    /// The failure with raw AX codes. The synthesized description prints
+    /// `__C.AXError`, which does not say which error it was.
+    var trace: String {
+        switch self {
+        case let .writeFailed(id, error): return "writeFailed(\(id), \(error.rawValue))"
+        case let .readFailed(id, error): return "readFailed(\(id), \(error.rawValue))"
+        case let .cleanupFailed(id, primary, error):
+            return "cleanupFailed(\(id), primary: \(primary?.trace ?? "nil"), \(error.rawValue))"
+        default: return "\(self)"
+        }
+    }
 }
 
 struct FrameSizingIO {
@@ -138,6 +159,16 @@ struct FrameSizingConfiguration {
                                        Int((extended.deadline / pollInterval).rounded(.up)))
         return extended
     }
+
+    /// This configuration for the one retry an AX messaging timeout gets: a
+    /// longer per-call timeout and deadline, never shorter than this one's.
+    /// The verified layout's timeout recovery and the tiled drag both use it.
+    var withTimeoutRecoveryBudget: FrameSizingConfiguration {
+        var relaxed = self
+        relaxed.deadline = max(deadline, 0.75)
+        relaxed.perCallTimeout = max(perCallTimeout, 0.25)
+        return relaxed
+    }
 }
 
 /// Two windows that sit on top of each other. Only the restoration phase
@@ -182,8 +213,9 @@ struct FrameSizingAttempt {
         var targetIDs: [CGWindowID] = []
         var possiblyWritten: Set<CGWindowID> = []
         var writesCompleted: Set<CGWindowID> = []
-        /// A setter or frame read returned `cannotComplete` after consuming
-        /// nearly all of its configured messaging timeout.
+        /// A setter, a frame read or the enhanced-UI read before a window's
+        /// writes returned `cannotComplete` after consuming nearly all of its
+        /// configured messaging timeout.
         var timeoutShapedCannotComplete = false
         /// every target produced a readable frame
         var readbackComplete = false
@@ -219,9 +251,10 @@ struct FrameSizingAttempt {
     func captureFrames(windowIDs: [CGWindowID], generation: UInt64) -> Result {
         let started = io.now()
         var frames: [CGWindowID: CGRect] = [:]
-        let progress = Progress(phase: .capture, generation: generation,
+        var progress = Progress(phase: .capture, generation: generation,
                                 targetIDs: windowIDs.sorted())
-        // a capture never writes, so only the readback fields move
+        // a capture never writes, so only the readback fields and the
+        // timeout shape move
         func out(_ result: Result) -> Result {
             var stamped = progress
             stamped.readbackComplete = windowIDs.allSatisfy { result.actualFrames[$0] != nil }
@@ -254,7 +287,9 @@ struct FrameSizingAttempt {
                     ? .windowUnavailable(windowID) : .readFailed(windowID, timeoutError)
                 return out(Result(verdict: .unknown(failure), actualFrames: frames))
             }
+            let positionStarted = io.now()
             let (positionError, position) = io.readPosition(windowID, configuration.perCallTimeout)
+            noteTimeoutShape(positionError, started: positionStarted, progress: &progress)
             guard io.currentGeneration() == generation else {
                 return out(Result(verdict: .unknown(.superseded), actualFrames: frames))
             }
@@ -278,7 +313,9 @@ struct FrameSizingAttempt {
                     ? .windowUnavailable(windowID) : .readFailed(windowID, sizeTimeoutError)
                 return out(Result(verdict: .unknown(failure), actualFrames: frames))
             }
+            let sizeStarted = io.now()
             let (sizeError, size) = io.readSize(windowID, configuration.perCallTimeout)
+            noteTimeoutShape(sizeError, started: sizeStarted, progress: &progress)
             guard io.currentGeneration() == generation else {
                 return out(Result(verdict: .unknown(.superseded), actualFrames: frames))
             }
@@ -508,9 +545,13 @@ struct FrameSizingAttempt {
             return Result(verdict: .unknown(failure), actualFrames: actualFrames)
         }
         let token: AXFrameWriteBatch.Token
+        let beginStarted = io.now()
         switch io.beginFrameWrite(target.windowID, configuration.perCallTimeout, checkpoint) {
         case let .ready(value): token = value
         case let .failed(error):
+            // the enhanced-UI read that opens a window's writes is an AX call
+            // like the setters. seen live: Messages refused it at 101 ms
+            noteTimeoutShape(error, started: beginStarted, progress: &progress)
             traceSteps(false)
             let failure: FrameSizingFailure = error == .invalidUIElement
                 ? .windowUnavailable(target.windowID) : .writeFailed(target.windowID, error)
@@ -932,18 +973,101 @@ struct FrameSizingTransaction {
     }
 
     let attempt: FrameSizingAttempt
+    /// Give a call AX gave up on at its messaging timeout one more try with
+    /// `withTimeoutRecoveryBudget`, the way the verified layout's timeout
+    /// recovery does. Off unless the caller asks. The tiled drag asks: an app
+    /// that has just crossed displays can take longer than the 100 ms call
+    /// timeout to answer (Messages, live: a position write refused at 101 ms,
+    /// then the rollback's first read refused at 101 ms too).
+    var recoversTimeouts = false
+    /// Whether a longer try may still run. A tiled drag spends one budget
+    /// across all of its attempts, so this asks the drop, not the attempt.
+    var recoveryAllowed: () -> Bool = { true }
 
+    /// A frame read, with its one timeout retry.
+    func capture(windowIDs: [CGWindowID], generation: UInt64) -> FrameSizingAttempt.Result {
+        let first = attempt.captureFrames(windowIDs: windowIDs, generation: generation)
+        return retried(first, phase: .capture, ids: windowIDs, generation: generation) { relaxed in
+            relaxed.captureFrames(windowIDs: windowIDs, generation: generation)
+        }
+    }
+
+    /// A candidate attempt, with its one timeout retry.
+    func candidate(targets: [FrameSizingAttempt.Target], usableFrame: CGRect, gap: CGFloat,
+                   generation: UInt64,
+                   phase: FrameSizingPhase = .candidate) -> FrameSizingAttempt.Result {
+        let first = attempt.apply(targets: targets, usableFrame: usableFrame,
+                                  gap: gap, generation: generation, phase: phase)
+        return retried(first, phase: phase, ids: targets.map(\.windowID),
+                       generation: generation) { relaxed in
+            relaxed.apply(targets: targets, usableFrame: usableFrame, gap: gap,
+                          generation: generation, phase: phase)
+        }
+    }
+
+    /// A rollback, with its one timeout retry.
     func restore(originalFrames: [CGWindowID: CGRect], usableFrame: CGRect,
                  gap: CGFloat, generation: UInt64) -> FrameSizingAttempt.Result {
         let targets = originalFrames.map { FrameSizingAttempt.Target(windowID: $0.key, frame: $0.value) }
             .sorted { $0.windowID < $1.windowID }
+        let first = Self.strict(attempt).apply(targets: targets, usableFrame: usableFrame,
+                                               gap: gap, generation: generation, phase: .restoration)
+        return retried(first, phase: .restoration, ids: targets.map(\.windowID),
+                       generation: generation) { relaxed in
+            Self.strict(relaxed).apply(targets: targets, usableFrame: usableFrame, gap: gap,
+                                       generation: generation, phase: .restoration)
+        }
+    }
+
+    private static func strict(_ attempt: FrameSizingAttempt) -> FrameSizingAttempt {
         var strictAttempt = attempt
         strictAttempt.configuration.sizeOvershootTolerance = strictAttempt.configuration.sizeTolerance
         strictAttempt.configuration.sizeUndershootTolerance = strictAttempt.configuration.sizeTolerance
         strictAttempt.configuration.aggregateSafetySlack = strictAttempt.configuration.sizeTolerance
         strictAttempt.configuration.correspondenceOnly = true
-        return strictAttempt.apply(targets: targets, usableFrame: usableFrame,
-                                   gap: gap, generation: generation, phase: .restoration)
+        return strictAttempt
+    }
+
+    /// `first`, or when it ended on an AX messaging timeout and nothing
+    /// newer owns the geometry, one more run of `again` with the recovery
+    /// budget. A timeout is what the verified layout's recovery asks for: a
+    /// direct `cannotComplete` from a call that used up nearly all of its
+    /// timeout. One that comes back at once is AX refusing, and restores.
+    /// The retry's result stands, carrying every id either run may have
+    /// written.
+    private func retried(_ first: FrameSizingAttempt.Result, phase: FrameSizingPhase,
+                         ids: [CGWindowID], generation: UInt64,
+                         _ again: (FrameSizingAttempt) -> FrameSizingAttempt.Result)
+        -> FrameSizingAttempt.Result {
+        guard recoversTimeouts else { return first }
+        let reason: FrameSizingFailure
+        switch first.verdict {
+        case .accepted: return first
+        case let .rejected(failure), let .unknown(failure): reason = failure
+        }
+        guard reason.isDirectCannotComplete, first.progress.timeoutShapedCannotComplete,
+              attempt.io.currentGeneration() == generation else { return first }
+        guard recoveryAllowed() else {
+            hyprLog(.notice, .tiling, "frame attempt AX timeout recovery skipped: phase=\(phase.rawValue) "
+                    + "reason=\(reason.trace) ids=\(ids) — the drop's time budget is spent")
+            return first
+        }
+        var relaxed = attempt
+        relaxed.configuration = attempt.configuration.withTimeoutRecoveryBudget
+        hyprLog(.notice, .tiling, "frame attempt AX timeout recovery: phase=\(phase.rawValue) "
+                + "reason=\(reason.trace) ids=\(ids) "
+                + "timeout=\(Int((relaxed.configuration.perCallTimeout * 1000).rounded()))ms "
+                + "deadline=\(Int((relaxed.configuration.deadline * 1000).rounded()))ms")
+        var second = again(relaxed)
+        second.progress.possiblyWritten.formUnion(first.progress.possiblyWritten)
+        switch second.verdict {
+        case .accepted:
+            hyprLog(.notice, .tiling, "frame attempt AX timeout recovery accepted: phase=\(phase.rawValue)")
+        case let .rejected(failure), let .unknown(failure):
+            hyprLog(.notice, .tiling, "frame attempt AX timeout recovery refused: "
+                    + "phase=\(phase.rawValue) reason=\(failure.trace)")
+        }
+        return second
     }
 
     func apply(targets: [FrameSizingAttempt.Target], originalFrames: [CGWindowID: CGRect],
@@ -955,8 +1079,8 @@ struct FrameSizingTransaction {
                 restorationReason: nil,
                 actualFrames: [:]))
         }
-        let candidate = attempt.apply(targets: targets, usableFrame: usableFrame,
-                                      gap: gap, generation: generation, phase: phase)
+        let candidate = self.candidate(targets: targets, usableFrame: usableFrame,
+                                       gap: gap, generation: generation, phase: phase)
         let candidateOnly = FrameSizingProgressReport(candidate: candidate.progress)
         func report(_ outcome: Outcome, restored: FrameSizingAttempt.Result? = nil) -> Report {
             var progress = candidateOnly

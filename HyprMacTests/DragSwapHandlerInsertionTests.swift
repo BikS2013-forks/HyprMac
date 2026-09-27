@@ -670,6 +670,159 @@ final class DragSwapHandlerInsertionTests: XCTestCase {
         ), newer)
     }
 
+    func testDegradedFeedbackAcrossMonitorsWaitsForBothKeys() {
+        var reconciler = TiledDragFeedbackReconciler()
+        let source = TiledDragFeedbackKey(workspace: 1, displayID: 2)
+        let release = TiledDragFeedbackKey(workspace: 2, displayID: 4)
+        XCTAssertEqual(reconciler.beginDegraded(key: source, generation: 10, affectedIDs: [1, 2],
+                                                alsoAwaiting: [release: [10, 11]]), [])
+        XCTAssertEqual(Set(reconciler.pendingKeys), [source, release])
+
+        // the source verified on its own is not enough
+        XCTAssertEqual(reconciler.reconcile(.accepted(key: source, generation: 11,
+                                                      publishedIDs: [1, 2], expectedIDs: [1, 2])), [])
+        XCTAssertTrue(reconciler.hasPendingFeedback)
+        XCTAssertEqual(reconciler.pendingKeys, [release])
+        XCTAssertEqual(reconciler.reconcile(.accepted(key: release, generation: 12,
+                                                      publishedIDs: [10, 11], expectedIDs: [10, 11])),
+                       [.cancelDegraded(key: source)])
+        XCTAssertFalse(reconciler.hasPendingFeedback)
+    }
+
+    func testDegradedFeedbackAcrossMonitorsShowsWhenTheReleaseScreenFails() {
+        var reconciler = TiledDragFeedbackReconciler()
+        let source = TiledDragFeedbackKey(workspace: 1, displayID: 2)
+        let release = TiledDragFeedbackKey(workspace: 2, displayID: 4)
+        _ = reconciler.beginDegraded(key: source, generation: 10, affectedIDs: [1, 2],
+                                     alsoAwaiting: [release: [10, 11]])
+        XCTAssertEqual(reconciler.reconcile(.failed(key: release, generation: 11, requiredIDs: [10],
+                                                    recoveryPending: false)),
+                       [.showDegraded(key: source, generation: 11)])
+        XCTAssertEqual(reconciler.reconcile(.terminalFailure(key: release)), [], "shown once")
+    }
+
+    func testASecondFailureFromTheSameSourceKeepsWaitingOnTheReleaseScreen() {
+        var reconciler = TiledDragFeedbackReconciler()
+        let source = TiledDragFeedbackKey(workspace: 1, displayID: 2)
+        let release = TiledDragFeedbackKey(workspace: 2, displayID: 4)
+        _ = reconciler.beginDegraded(key: source, generation: 10, affectedIDs: [1, 2],
+                                     alsoAwaiting: [release: [10, 11]])
+        // a same-tree drop from the same source then degrades too
+        XCTAssertEqual(reconciler.beginDegraded(key: source, generation: 12, affectedIDs: [1, 3]), [])
+        XCTAssertEqual(Set(reconciler.pendingKeys), [source, release])
+
+        // the source must publish both failures' windows, after the second one
+        XCTAssertEqual(reconciler.reconcile(.accepted(key: source, generation: 11,
+                                                      publishedIDs: [1, 2, 3],
+                                                      expectedIDs: [1, 2, 3])), [],
+                       "older than the second failure")
+        XCTAssertEqual(reconciler.reconcile(.accepted(key: source, generation: 13,
+                                                      publishedIDs: [1, 2, 3],
+                                                      expectedIDs: [1, 2, 3])), [])
+        XCTAssertEqual(reconciler.pendingKeys, [release])
+        XCTAssertEqual(reconciler.reconcile(.accepted(key: release, generation: 14,
+                                                      publishedIDs: [10, 11],
+                                                      expectedIDs: [10, 11])),
+                       [.cancelDegraded(key: source)])
+    }
+
+    func testANewestPassMustReachEveryAwaitedKey() {
+        let source = TiledDragFeedbackKey(workspace: 1, displayID: 2)
+        let release = TiledDragFeedbackKey(workspace: 2, displayID: 4)
+        let pass: [TiledDragFeedbackReconciliation] = [
+            .accepted(key: source, generation: 11, publishedIDs: [1, 2], expectedIDs: [1, 2])
+        ]
+        var reconciler = TiledDragFeedbackReconciler()
+        _ = reconciler.beginDegraded(key: source, generation: 10, affectedIDs: [1, 2],
+                                     alsoAwaiting: [release: [10, 11]])
+        XCTAssertEqual(reconciler.reconcileNewest(pass, activeRetry: false),
+                       [.showDegraded(key: source, generation: 10)],
+                       "the release screen was never retiled, so nothing verified it")
+
+        var waiting = TiledDragFeedbackReconciler()
+        _ = waiting.beginDegraded(key: source, generation: 10, affectedIDs: [1, 2],
+                                  alsoAwaiting: [release: [10, 11]])
+        XCTAssertEqual(waiting.reconcileNewest(pass, activeRetry: true), [])
+        XCTAssertEqual(waiting.pendingKeys, [release])
+    }
+
+    func testCachePolicyAcrossTreesTakesTheReleaseScreensMembersToo() {
+        let existing: [CGWindowID: CGRect] = [
+            1: CGRect(x: 1, y: 1, width: 10, height: 10),
+            2: CGRect(x: 2, y: 2, width: 20, height: 20),
+            10: CGRect(x: 10, y: 10, width: 10, height: 10),
+            11: CGRect(x: 11, y: 11, width: 10, height: 10),
+            99: CGRect(x: 99, y: 99, width: 9, height: 9)
+        ]
+        let target = TiledDragContext(
+            workspace: 2, physicalDisplayID: 78,
+            usableFrame: CGRect(x: 400, y: 0, width: 400, height: 300),
+            gap: 8, padding: 8, maxDepth: 2, memberIDs: [10, 11], floatingIDs: [],
+            fingerprint: BSPTree().structuralFingerprint())
+        let cross = TiledDragCrossTree(target: target, targetCandidate: nil, moves: [:])
+        let verified: [CGWindowID: CGRect] = [
+            1: CGRect(x: 408, y: 8, width: 100, height: 100),
+            2: CGRect(x: 8, y: 8, width: 100, height: 100),
+            10: CGRect(x: 508, y: 8, width: 100, height: 100),
+            11: CGRect(x: 608, y: 8, width: 100, height: 100)
+        ]
+        let committed = TiledDragCacheUpdate.applying(
+            .acrossTrees(.committed(candidate: BSPTree(), actualFrames: verified,
+                                    progress: FrameSizingProgressReport()), cross),
+            draggedID: 1, affectedIDs: [1, 2], to: existing)
+        for id: CGWindowID in [1, 2, 10, 11] { XCTAssertEqual(committed[id], verified[id]) }
+        XCTAssertEqual(committed[99], existing[99])
+
+        // the candidate reached 1 and 10; nothing reached 2 or 11
+        var progress = FrameSizingProgressReport()
+        progress.candidate.possiblyWritten = [1, 10]
+        let degraded = TiledDragCachePolicy.actions(
+            for: .acrossTrees(.degraded(candidateReason: .sizing(.geometryMismatch(10)),
+                                        restorationReason: nil, actualFrames: [:],
+                                        progress: progress), cross),
+            draggedID: 1, affectedIDs: [1, 2])
+        XCTAssertEqual(degraded, [1: .invalidate, 2: .preserve, 10: .invalidate, 11: .preserve])
+        XCTAssertEqual(TiledDragFeedbackPolicy.feedback(
+            for: .acrossTrees(.rejectedRestored(reason: .preflight(.maxDepthExceeded),
+                                                actualFrames: verified), cross)), .rejected)
+    }
+
+    func testOnlyAReleaseOffTheSourceMonitorAsksForACrossMonitorDrop() {
+        let captured = snapshot(draggedID: 1)
+        let scheduler = DeferredScheduler()
+        var modes: [TiledDragMode?] = []
+        let coordinator = TiledDragSessionCoordinator(
+            capture: { _ in .captured(captured) },
+            apply: { _, mode in modes.append(mode); return .superseded },
+            resolveTarget: { point, _ in
+                point.x < 100 ? TiledDragTarget(windowID: 2, edge: .left) : nil
+            },
+            schedule: scheduler.schedule,
+            report: { _ in },
+            isCrossMonitor: { point, _ in point.x >= 1000 })
+
+        // a same-tree target wins, a miss on the source stays a miss, and
+        // only a release on another monitor carries its pointer across
+        let releases: [(CGFloat, Bool)] = [(50, false), (500, false), (1500, false), (1500, true)]
+        for (index, release) in releases.enumerated() {
+            coordinator.mouseDown(at: .zero)
+            coordinator.mouseUp(TiledDragRelease(pointer: CGPoint(x: release.0, y: 10),
+                                                 swapRequested: release.1, sawDragEvent: true))
+            scheduler.run(index)
+        }
+
+        XCTAssertEqual(modes.count, 4)
+        XCTAssertInsert(modes[0], targetID: 2, edge: .left)
+        XCTAssertNil(modes[1])
+        for (mode, swap) in [(modes[2], false), (modes[3], true)] {
+            guard case let .crossMonitor(pointer, swapRequested)? = mode else {
+                return XCTFail("expected a cross-monitor release")
+            }
+            XCTAssertEqual(pointer, CGPoint(x: 1500, y: 10))
+            XCTAssertEqual(swapRequested, swap)
+        }
+    }
+
     func testCompletionReportsTheExactSnapshotPairedWithItsOutcome() {
         let captured = snapshot(draggedID: 71)
         let scheduler = DeferredScheduler()
@@ -1014,7 +1167,10 @@ final class DragSwapHandlerInsertionTests: XCTestCase {
                              142: actualTarget], generation: 1)
         let point = CGPoint(x: actualTarget.maxX - 2, y: actualTarget.midY)
 
-        let resolved = TiledDragTargetResolver.resolve(pointer: point, snapshot: snapshot)
+        // the drop's own resolution, as WindowManager asks it at release
+        let resolved = TiledDropPlanner.sameTreeTarget(
+            pointer: point, draggedID: snapshot.draggedID,
+            sourceTiles: snapshot.context.usableFrame, sourceSlots: snapshot.originalFrames)
 
         XCTAssertEqual(resolved, TiledDragTarget(windowID: 142, edge: .right))
     }

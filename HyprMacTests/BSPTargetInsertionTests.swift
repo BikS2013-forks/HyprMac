@@ -205,6 +205,61 @@ final class BSPTargetInsertionTests: XCTestCase {
         }
         XCTAssertNil(discardedRoot)
     }
+
+    // MARK: - cross-tree candidates
+
+    func testCrossTreeCandidatesLeaveTheirSourceTreesUntouched() throws {
+        let source = makeThreeWindowTree()
+        let target = makeBalancedFourWindowTree()
+        let sourcePrint = source.structuralFingerprint()
+        let targetPrint = target.structuralFingerprint()
+        let arriving = makeWindow(id: 9)
+
+        let removed = try XCTUnwrap(source.candidateTree(removing: 1))
+        XCTAssertEqual(removed.allWindows.map(\.windowID), [2, 3])
+
+        let sides: [(BSPTargetEdge, [CGWindowID])] = [(.left, [9, 2]), (.right, [2, 9]),
+                                                      (.top, [9, 2]), (.bottom, [2, 9])]
+        for (edge, order) in sides {
+            let inserted = try XCTUnwrap(target.candidateTree(inserting: arriving, beside: 2,
+                                                              edge: edge, maxDepth: 3))
+            XCTAssertEqual(inserted.allWindows.map(\.windowID), [1] + order + [3, 4], "\(edge)")
+            let parent = try XCTUnwrap(inserted.root.find(arriving)?.parent)
+            XCTAssertEqual(parent.splitOverride,
+                           edge == .left || edge == .right ? .horizontal : .vertical, "\(edge)")
+        }
+
+        let replaced = try XCTUnwrap(target.candidateTree(replacing: 3, with: arriving))
+        XCTAssertEqual(replaced.allWindows.map(\.windowID), [1, 2, 9, 4])
+        XCTAssertEqual(replaced.root.splitOverride, target.root.splitOverride)
+
+        XCTAssertEqual(source.structuralFingerprint(), sourcePrint)
+        XCTAssertEqual(target.structuralFingerprint(), targetPrint)
+    }
+
+    func testCrossTreeCandidatesRefuseDepthAndMembershipMistakes() {
+        let tree = makeBalancedFourWindowTree()
+        let arriving = makeWindow(id: 9)
+        // every leaf is at depth 2 already
+        XCTAssertNil(tree.candidateTree(inserting: arriving, beside: 2, edge: .left, maxDepth: 2))
+        XCTAssertNil(tree.candidateTree(inserting: arriving, beside: 99, edge: .left, maxDepth: 3))
+        XCTAssertNil(tree.candidateTree(inserting: makeWindow(id: 1), beside: 2, edge: .left,
+                                        maxDepth: 3))
+        XCTAssertNil(tree.candidateTree(removing: 99))
+        XCTAssertNil(tree.candidateTree(replacing: 99, with: arriving))
+        XCTAssertNil(tree.candidateTree(replacing: 1, with: makeWindow(id: 2)))
+        XCTAssertNil(tree.candidateTree(rootedAt: arriving))
+    }
+
+    func testRootedCandidateHoldsOnlyTheArrivingWindow() throws {
+        let empty = BSPTree()
+        let rooted = try XCTUnwrap(empty.candidateTree(rootedAt: makeWindow(id: 9)))
+        XCTAssertEqual(rooted.allWindows.map(\.windowID), [9])
+        XCTAssertTrue(rooted.root.isLeaf)
+        XCTAssertTrue(empty.allWindows.isEmpty)
+        XCTAssertNil(try XCTUnwrap(makeThreeWindowTree().candidateTree(removing: 1))
+            .candidateTree(rootedAt: makeWindow(id: 9)))
+    }
 }
 
 private func assertParentLinks(in node: BSPNode,

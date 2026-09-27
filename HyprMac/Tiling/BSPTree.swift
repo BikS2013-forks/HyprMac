@@ -96,13 +96,83 @@ class BSPTree {
               let target = candidate.root.find(targetWindow), target.isLeaf,
               target.depth < maxDepth else { return nil }
 
+        Self.split(target, adding: dragged, edge: edge)
+
+        let candidateIDs = candidate.allWindows.map(\.windowID)
+        guard candidate.root.allLeavesRightToLeft().allSatisfy({ $0.depth <= maxDepth }),
+              candidateIDs.count == originalIDs.count,
+              Set(candidateIDs) == Set(originalIDs),
+              candidateIDs.count == Set(candidateIDs).count else { return nil }
+        return candidate
+    }
+
+    // MARK: - cross-tree candidates
+
+    /// A clone without `windowID`, for a window leaving this tree for
+    /// another screen's. The sibling is promoted as on a close. nil when the
+    /// window is not here.
+    func candidateTree(removing windowID: CGWindowID) -> BSPTree? {
+        guard let window = allWindows.first(where: { $0.windowID == windowID }) else { return nil }
+        let candidate = deepClone()
+        candidate.remove(window)
+        candidate.root.pruneEmptyNodes()
+        return candidate
+    }
+
+    /// A clone with `window` split in beside `targetID` on `edge`, for a
+    /// window arriving from another screen's tree. The same split a
+    /// same-tree drop makes. nil when the target is missing, the window is
+    /// already here, or the split would pass `maxDepth`.
+    func candidateTree(inserting window: HyprWindow, beside targetID: CGWindowID,
+                       edge: BSPTargetEdge, maxDepth: Int) -> BSPTree? {
+        let originalIDs = allWindows.map(\.windowID)
+        guard !originalIDs.contains(window.windowID),
+              let targetWindow = allWindows.first(where: { $0.windowID == targetID }) else { return nil }
+        let candidate = deepClone()
+        guard let target = candidate.root.find(targetWindow), target.isLeaf,
+              target.depth < maxDepth else { return nil }
+
+        Self.split(target, adding: window, edge: edge)
+
+        let candidateIDs = candidate.allWindows.map(\.windowID)
+        guard candidate.root.allLeavesRightToLeft().allSatisfy({ $0.depth <= maxDepth }),
+              candidateIDs.count == originalIDs.count + 1,
+              Set(candidateIDs) == Set(originalIDs + [window.windowID]) else { return nil }
+        return candidate
+    }
+
+    /// A tree holding only `window` at its root, for a window arriving on a
+    /// workspace with no tiles. nil when this tree has any.
+    func candidateTree(rootedAt window: HyprWindow) -> BSPTree? {
+        guard allWindows.isEmpty else { return nil }
+        let candidate = BSPTree()
+        candidate.root.window = window
+        return candidate
+    }
+
+    /// A clone with `replacement` in `windowID`'s leaf, topology and ratios
+    /// untouched, for a swap across trees. nil when the window is not here
+    /// or the replacement already is.
+    func candidateTree(replacing windowID: CGWindowID, with replacement: HyprWindow) -> BSPTree? {
+        guard !allWindows.contains(where: { $0.windowID == replacement.windowID }),
+              let window = allWindows.first(where: { $0.windowID == windowID }) else { return nil }
+        let candidate = deepClone()
+        guard let leaf = candidate.root.find(window) else { return nil }
+        leaf.window = replacement
+        return candidate
+    }
+
+    /// Split leaf `target` in two on `edge`: `window` on that side, the
+    /// tenant on the other. Horizontal for left/right, vertical for
+    /// top/bottom, at the default ratio with the ratio memory cleared.
+    private static func split(_ target: BSPNode, adding window: HyprWindow, edge: BSPTargetEdge) {
         let existing = target.window
-        let draggedNode = BSPNode(window: dragged)
+        let addedNode = BSPNode(window: window)
         let targetNode = BSPNode(window: existing)
-        let draggedFirst = edge == .left || edge == .top
+        let addedFirst = edge == .left || edge == .top
         target.window = nil
-        target.left = draggedFirst ? draggedNode : targetNode
-        target.right = draggedFirst ? targetNode : draggedNode
+        target.left = addedFirst ? addedNode : targetNode
+        target.right = addedFirst ? targetNode : addedNode
         target.left?.parent = target
         target.right?.parent = target
         target.splitRatio = TilingConfig.defaultRatio
@@ -113,13 +183,6 @@ class BSPTree {
         target.savedSplitOverride = nil
         target.pendingSplitRatio = nil
         target.pendingSplitOverride = nil
-
-        let candidateIDs = candidate.allWindows.map(\.windowID)
-        guard candidate.root.allLeavesRightToLeft().allSatisfy({ $0.depth <= maxDepth }),
-              candidateIDs.count == originalIDs.count,
-              Set(candidateIDs) == Set(originalIDs),
-              candidateIDs.count == Set(candidateIDs).count else { return nil }
-        return candidate
     }
 
     /// Insert a window via plain dwindle: split the deepest-right leaf.

@@ -179,6 +179,16 @@ the Swift deadline. Stable off-target frames wait at least 0.24 seconds
 before becoming a geometry rejection. Failed reads and superseded work
 never become accepted geometry.
 
+A call that AX gives up on after using nearly all of its messaging timeout
+returns `cannotComplete`. That covers a setter, a frame read, or the
+enhanced-UI read that opens a window's writes. Such a call is a timeout,
+not a refusal, and gets one more try with a 0.25-second call timeout and a
+0.75-second deadline (`withTimeoutRecoveryBudget`). A verified layout takes
+that try after its rollback verifies. A tiled drag takes it straight away,
+on the settle read, the release screen's read, each candidate and each
+rollback. A `cannotComplete` that comes back at once is AX refusing, and
+gets no second try.
+
 A pass that moves a window onto a screen with a different backing scale
 factor gets a 1-second deadline instead, with the sample limit raised to
 match. The engine compares the scale of the screen holding most of each
@@ -751,16 +761,41 @@ The mouse-up event supplies the release point. The mouse lifecycle latches the
 logical Hypr key when it is held at press, pressed during the drag, or still
 held at release. Option at release remains a compatibility shortcut. After
 the 100 ms settle delay, a bounded read of the captured dragged window
-separates manual resizing from movement. A width or height change greater than
-20 AX points produces a resize candidate. Position and size changes within
-one point are ignored, so text selection does not rearrange unmoved windows.
+separates manual resizing from movement (`TiledDragSnapshot.gesture`). The
+window is unmoved when its position and size are each within a point of the
+captured frame, so text selection does not rearrange unmoved windows. It is a
+resize only when all three of these hold:
+
+- The press landed on the window's resize border. The border is a band just
+  inside the captured frame: 8 points at the left, right and bottom edges and
+  4 at the top, corners giving two edges. The top band is narrow because the
+  title bar starts right below it. There is no outer band: a press outside
+  the frame is not a tile press at all.
+- The edge opposite every grabbed edge stayed within 3 points: maxX for a
+  left edge, minY for a bottom edge, and so on.
+- At least one grabbed axis changed size by more than 4 points.
+
+Anything else is a move. A size change on an axis nobody grabbed counts
+neither way. An aspect-locked side resize moves the other axis, and a corner
+press the band reads as one edge is still that edge's resize. A small resize
+reads as one from its first few points, which keeps the live preview from
+flashing at the start of an edge drag.
+
+A real edge or corner drag keeps the far edge still. A move keeps no edge
+still, even when the app changes its own size on the way. Messages changes
+its height by up to 279 points when it is dragged onto the ultrawide. Reading
+that as a resize rejected the drop, or grew its tile on the source, and a
+press in the top of the title bar would still have done it under a band
+alone. A capture by window id has no press point, so size alone decides
+there, a change over 20 points as before.
 
 An ordinary move chooses a target from the release point within the source
 workspace and physical display. The nearest normalized target edge selects
 left, right, top, or bottom insertion; ties use that order. A latched Hypr
-gesture or Option at release requests a same-tree swap instead. A release
-without a target restores and verifies the captured frames. Cross-monitor and
-cross-workspace insertion are excluded.
+gesture or Option at release requests a same-tree swap instead. A release on
+the source display without a target restores and verifies the captured
+frames. A release on another display is a drop across monitors, described
+below.
 
 `BSPTree.candidateTree` clones the source, removes the dragged leaf, and
 splits the target on the selected side. Horizontal splits create columns;
@@ -789,6 +824,138 @@ carries no provenance clears every member, because then nothing is provably
 untouched. Clearing only the dragged id would be wrong: a rollback writes
 every captured original. The finishing flag suppresses polling
 through the settle delay and transaction, without a fixed expiry timer.
+
+### Dropping on another monitor
+
+A plain move released on another display lands in the workspace visible
+there (`WorkspaceManager.workspaceForScreen`). The release screen is the one
+whose whole display frame holds the point, menu bar and Dock included. The
+drop places the window the way a same-tree drop does:
+
+- Over a tile, the window is split in beside it on the nearest normalized
+  edge, with the same edge rule and the same split.
+- In a gap or the padding, the nearest tile takes it, the lower id on a tie.
+  The edge is measured from the point clamped into that tile.
+- A latched Hypr gesture or Option at release swaps it with that tile. The
+  two windows trade leaves, trees and workspaces. Both topologies stay as
+  they were. Ratios move only for a known-minimum conflict, as on any drop.
+- A workspace with no tiles takes the window as its tree root, swap or not.
+
+The source tree loses the window the way it would on a close, and a source
+tree left empty is dropped. Visible floaters on the release screen do not
+block the drop. The same-tree release ignores them too.
+
+The release screen's tree is read before anything is written, and its
+members' actual frames become its originals for a rollback. The target tile is
+chosen from that tree's own layout slots, the same ones the live preview uses.
+Both candidates are private clones from `BSPTree`, built in the engine's drop
+path. Each must stay within its own screen's Max Splits. Each layout gets the
+same known-minimum ratio adjustment as a same-tree drop. If a known minimum
+still overflows its slot by more than 20 points
+(`TilingConfig.frameToleranceXPx`, the overshoot a readback may show), the
+drop is refused (`noRoom`) before any candidate write. The release screen's
+frames go out first, then the source's. Each screen has its own
+`FrameSizingAttempt` against its own usable frame. A window crossing screens
+takes the engine's write order, and two displays with different backing
+scales get the scale-change budget. Both trees publish together, and only
+after every frame on both screens was accepted.
+
+A call that times out on either screen gets its one longer try first.
+Messages took 101 ms to answer a position write right after crossing
+displays, just past the 100 ms call timeout. All of a drop's attempts share
+one 2.5-second budget for those longer tries (`TiledDragBudget`). Once it is
+spent, a timeout gets no longer try, and the drop goes on with its plain
+attempts to its plain outcome. The cut logs `frame attempt AX timeout
+recovery skipped`. The budget bounds the retries, not the drop. Each
+capture, candidate and rollback still runs with its own deadline of 0.36
+seconds, or 1 second under the scale-change budget. So a drop that ends up
+rolling both trees back can still hold the main thread past 2.5 seconds,
+though no longer for the ten or more that every retry could add up to.
+
+A refusal before the first write puts back only the source. The release
+screen was read but never written. These refusals are no target, no room,
+Max Splits, and an invalid candidate, and they report as an ordinary
+same-tree restore that marks only the source key.
+
+A sizing failure after the writes began puts both trees back. The source's
+captured originals go first, the dragged window's among them, then the
+release screen's. Each set is verified against its own screen. Neither
+topology changes, and every key that has a tree is marked unverified. A
+release screen with no tree has no key to mark. So does a commit whose frames
+were accepted but whose setters did not all return success
+(`unverifiedCommit`). The dragged window may already stand on the release
+screen, and publishing nothing while it stays there would leave the source's
+tree and membership claiming it. Superseded work writes nothing more, on
+either screen, as on a same-tree drop: a newer operation owns the geometry.
+A failure whose drop went stale before the rollback is reported degraded
+without one. The cache rules above cover both trees' members, and deferred
+degraded feedback waits for both keys to verify again.
+
+Workspace membership changes only on a commit, through
+`WorkspaceManager.moveWindow`, for the dragged window and for a swapped one.
+It moves in the same synchronous step that published the trees, before the
+drop is reported. After a commit the dragged window keeps focus, and the
+border is drawn on its verified frame rather than on a live AX read.
+
+These cases restore exactly as a release without a target always has: a
+disabled release screen, the scratchpad layer up on any screen, a scratchpad
+source, a point on no screen, and a resize candidate, which keeps the
+same-tree resize rule. A window that did not move is still ignored.
+
+### Live drop preview
+
+While a tiled drag is in progress, a translucent highlight shows where the
+window will land. It uses the focus color the user picked, at low alpha: the
+bracket color when brackets are on, else the focus border color when the
+border is on, else brand cyan (`UserConfig.resolvedDropPreviewColor`). It has a
+thin border and the window corner radius. It appears only after all of these
+hold:
+
+- the press was captured as a tiled press
+- the pointer has passed the drag threshold
+- the drag is a move by the drop's own rule (`TiledDragSnapshot.gesture`),
+  applied to the dragged window's frame from the window list
+  (`CGWindowListCreateDescriptionFromArray`, not AX) at every update. A press
+  that selects text leaves the window unmoved, and an edge drag becomes a
+  resize, so neither shows a preview. The drop reaches the same verdict from
+  its settle read.
+
+What it shows:
+
+- **Plain insert, on either monitor:** the rect the dragged window would get.
+  That is its slot in the candidate tree the drop would build, with the same
+  known-minimum adjustment.
+- **Swap (Hypr latched or held, or Option):** the whole target tile.
+- **An empty workspace on another monitor:** that screen's tiling rect, inside
+  the outer padding.
+- **Nothing** wherever the drop would restore: a gap on the source, a disabled
+  monitor, the scratchpad, a point on no screen, past Max Splits, or no room
+  for a known minimum.
+
+Preview and drop cannot disagree, because both come from the same parts:
+
+- `TiledDropPlanner` picks the target and edge. The drop calls it too: its
+  same-tree target at release, and its target on another monitor.
+- The source tiles are the press capture, which the drop resolves against as
+  well.
+- Another monitor's tiles are that tree's own layout slots
+  (`TiledDropPlanner.slots`), not a live read. The drop now picks its target
+  from those slots too. It still reads that screen's frames first, for the
+  rollback.
+- The rect comes from `TiledDragTransaction.previewFrame`, which builds the
+  same candidates as `drop` and `dropAcrossTrees`.
+
+No AX call runs while the pointer moves. Another monitor's tree is kept
+between updates only while its workspace is still the one visible there and
+the tree is unchanged. A workspace switch, the scratchpad, or any layout since
+the press (which supersedes the drop) shows through at the next update. A
+workspace change or a hotkey action also asks again straight away. Updates come at most 60
+times a second. A move inside that interval is held and applied when it ends,
+so the last position always shows. The panel redraws only when the rect
+changes. A Hypr press or an Option change asks again at the last point. The
+highlight hides at mouse-up, on a stop, and when there is nowhere to land.
+Nothing keeps running after the drag: one held update at most, and it does
+nothing once the drag has ended.
 
 ## `prepareTileLayout` / `prepareSwapLayout` / `prepareToggleSplitLayout`
 

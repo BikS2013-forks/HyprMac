@@ -398,6 +398,22 @@ class UserConfig: ObservableObject {
         didApplyRuntimeChange.send()
     }
 
+    // the drop preview wears the focus color the user picked: the bracket's
+    // when brackets are on, else the border's when it is on. dim-only or
+    // default colors keep brand cyan
+    var resolvedDropPreviewColor: NSColor {
+        Self.dropPreviewColorHex(bracketStyle: focusBracketStyle, bracketHex: focusBracketColorHex,
+                                 showBorder: showFocusBorder, borderHex: focusBorderColorHex)
+            .flatMap(NSColor.fromHex) ?? NSColor.hyprCyan
+    }
+
+    static func dropPreviewColorHex(bracketStyle: FocusBracketStyle, bracketHex: String?,
+                                    showBorder: Bool, borderHex: String?) -> String? {
+        if bracketStyle != .off, let bracketHex, NSColor.fromHex(bracketHex) != nil { return bracketHex }
+        if showBorder, let borderHex, NSColor.fromHex(borderHex) != nil { return borderHex }
+        return nil
+    }
+
     // resolve the border color — custom hex or brand cyan
     var resolvedFocusBorderColor: NSColor {
         if let hex = focusBorderColorHex, let c = NSColor.fromHex(hex) { return c }

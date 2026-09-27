@@ -18,12 +18,28 @@ final class TiledDragTransactionTests: XCTestCase {
         var sizeUndershoot: CGFloat = 0
         var readDrift: CGFloat = 0
         var readNumber: CGFloat = 0
+        /// seconds a window takes to answer a position write, a position
+        /// read, or the enhanced-UI read before its writes. a call whose
+        /// timeout is shorter uses the whole timeout and gets
+        /// `cannotComplete`, the way AX gives up on a busy app
+        var positionWriteAnswer: [CGWindowID: TimeInterval] = [:]
+        var positionReadAnswer: [CGWindowID: TimeInterval] = [:]
+        var beginAnswer: [CGWindowID: TimeInterval] = [:]
+        /// the call timeout each slow call was given, in order
+        var slowCallTimeouts: [TimeInterval] = []
 
         init(frames: [CGWindowID: CGRect]) { self.frames = frames }
 
+        private func answers(_ answer: TimeInterval?, within timeout: TimeInterval) -> Bool {
+            guard let answer else { return true }
+            slowCallTimeouts.append(timeout)
+            time += min(answer, timeout)
+            return answer <= timeout
+        }
+
         func factory(windows: [CGWindowID: HyprWindow], current: @escaping () -> UInt64) -> FrameSizingIO {
             var pendingSizes: [CGWindowID: CGSize] = [:]
-            return FrameSizingIO(
+            var io = FrameSizingIO(
                 setMessagingTimeout: { _, _ in .success },
                 writeSize: { [unowned self] id, size, _ in
                     onWrite?()
@@ -38,8 +54,9 @@ final class TiledDragTransactionTests: XCTestCase {
                     writes.append((id, frames[id] ?? CGRect(origin: .zero, size: size)))
                     return .success
                 },
-                writePosition: { [unowned self] id, point, _ in
+                writePosition: { [unowned self] id, point, timeout in
                     onWrite?()
+                    guard answers(positionWriteAnswer[id], within: timeout) else { return .cannotComplete }
                     if !writeErrors.isEmpty {
                         let error = writeErrors.removeFirst()
                         if error != .success { return error }
@@ -49,10 +66,13 @@ final class TiledDragTransactionTests: XCTestCase {
                     writes.append((id, frames[id] ?? CGRect(origin: point, size: .zero)))
                     return .success
                 },
-                readPosition: { [unowned self] id, _ in
+                readPosition: { [unowned self] id, timeout in
                     reads += 1
                     readIDs.append(id)
                     time += callAdvance
+                    guard answers(positionReadAnswer[id], within: timeout) else {
+                        return (.cannotComplete, nil)
+                    }
                     if let readError { return (readError, nil) }
                     if !readErrors.isEmpty {
                         let error = readErrors.removeFirst()
@@ -78,6 +98,11 @@ final class TiledDragTransactionTests: XCTestCase {
                 sleep: { [unowned self] interval in time += interval },
                 currentGeneration: current
             )
+            io.beginFrameWrite = { [unowned self] id, timeout, _ in
+                answers(beginAnswer[id], within: timeout)
+                    ? .ready(.noop(windowID: id)) : .failed(.cannotComplete)
+            }
+            return io
         }
     }
 
@@ -919,6 +944,564 @@ final class TiledDragTransactionTests: XCTestCase {
             return XCTFail("two-point actual movement must apply insertion")
         }
         XCTAssertFalse(fake.writes.isEmpty)
+    }
+
+    // MARK: - across trees
+
+    func testAcrossTreesInsertCommitsBothCandidatesWithoutTouchingEitherTree() {
+        let (tree, context, target, frames) = crossFixture()
+        let fake = FakeAX(frames: frames)
+        let transaction = TiledDragTransaction(ioFactory: fake.factory)
+        guard case let .captured(snapshot) = transaction.capture(
+            draggedID: 1, tree: tree, context: context, generation: 1,
+            currentContext: { context }) else { return XCTFail("capture failed") }
+        let release = CGRect(origin: CGPoint(x: 1300, y: 100), size: frames[1]!.size)
+        fake.frames[1] = release
+        let slot = frames[11]!
+
+        guard case let .acrossTrees(.committed(source, actual, _), cross) = transaction.dropAcrossTrees(
+            snapshot, into: target, pointer: CGPoint(x: slot.midX, y: slot.maxY - 2),
+            swapRequested: false, releaseFrame: release, currentContext: { context }) else {
+            return XCTFail("expected a committed drop across trees")
+        }
+        XCTAssertEqual(source.allWindows.map(\.windowID), [2, 3])
+        XCTAssertEqual(cross.targetCandidate?.allWindows.map(\.windowID), [10, 11, 1])
+        XCTAssertEqual(cross.moves, [1: 2])
+        XCTAssertEqual(tree.structuralFingerprint(), context.fingerprint)
+        XCTAssertEqual(target.tree.structuralFingerprint(), target.context.fingerprint)
+        XCTAssertEqual(Set(actual.keys), [1, 2, 3, 10, 11])
+        XCTAssertTrue(target.context.usableFrame.contains(actual[1]!))
+        XCTAssertTrue(context.usableFrame.contains(actual[2]!))
+    }
+
+    func testAcrossTreesSwapThatCannotFitAKnownMinimumRestoresOnlyTheSource() {
+        let (tree, context, target, frames) = crossFixture()
+        let fake = FakeAX(frames: frames)
+        // 10 cannot shrink into the dragged window's slot, even at 0.85
+        let transaction = TiledDragTransaction(
+            ioFactory: fake.factory,
+            minimumSize: { $0?.windowID == 10 ? CGSize(width: 1100, height: 0) : .zero })
+        guard case let .captured(snapshot) = transaction.capture(
+            draggedID: 1, tree: tree, context: context, generation: 1,
+            currentContext: { context }) else { return XCTFail("capture failed") }
+        let release = CGRect(origin: CGPoint(x: 1300, y: 100), size: frames[1]!.size)
+        fake.frames[1] = release
+
+        let outcome = transaction.dropAcrossTrees(
+            snapshot, into: target, pointer: center(frames[10]!), swapRequested: true,
+            releaseFrame: release, currentContext: { context })
+
+        // refused before the first write: the release screen was only read
+        guard case let .rejectedRestored(reason, restored) = outcome else {
+            return XCTFail("expected an ordinary restore of the source, got \(outcome)")
+        }
+        XCTAssertEqual(reason, .preflight(.noRoom))
+        XCTAssertEqual(fake.frames, frames)
+        XCTAssertEqual(Set(restored.keys), [1, 2, 3])
+        XCTAssertEqual(Set(fake.writes.map { $0.0 }), [1, 2, 3], "nothing written on the release screen")
+        XCTAssertEqual(fake.writes.count, 3 * 3, "one resize-move-resize per source original")
+    }
+
+    func testAcrossTreesSourceWriteFailureAfterTheTargetLandedRestoresBothTrees() {
+        let (tree, context, target, frames) = crossFixture()
+        let fake = FakeAX(frames: frames)
+        let transaction = TiledDragTransaction(ioFactory: fake.factory)
+        guard case let .captured(snapshot) = transaction.capture(
+            draggedID: 1, tree: tree, context: context, generation: 1,
+            currentContext: { context }) else { return XCTFail("capture failed") }
+        let release = CGRect(origin: CGPoint(x: 1300, y: 100), size: frames[1]!.size)
+        fake.frames[1] = release
+        // the release screen's three windows take all nine setters, then the
+        // source's first one fails
+        fake.writeErrors = Array(repeating: .success, count: 9) + [.cannotComplete]
+        let slot = frames[11]!
+
+        let outcome = transaction.dropAcrossTrees(
+            snapshot, into: target, pointer: CGPoint(x: slot.midX, y: slot.maxY - 2),
+            swapRequested: false, releaseFrame: release, currentContext: { context })
+
+        guard case let .acrossTrees(.rejectedRestored(reason, restored), _) = outcome else {
+            return XCTFail("expected a verified rollback of both trees")
+        }
+        XCTAssertEqual(reason, .sizing(.writeFailed(2, .cannotComplete)))
+        XCTAssertEqual(fake.frames, frames)
+        XCTAssertEqual(restored, frames)
+    }
+
+    func testAcrossTreesStaleTargetDuringWritesIsSupersededWithoutRollback() {
+        let (tree, context, fresh, frames) = crossFixture()
+        var targetContext: TiledDragContext? = fresh.context
+        let target = TiledDragCrossTarget(tree: fresh.tree, context: fresh.context,
+                                          currentContext: { targetContext })
+        let fake = FakeAX(frames: frames)
+        let transaction = TiledDragTransaction(ioFactory: fake.factory)
+        guard case let .captured(snapshot) = transaction.capture(
+            draggedID: 1, tree: tree, context: context, generation: 1,
+            currentContext: { context }) else { return XCTFail("capture failed") }
+        let release = CGRect(origin: CGPoint(x: 1300, y: 100), size: frames[1]!.size)
+        fake.frames[1] = release
+        fake.onWrite = { targetContext = nil }
+
+        XCTAssertSuperseded(transaction.dropAcrossTrees(
+            snapshot, into: target, pointer: center(frames[10]!), swapRequested: false,
+            releaseFrame: release, currentContext: { context }))
+        XCTAssertEqual(fake.writes.count, 1, "a newer operation owns the geometry")
+    }
+
+    func testDropReleaseHandsOnlyAPlainMoveToTheCrossTreePath() {
+        let (tree, _, context) = fixture()
+        let frames = layoutFrames(tree, context)
+        let fake = FakeAX(frames: frames)
+        let transaction = TiledDragTransaction(ioFactory: fake.factory)
+        guard case let .captured(snapshot) = transaction.capture(
+            draggedID: 1, tree: tree, context: context, generation: 1,
+            currentContext: { context }) else { return XCTFail("capture failed") }
+        var moved: [CGRect] = []
+        let handoff: (CGRect) -> TiledDragDropOutcome = { frame in
+            moved.append(frame)
+            return .superseded
+        }
+
+        // unmoved: nothing to do
+        guard case .ignored = transaction.dropRelease(snapshot, mode: nil,
+                                                      currentContext: { context },
+                                                      moved: handoff) else {
+            return XCTFail("an unmoved window must be ignored")
+        }
+        // resized off the source: the ordinary restore
+        fake.frames[1] = CGRect(x: 1500, y: 100, width: 300, height: 300)
+        guard case .rejectedRestored(reason: .preflight(.noTarget), _) = transaction.dropRelease(
+            snapshot, mode: nil, currentContext: { context }, moved: handoff) else {
+            return XCTFail("a resize candidate must keep the same-tree rule")
+        }
+        XCTAssertTrue(moved.isEmpty)
+        // a plain move goes across, with the frame it was read at
+        let release = CGRect(origin: CGPoint(x: 1500, y: 100), size: frames[1]!.size)
+        fake.frames[1] = release
+        XCTAssertSuperseded(transaction.dropRelease(snapshot, mode: nil,
+                                                    currentContext: { context }, moved: handoff))
+        XCTAssertEqual(moved, [release])
+    }
+
+    func testReleasePolicyRefusesADisabledMonitorAndTheScratchpadLayer() {
+        XCTAssertEqual(TiledDragReleasePolicy.resolve(monitorDisabled: false, scratchpadVisible: false,
+                                                      visibleWorkspace: { 4 }), .workspace(4))
+        XCTAssertEqual(TiledDragReleasePolicy.resolve(monitorDisabled: true, scratchpadVisible: false,
+                                                      visibleWorkspace: { 4 }),
+                       .refused("monitor disabled"))
+        XCTAssertEqual(TiledDragReleasePolicy.resolve(monitorDisabled: false, scratchpadVisible: true,
+                                                      visibleWorkspace: { 4 }),
+                       .refused("scratchpad visible"))
+    }
+
+    // MARK: - AX timeout recovery
+
+    func testAcrossTreesSlowPositionWriteGetsOneLongerTryAndCommits() {
+        let (tree, context, target, frames) = crossFixture()
+        let fake = FakeAX(frames: frames)
+        let transaction = TiledDragTransaction(ioFactory: fake.factory)
+        guard case let .captured(snapshot) = transaction.capture(
+            draggedID: 1, tree: tree, context: context, generation: 1,
+            currentContext: { context }) else { return XCTFail("capture failed") }
+        let release = CGRect(origin: CGPoint(x: 1300, y: 100), size: frames[1]!.size)
+        fake.frames[1] = release
+        // Messages, live: a position write refused at the 100 ms call timeout
+        fake.positionWriteAnswer[1] = 0.15
+        let slot = frames[11]!
+
+        guard case let .acrossTrees(.committed(_, actual, progress), cross) = transaction.dropAcrossTrees(
+            snapshot, into: target, pointer: CGPoint(x: slot.midX, y: slot.maxY - 2),
+            swapRequested: false, releaseFrame: release, currentContext: { context }) else {
+            return XCTFail("the longer try must land the drop")
+        }
+        XCTAssertEqual(fake.slowCallTimeouts, [0.1, 0.25])
+        XCTAssertTrue(progress.candidateVerified)
+        XCTAssertEqual(cross.moves, [1: 2])
+        XCTAssertEqual(actual[1], fake.frames[1])
+        XCTAssertTrue(target.context.usableFrame.contains(fake.frames[1]!))
+    }
+
+    func testAcrossTreesRollbackThatTimesOutGetsOneLongerTryAndVerifies() {
+        let (tree, context, target, frames) = crossFixture()
+        let fake = FakeAX(frames: frames)
+        let transaction = TiledDragTransaction(ioFactory: fake.factory)
+        guard case let .captured(snapshot) = transaction.capture(
+            draggedID: 1, tree: tree, context: context, generation: 1,
+            currentContext: { context }) else { return XCTFail("capture failed") }
+        let release = CGRect(origin: CGPoint(x: 1300, y: 100), size: frames[1]!.size)
+        fake.frames[1] = release
+        // the release screen refuses outright, then the dragged window's
+        // rollback times out on the read that opens its writes, as Messages did
+        fake.writeErrors = [.failure]
+        fake.beginAnswer[1] = 0.15
+        let slot = frames[11]!
+
+        let outcome = transaction.dropAcrossTrees(
+            snapshot, into: target, pointer: CGPoint(x: slot.midX, y: slot.maxY - 2),
+            swapRequested: false, releaseFrame: release, currentContext: { context })
+
+        guard case let .acrossTrees(.rejectedRestored(reason, restored), _) = outcome else {
+            return XCTFail("the longer try must verify the rollback, got \(outcome)")
+        }
+        XCTAssertEqual(reason, .sizing(.writeFailed(10, .failure)))
+        XCTAssertEqual(fake.slowCallTimeouts, [0.1, 0.25])
+        XCTAssertEqual(fake.frames, frames)
+        XCTAssertEqual(restored, frames)
+    }
+
+    func testSameTreeDropSlowPositionWriteGetsOneLongerTryAndCommits() {
+        let (tree, _, context) = fixture()
+        let fake = FakeAX(frames: layoutFrames(tree, context))
+        let transaction = TiledDragTransaction(ioFactory: fake.factory)
+        guard case let .captured(snapshot) = transaction.capture(
+            draggedID: 1, tree: tree, context: context, generation: 1,
+            currentContext: { context }) else { return XCTFail("capture failed") }
+        fake.positionWriteAnswer[2] = 0.15
+
+        guard case .committed = transaction.drop(snapshot, mode: .insert(targetID: 2, edge: .left),
+                                                 currentContext: { context }) else {
+            return XCTFail("the longer try must land the drop")
+        }
+        XCTAssertEqual(fake.slowCallTimeouts, [0.1, 0.25])
+    }
+
+    func testSettleReadThatTimesOutGetsOneLongerTry() {
+        let (tree, _, context) = fixture()
+        let frames = layoutFrames(tree, context)
+        let fake = FakeAX(frames: frames)
+        let transaction = TiledDragTransaction(ioFactory: fake.factory)
+        guard case let .captured(snapshot) = transaction.capture(
+            draggedID: 1, tree: tree, context: context, generation: 1,
+            currentContext: { context }) else { return XCTFail("capture failed") }
+        fake.positionReadAnswer[1] = 0.15
+
+        // unmoved, once the longer read answers
+        guard case .ignored = transaction.dropRelease(snapshot, mode: nil,
+                                                      currentContext: { context }) else {
+            return XCTFail("the longer read must classify the release")
+        }
+        XCTAssertEqual(fake.slowCallTimeouts, [0.1, 0.25])
+        XCTAssertTrue(fake.writes.isEmpty)
+    }
+
+    func testSpentDropBudgetCutsTheLongerTries() {
+        let (tree, context, target, frames) = crossFixture()
+        let fake = FakeAX(frames: frames)
+        // the first timeout alone spends this budget
+        let transaction = TiledDragTransaction(ioFactory: fake.factory,
+                                               budget: TiledDragBudget(limit: 0.05))
+        guard case let .captured(snapshot) = transaction.capture(
+            draggedID: 1, tree: tree, context: context, generation: 1,
+            currentContext: { context }) else { return XCTFail("capture failed") }
+        let release = CGRect(origin: CGPoint(x: 1300, y: 100), size: frames[1]!.size)
+        fake.frames[1] = release
+        fake.positionWriteAnswer[1] = 0.15
+        let slot = frames[11]!
+
+        let outcome = transaction.dropAcrossTrees(
+            snapshot, into: target, pointer: CGPoint(x: slot.midX, y: slot.maxY - 2),
+            swapRequested: false, releaseFrame: release, currentContext: { context })
+
+        XCTAssertEqual(fake.slowCallTimeouts, [0.1, 0.1],
+                       "the candidate and the rollback each get their plain try, no 250 ms one")
+        guard case .acrossTrees(.degraded, _) = outcome else {
+            return XCTFail("expected the plain outcome, got \(outcome)")
+        }
+    }
+
+    func testDropBudgetCountsFromTheFirstStart() {
+        let budget = TiledDragBudget(limit: 1)
+        budget.start(at: 10)
+        budget.start(at: 20)
+        XCTAssertTrue(budget.allowsRecovery(at: 10.9))
+        XCTAssertFalse(budget.allowsRecovery(at: 11))
+        XCTAssertTrue(TiledDragBudget(limit: 1).allowsRecovery(at: 50), "an unstarted budget starts now")
+        XCTAssertEqual(TiledDragBudget.defaultLimit, 2.5)
+    }
+
+    func testCommitWhoseSettersDidNotAllSucceedCannotPublish() {
+        var progress = FrameSizingAttempt.Progress()
+        progress.targetIDs = [1, 10]
+        progress.writesCompleted = [1, 10]
+        progress.readbackComplete = true
+        progress.readbackStable = true
+        XCTAssertNil(TiledDragTransaction.unverifiedCommit(progress))
+        progress.writesCompleted = [1]
+        XCTAssertEqual(TiledDragTransaction.unverifiedCommit(progress), .writeFailed(10, .failure))
+        progress.writesCompleted = [1, 10]
+        progress.readbackStable = false
+        XCTAssertEqual(TiledDragTransaction.unverifiedCommit(progress), .attemptsExhausted)
+    }
+
+    func testTimeoutRecoveryIsOptInAndLeavesAnInstantRefusalAlone() {
+        let frames: [CGWindowID: CGRect] = [1: CGRect(x: 0, y: 0, width: 400, height: 300)]
+        let targets = [FrameSizingAttempt.Target(windowID: 1,
+                                                 frame: CGRect(x: 10, y: 10, width: 400, height: 300))]
+        let bounds = CGRect(x: 0, y: 0, width: 1200, height: 800)
+
+        let slow = FakeAX(frames: frames)
+        slow.positionWriteAnswer[1] = 0.15
+        let plain = FrameSizingTransaction(
+            attempt: FrameSizingAttempt(io: slow.factory(windows: [:], current: { 1 })))
+            .candidate(targets: targets, usableFrame: bounds, gap: 8, generation: 1)
+        XCTAssertEqual(plain.verdict, .rejected(.writeFailed(1, .cannotComplete)))
+        XCTAssertEqual(slow.slowCallTimeouts, [0.1], "off unless the caller asks")
+
+        // a cannotComplete that comes straight back is AX refusing, not a timeout
+        let quick = FakeAX(frames: frames)
+        quick.writeErrors = [.success, .cannotComplete]
+        let refused = FrameSizingTransaction(
+            attempt: FrameSizingAttempt(io: quick.factory(windows: [:], current: { 1 })),
+            recoversTimeouts: true)
+            .candidate(targets: targets, usableFrame: bounds, gap: 8, generation: 1)
+        XCTAssertEqual(refused.verdict, .rejected(.writeFailed(1, .cannotComplete)))
+        XCTAssertEqual(quick.writes.count, 1, "no second try")
+    }
+
+    func testTimeoutRecoveryBudgetMatchesTheVerifiedLayoutsAndKeepsAScaleBudget() {
+        let relaxed = FrameSizingConfiguration().withTimeoutRecoveryBudget
+        XCTAssertEqual(relaxed.deadline, 0.75)
+        XCTAssertEqual(relaxed.perCallTimeout, 0.25)
+        let scaled = FrameSizingConfiguration().withScaleChangeBudget.withTimeoutRecoveryBudget
+        XCTAssertEqual(scaled.deadline, FrameSizingConfiguration().scaleChangeDeadline)
+        XCTAssertEqual(scaled.perCallTimeout, 0.25)
+    }
+
+    func testFailureTracesPrintRawAXCodes() {
+        XCTAssertEqual(FrameSizingFailure.writeFailed(77705, .cannotComplete).trace,
+                       "writeFailed(77705, -25204)")
+        XCTAssertEqual(TiledDragFailure.sizing(.readFailed(71889, .cannotComplete)).trace,
+                       "sizing(readFailed(71889, -25204))")
+        XCTAssertEqual(TiledDragFailure.preflight(.noTarget).trace, "preflight(noTarget)")
+    }
+
+    // MARK: - live drop preview
+
+    func testPreviewOfASwapIsTheWholeTargetTileAndNoRoomShowsNothing() {
+        let (tree, context, target, frames) = crossFixture()
+        let transaction = TiledDragTransaction(ioFactory: FakeAX(frames: frames).factory)
+        guard case let .captured(snapshot) = transaction.capture(
+            draggedID: 1, tree: tree, context: context, generation: 1,
+            currentContext: { context }) else { return XCTFail("capture failed") }
+        let hit = TiledDragTarget(windowID: 11, edge: .left)
+
+        XCTAssertEqual(transaction.previewFrame(snapshot, plan: .otherMonitor(hit), swap: true,
+                                                target: target), frames[11])
+        XCTAssertNil(transaction.previewFrame(snapshot, plan: .none, swap: false, target: target))
+        XCTAssertNil(transaction.previewFrame(snapshot, plan: .otherMonitor(hit), swap: false,
+                                              target: nil))
+
+        // 11 cannot shrink into the dragged window's slot, so the drop would
+        // restore with noRoom, and the preview shows nothing
+        let crowded = TiledDragTransaction(
+            ioFactory: FakeAX(frames: frames).factory,
+            minimumSize: { $0?.windowID == 11 ? CGSize(width: 1100, height: 0) : .zero })
+        XCTAssertNil(crowded.previewFrame(snapshot, plan: .otherMonitor(hit), swap: true,
+                                          target: target))
+    }
+
+    // MARK: - resize or move, by where the press landed
+
+    func testResizeBorderIsAnInnerBandNarrowAtTheTop() {
+        let (tree, _, context) = fixture()
+        let frames = layoutFrames(tree, context)
+        let frame = frames[1]!
+        func edges(_ point: CGPoint?) -> Set<BSPTargetEdge>? {
+            snapshot(tree, context, frames, press: point).pressedEdges
+        }
+        XCTAssertEqual(edges(CGPoint(x: frame.midX, y: frame.midY)), [])
+        XCTAssertEqual(edges(CGPoint(x: frame.midX, y: frame.minY + 20)), [], "title bar")
+        XCTAssertEqual(edges(CGPoint(x: frame.midX, y: frame.minY + 5)), [], "the title bar's top strip")
+        XCTAssertEqual(edges(CGPoint(x: frame.midX, y: frame.minY + 2)), [.top])
+        XCTAssertEqual(edges(CGPoint(x: frame.minX + 7, y: frame.midY)), [.left])
+        XCTAssertEqual(edges(CGPoint(x: frame.minX + 9, y: frame.midY)), [])
+        XCTAssertEqual(edges(CGPoint(x: frame.maxX - 3, y: frame.midY)), [.right])
+        XCTAssertEqual(edges(CGPoint(x: frame.midX, y: frame.maxY - 1)), [.bottom])
+        XCTAssertEqual(edges(CGPoint(x: frame.maxX - 2, y: frame.maxY - 2)), [.right, .bottom])
+        XCTAssertEqual(edges(CGPoint(x: frame.midX, y: frame.minY - 3)), [], "outside is not a capture")
+        XCTAssertNil(edges(nil), "a capture by id does not know")
+    }
+
+    func testGestureIsAResizeOnlyWhenEveryGrabbedEdgesOppositeHeld() {
+        let (tree, _, context) = fixture()
+        // an 800x600 window: minX 100, maxX 900, minY 100, maxY 700
+        let frame = CGRect(x: 100, y: 100, width: 800, height: 600)
+        func gesture(press: CGPoint, to now: CGRect) -> TiledDragGesture {
+            snapshot(tree, context, [1: frame], press: press).gesture(to: now)
+        }
+        let bottomLeft = CGPoint(x: 103, y: 697)
+        let topRight = CGPoint(x: 897, y: 102)
+        let bottomRight = CGPoint(x: 897, y: 697)
+        let leftEdge = CGPoint(x: 103, y: 400)
+        let topStrip = CGPoint(x: 500, y: 102)
+        XCTAssertEqual(snapshot(tree, context, [1: frame], press: bottomLeft).pressedEdges,
+                       [.left, .bottom])
+
+        let cases: [(String, CGPoint, CGRect, TiledDragGesture)] = [
+            ("bottom-left corner, down 100 / left 10", bottomLeft,
+             CGRect(x: 90, y: 100, width: 810, height: 700), .resize),
+            ("bottom-left corner, down 100 / left 30", bottomLeft,
+             CGRect(x: 70, y: 100, width: 830, height: 700), .resize),
+            ("top-right corner, right 100 / up 10", topRight,
+             CGRect(x: 100, y: 90, width: 900, height: 610), .resize),
+            ("bottom-right corner, down 100 / right 10", bottomRight,
+             CGRect(x: 100, y: 100, width: 810, height: 700), .resize),
+            ("left edge, aspect-locked height, top held", leftEdge,
+             CGRect(x: 40, y: 100, width: 860, height: 645), .resize),
+            ("left edge, a 10 pt drag", leftEdge,
+             CGRect(x: 90, y: 100, width: 810, height: 600), .resize),
+            ("a corner-ish drag that registered only the right edge", CGPoint(x: 897, y: 690),
+             CGRect(x: 100, y: 100, width: 810, height: 700), .resize),
+            ("top strip, the app shrinks across screens", topStrip,
+             CGRect(x: 1350, y: 30, width: 800, height: 321), .move),
+            ("top strip, no size change", topStrip,
+             CGRect(x: 100, y: 400, width: 800, height: 600), .move),
+            ("left band, a vertical move the app shortens", leftEdge,
+             CGRect(x: 100, y: 300, width: 800, height: 450), .move),
+            ("left edge, the whole window moved and shrank", leftEdge,
+             CGRect(x: 500, y: 100, width: 780, height: 600), .move),
+            ("a press that selects text", CGPoint(x: 500, y: 400), frame, .unmoved),
+            ("a mid-window press whose window moved", CGPoint(x: 500, y: 400),
+             CGRect(x: 110, y: 100, width: 780, height: 600), .move)
+        ]
+        for (name, press, now, expected) in cases {
+            XCTAssertEqual(gesture(press: press, to: now), expected, name)
+        }
+
+        // no press point: size alone decides, over 20 points as before
+        let byID = snapshot(tree, context, [1: frame], press: nil)
+        XCTAssertEqual(byID.gesture(to: CGRect(x: 1000, y: 100, width: 830, height: 600)), .resize)
+        XCTAssertEqual(byID.gesture(to: CGRect(x: 1000, y: 100, width: 810, height: 600)), .move)
+    }
+
+    func testTopStripPressDraggedAcrossIsAMoveWithAPreview() {
+        let (tree, context, target, frames) = crossFixture()
+        let fake = FakeAX(frames: frames)
+        let transaction = TiledDragTransaction(ioFactory: fake.factory)
+        let topStrip = CGPoint(x: frames[1]!.midX, y: frames[1]!.minY + 2)
+        guard case let .captured(snapshot) = transaction.capture(
+            pointer: topStrip, tree: tree, context: context, occludingWindows: [],
+            generation: 1, currentContext: { context }) else { return XCTFail("capture failed") }
+        XCTAssertEqual(snapshot.pressedEdges, [.top])
+        let slot = frames[11]!
+        let point = CGPoint(x: slot.midX, y: slot.maxY - 2)
+        let plan = TiledDropPlanner.plan(pointer: point, draggedID: 1,
+                                         sourceTiles: context.usableFrame,
+                                         sourceSlots: snapshot.originalFrames,
+                                         release: .otherMonitor(slots: TiledDropPlanner.slots(
+                                            of: target.tree, in: target.context.usableFrame,
+                                            gap: 8, padding: 8)))
+        var moved: [CGRect] = []
+        for shrink: CGFloat in [0, 279] {
+            // mid-drag the preview sees a move, and so does the drop
+            let released = CGRect(x: 1300, y: 100, width: frames[1]!.width,
+                                  height: frames[1]!.height - shrink)
+            XCTAssertEqual(snapshot.gesture(to: released), .move, "shrink \(shrink)")
+            XCTAssertNotNil(transaction.previewFrame(snapshot, plan: plan, swap: false,
+                                                     target: target), "shrink \(shrink)")
+            fake.frames[1] = released
+            XCTAssertSuperseded(transaction.dropRelease(snapshot, mode: nil,
+                                                        currentContext: { context }) { frame in
+                moved.append(frame)
+                return .superseded
+            })
+        }
+        XCTAssertEqual(moved.count, 2, "both drops go across as moves")
+    }
+
+    private func snapshot(_ tree: BSPTree, _ context: TiledDragContext,
+                          _ frames: [CGWindowID: CGRect], press: CGPoint?) -> TiledDragSnapshot {
+        TiledDragSnapshot(draggedID: 1, sourceTree: tree, originalTree: tree, context: context,
+                          originalFrames: frames, generation: 1, pressPoint: press)
+    }
+
+    func testTitleBarPressWithAnAppResizeOnAnotherMonitorIsACrossMonitorMove() {
+        let (tree, _, context) = fixture()
+        let frames = layoutFrames(tree, context)
+        let fake = FakeAX(frames: frames)
+        let transaction = TiledDragTransaction(ioFactory: fake.factory)
+        let titleBar = CGPoint(x: frames[1]!.midX, y: frames[1]!.minY + 20)
+        guard case let .captured(snapshot) = transaction.capture(
+            pointer: titleBar, tree: tree, context: context, occludingWindows: [],
+            generation: 1, currentContext: { context }) else { return XCTFail("capture failed") }
+        // dragged by the title bar onto the next display, where the app
+        // takes 279 points off its own height, as Messages did at 14:47:51
+        let released = CGRect(x: 1350, y: 30, width: frames[1]!.width,
+                              height: frames[1]!.height - 279)
+        fake.frames[1] = released
+        var moved: [CGRect] = []
+
+        let outcome = transaction.dropRelease(snapshot, mode: nil, currentContext: { context }) { frame in
+            moved.append(frame)
+            return .superseded
+        }
+
+        XCTAssertSuperseded(outcome)
+        XCTAssertEqual(moved, [released], "a title-bar drag is a move, whatever size the app reports")
+    }
+
+    func testTitleBarPressWithAnAppResizeOnTheSameScreenChangesNoRatio() {
+        let (tree, _, context) = fixture()
+        let frames = layoutFrames(tree, context)
+        let fake = FakeAX(frames: frames)
+        let transaction = TiledDragTransaction(ioFactory: fake.factory)
+        let titleBar = CGPoint(x: frames[1]!.midX, y: frames[1]!.minY + 20)
+        guard case let .captured(snapshot) = transaction.capture(
+            pointer: titleBar, tree: tree, context: context, occludingWindows: [],
+            generation: 1, currentContext: { context }) else { return XCTFail("capture failed") }
+        // the 14:50:09 shape: moved a little, centre still on the source,
+        // 178 points shorter by the app's own doing
+        var released = frames[1]!.offsetBy(dx: 60, dy: 40)
+        released.size.height -= 178
+        fake.frames[1] = released
+
+        guard case .rejectedRestored(reason: .preflight(.noTarget), _) = transaction.dropRelease(
+            snapshot, mode: nil, currentContext: { context }) else {
+            return XCTFail("a move with no target must restore, not resize")
+        }
+        XCTAssertEqual(fake.frames, frames)
+        XCTAssertEqual(tree.structuralFingerprint(), context.fingerprint)
+    }
+
+    func testEdgePressWithASizeChangeIsStillAResize() {
+        let (tree, _, context) = fixture()
+        let frames = layoutFrames(tree, context)
+        let fake = FakeAX(frames: frames)
+        let transaction = TiledDragTransaction(ioFactory: fake.factory)
+        let rightEdge = CGPoint(x: frames[1]!.maxX - 3, y: frames[1]!.midY)
+        guard case let .captured(snapshot) = transaction.capture(
+            pointer: rightEdge, tree: tree, context: context, occludingWindows: [],
+            generation: 1, currentContext: { context }) else { return XCTFail("capture failed") }
+        XCTAssertEqual(snapshot.pressedEdges, [.right])
+        fake.frames[1]!.size.width += 60
+
+        guard case let .committed(candidate, _, _) = transaction.dropRelease(
+            snapshot, mode: nil, currentContext: { context }) else {
+            return XCTFail("an edge drag must still resize")
+        }
+        XCTAssertTrue(candidate.root.userSetRatio, "the manual resize moved the root split")
+    }
+
+    /// The same three-window source as `fixture`, next to a two-window
+    /// tree on a display to its right, workspace 2.
+    private func crossFixture() -> (BSPTree, TiledDragContext, TiledDragCrossTarget,
+                                    [CGWindowID: CGRect]) {
+        let (tree, _, context) = fixture()
+        let targetTree = BSPTree()
+        [makeWindow(id: 10), makeWindow(id: 11)].forEach { _ = targetTree.insert($0, maxDepth: 4) }
+        let targetContext = TiledDragContext(
+            workspace: 2, physicalDisplayID: 78,
+            usableFrame: CGRect(x: 1200, y: 0, width: 1000, height: 800),
+            gap: 8, padding: 8, maxDepth: 3,
+            memberIDs: [10, 11], floatingIDs: [],
+            fingerprint: targetTree.structuralFingerprint())
+        let frames = layoutFrames(tree, context).merging(layoutFrames(targetTree, targetContext)) {
+            first, _ in first
+        }
+        return (tree, context,
+                TiledDragCrossTarget(tree: targetTree, context: targetContext,
+                                     currentContext: { targetContext }),
+                frames)
     }
 
     private func XCTAssertSuperseded(_ outcome: TiledDragDropOutcome,
