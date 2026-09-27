@@ -3292,7 +3292,7 @@ private extension WindowManager {
             dropPreviewTargets = [:]
             dropPreviewSawMove = false
             dropPreviewPanel.primaryScreenHeight = displayManager.primaryScreenHeight
-            dropPreviewPanel.accentColor = config.resolvedFocusBorderColor
+            dropPreviewPanel.accentColor = config.resolvedDropPreviewColor
             dropPreviewPanel.cornerRadius = config.windowCornerRadius
             dropPreview.begin { [weak self] point in
                 self?.tiledDropPreviewFrame(at: point, snapshot: snapshot)

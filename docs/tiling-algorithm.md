@@ -870,7 +870,9 @@ same-tree resize rule. A window that did not move is still ignored.
 ### Live drop preview
 
 While a tiled drag is in progress, a translucent highlight shows where the
-window will land. It uses the accent (focus border) color at low alpha, with a
+window will land. It uses the focus color the user picked, at low alpha: the
+bracket color when brackets are on, else the focus border color when the
+border is on, else brand cyan (`UserConfig.resolvedDropPreviewColor`). It has a
 thin border and the window corner radius. It appears only after all of these
 hold:
 

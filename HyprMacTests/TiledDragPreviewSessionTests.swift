@@ -129,4 +129,26 @@ final class TiledDragPreviewSessionTests: XCTestCase {
         harness.session.refresh()
         XCTAssertEqual(harness.shows, [Harness.left], "a new drag starts with no point")
     }
+
+    // MARK: - color
+
+    // the preview takes the focus color the user picked, else brand cyan
+    func testPreviewColorFollowsTheUsersPickedFocusColor() {
+        XCTAssertEqual(UserConfig.dropPreviewColorHex(bracketStyle: .rounded, bracketHex: "FF3B30",
+                                                      showBorder: true, borderHex: "34C759"), "FF3B30")
+        XCTAssertEqual(UserConfig.dropPreviewColorHex(bracketStyle: .off, bracketHex: "FF3B30",
+                                                      showBorder: true, borderHex: "34C759"), "34C759")
+        XCTAssertEqual(UserConfig.dropPreviewColorHex(bracketStyle: .rounded, bracketHex: nil,
+                                                      showBorder: true, borderHex: "34C759"), "34C759")
+    }
+
+    // dim only, or brackets and border in their default colors: brand cyan
+    func testPreviewColorDefaultsWhenNoColorWasPicked() {
+        XCTAssertNil(UserConfig.dropPreviewColorHex(bracketStyle: .rounded, bracketHex: nil,
+                                                    showBorder: false, borderHex: nil))
+        XCTAssertNil(UserConfig.dropPreviewColorHex(bracketStyle: .off, bracketHex: "FF3B30",
+                                                    showBorder: false, borderHex: "34C759"))
+        XCTAssertNil(UserConfig.dropPreviewColorHex(bracketStyle: .rounded, bracketHex: "not-a-color",
+                                                    showBorder: false, borderHex: nil))
+    }
 }
