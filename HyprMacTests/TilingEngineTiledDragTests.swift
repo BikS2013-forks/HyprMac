@@ -393,6 +393,224 @@ final class TilingEngineTiledDragTests: XCTestCase {
         }
     }
 
+    // MARK: - across monitors
+
+    func testCrossMonitorInsertCommitsBothTreesAndMovesOnlyTheDraggedWindow() throws {
+        let fixture = makeCrossFixture()
+        let sourceTree = try XCTUnwrap(fixture.engine.existingTree(forWorkspace: 1,
+                                                                  screen: fixture.tall))
+        let targetTree = try XCTUnwrap(fixture.engine.existingTree(forWorkspace: 2,
+                                                                  screen: fixture.wide))
+        // a floater over the wide screen does not block the release
+        let snapshot = try captureCross(fixture, floatingIDs: [40])
+        let slot = try XCTUnwrap(fixture.trace.frames[10])
+        fixture.trace.frames[1]?.origin = CGPoint(x: 300, y: 200)
+
+        let outcome = dropCross(fixture, snapshot,
+                                at: CGPoint(x: slot.minX + 5, y: slot.midY), swap: false,
+                                floatingIDs: [40])
+
+        guard case let .acrossTrees(.committed(sourceCandidate, frames, progress), cross) = outcome else {
+            return XCTFail("expected a committed drop across monitors, got \(outcome)")
+        }
+        XCTAssertTrue(progress.candidateVerified)
+        XCTAssertEqual(cross.moves, [1: 2])
+        XCTAssertEqual(fixture.engine.windowIDs(inTreeForWorkspace: 1, screen: fixture.tall), [2, 3])
+        XCTAssertEqual(fixture.engine.windowIDs(inTreeForWorkspace: 2, screen: fixture.wide),
+                       [1, 10, 11])
+        let publishedSource = fixture.engine.existingTree(forWorkspace: 1, screen: fixture.tall)
+        let publishedTarget = fixture.engine.existingTree(forWorkspace: 2, screen: fixture.wide)
+        XCTAssertTrue(publishedSource === sourceCandidate)
+        XCTAssertTrue(publishedTarget === cross.targetCandidate)
+        XCTAssertFalse(publishedSource === sourceTree)
+        XCTAssertFalse(publishedTarget === targetTree)
+        // every window on both screens sits on its published slot, as read back
+        for id: CGWindowID in [1, 2, 3, 10, 11] {
+            let onSource = [2, 3].contains(id)
+            let slot = fixture.engine.intendedRect(for: id, onWorkspace: onSource ? 1 : 2,
+                                                   screen: onSource ? fixture.tall : fixture.wide)
+            XCTAssertEqual(fixture.trace.frames[id], slot, "window \(id)")
+            XCTAssertEqual(frames[id], fixture.trace.frames[id], "window \(id)")
+        }
+        XCTAssertTrue(fixture.engine.unverifiedLayouts.isEmpty)
+    }
+
+    func testCrossMonitorSwapTradesTreesAndWorkspaces() throws {
+        let fixture = makeCrossFixture()
+        let snapshot = try captureCross(fixture)
+        let draggedSlot = try XCTUnwrap(fixture.trace.frames[1])
+        let targetSlot = try XCTUnwrap(fixture.trace.frames[10])
+        fixture.trace.frames[1]?.origin = CGPoint(x: 300, y: 200)
+
+        let outcome = dropCross(fixture, snapshot, at: center(of: targetSlot), swap: true)
+
+        guard case let .acrossTrees(.committed, cross) = outcome else {
+            return XCTFail("expected a committed swap across monitors, got \(outcome)")
+        }
+        XCTAssertEqual(cross.moves, [1: 2, 10: 1])
+        XCTAssertEqual(fixture.engine.windowIDs(inTreeForWorkspace: 1, screen: fixture.tall),
+                       [10, 2, 3])
+        XCTAssertEqual(fixture.engine.windowIDs(inTreeForWorkspace: 2, screen: fixture.wide), [1, 11])
+        XCTAssertEqual(fixture.trace.frames[10], draggedSlot)
+        XCTAssertEqual(fixture.trace.frames[1], targetSlot)
+    }
+
+    func testCrossMonitorDropOnAWorkspaceWithoutTilesMakesTheDraggedWindowItsRoot() throws {
+        for swap in [false, true] {
+            let fixture = makeCrossFixture(targetIDs: [])
+            XCTAssertNil(fixture.engine.existingTree(forWorkspace: 2, screen: fixture.wide))
+            let snapshot = try captureCross(fixture)
+            fixture.trace.frames[1]?.origin = CGPoint(x: 300, y: 200)
+
+            let outcome = dropCross(fixture, snapshot, at: CGPoint(x: 1000, y: 500), swap: swap)
+
+            guard case let .acrossTrees(.committed, cross) = outcome else {
+                return XCTFail("expected the empty workspace to take the window, swap=\(swap)")
+            }
+            XCTAssertEqual(cross.moves, [1: 2])
+            XCTAssertEqual(fixture.engine.windowIDs(inTreeForWorkspace: 2, screen: fixture.wide), [1])
+            XCTAssertEqual(fixture.engine.windowIDs(inTreeForWorkspace: 1, screen: fixture.tall), [2, 3])
+            let usable = fixture.engine.displayManager.cgRect(for: fixture.wide)
+            let padding = fixture.engine.outerPadding
+            XCTAssertEqual(fixture.trace.frames[1], usable.insetBy(dx: padding, dy: padding))
+        }
+    }
+
+    func testCrossMonitorDropOfTheSoleSourceWindowRemovesTheSourceTree() throws {
+        let fixture = makeCrossFixture(sourceIDs: [1])
+        let snapshot = try captureCross(fixture)
+        let slot = try XCTUnwrap(fixture.trace.frames[11])
+        fixture.trace.frames[1]?.origin = CGPoint(x: 300, y: 200)
+
+        let outcome = dropCross(fixture, snapshot,
+                                at: CGPoint(x: slot.maxX - 5, y: slot.midY), swap: false)
+
+        guard case .acrossTrees(.committed, _) = outcome else {
+            return XCTFail("expected a committed drop, got \(outcome)")
+        }
+        XCTAssertNil(fixture.engine.existingTree(forWorkspace: 1, screen: fixture.tall))
+        XCTAssertEqual(fixture.engine.windowIDs(inTreeForWorkspace: 2, screen: fixture.wide),
+                       [10, 11, 1])
+    }
+
+    func testCrossMonitorDropPastTheTargetMaxSplitsRestoresBothTreesAndVerifiesFrames() throws {
+        let fixture = makeCrossFixture { engine, wide in
+            engine.maxSplitsPerMonitor[wide.localizedName] = 1
+        }
+        let sourceTree = fixture.engine.existingTree(forWorkspace: 1, screen: fixture.tall)
+        let targetTree = fixture.engine.existingTree(forWorkspace: 2, screen: fixture.wide)
+        let originals = fixture.trace.frames
+        let snapshot = try captureCross(fixture)
+        let slot = try XCTUnwrap(originals[10])
+        fixture.trace.frames[1]?.origin = CGPoint(x: 300, y: 200)
+        fixture.trace.writes.removeAll()
+
+        let outcome = dropCross(fixture, snapshot,
+                                at: CGPoint(x: slot.minX + 5, y: slot.midY), swap: false)
+
+        guard case let .acrossTrees(.rejectedRestored(reason, frames), cross) = outcome else {
+            return XCTFail("expected a verified rollback of both trees, got \(outcome)")
+        }
+        XCTAssertEqual(reason, .preflight(.maxDepthExceeded))
+        XCTAssertTrue(cross.moves.isEmpty)
+        XCTAssertNil(cross.targetCandidate)
+        XCTAssertEqual(fixture.trace.frames, originals)
+        XCTAssertEqual(frames, originals)
+        // the rollback wrote and verified every original on both screens
+        XCTAssertEqual(Set(fixture.trace.writes), [1, 2, 3, 10, 11])
+        XCTAssertTrue(fixture.engine.existingTree(forWorkspace: 1, screen: fixture.tall) === sourceTree)
+        XCTAssertTrue(fixture.engine.existingTree(forWorkspace: 2, screen: fixture.wide) === targetTree)
+        XCTAssertEqual(Set(fixture.engine.unverifiedLayouts.map(\.workspace)), [1, 2])
+    }
+
+    func testCrossMonitorRollsBackBothTreesWhenATargetFrameIsRefused() throws {
+        let fixture = makeCrossFixture()
+        let sourceTree = fixture.engine.existingTree(forWorkspace: 1, screen: fixture.tall)
+        let targetTree = fixture.engine.existingTree(forWorkspace: 2, screen: fixture.wide)
+        let originals = fixture.trace.frames
+        let snapshot = try captureCross(fixture)
+        let slot = try XCTUnwrap(originals[10])
+        fixture.trace.frames[1]?.origin = CGPoint(x: 300, y: 200)
+        // 10 will not give up any of its width to make room
+        fixture.trace.sizeFloors[10] = slot.size
+        fixture.trace.advancesClock = true
+
+        let outcome = dropCross(fixture, snapshot,
+                                at: CGPoint(x: slot.minX + 5, y: slot.midY), swap: false)
+
+        guard case let .acrossTrees(.rejectedRestored(reason, _), cross) = outcome else {
+            return XCTFail("expected a verified rollback of both trees, got \(outcome)")
+        }
+        XCTAssertEqual(reason, .sizing(.geometryMismatch(10)))
+        XCTAssertTrue(cross.moves.isEmpty)
+        XCTAssertEqual(fixture.trace.frames, originals)
+        XCTAssertTrue(fixture.engine.existingTree(forWorkspace: 1, screen: fixture.tall) === sourceTree)
+        XCTAssertTrue(fixture.engine.existingTree(forWorkspace: 2, screen: fixture.wide) === targetTree)
+        XCTAssertEqual(fixture.engine.windowIDs(inTreeForWorkspace: 1, screen: fixture.tall), [1, 2, 3])
+        XCTAssertEqual(fixture.engine.windowIDs(inTreeForWorkspace: 2, screen: fixture.wide), [10, 11])
+    }
+
+    func testCrossMonitorReleaseOnAScreenThatCannotTakeTheWindowRestoresAsBefore() throws {
+        let fixture = makeCrossFixture()
+        let sourceTree = fixture.engine.existingTree(forWorkspace: 1, screen: fixture.tall)
+        let targetTree = fixture.engine.existingTree(forWorkspace: 2, screen: fixture.wide)
+        let originals = fixture.trace.frames
+        let snapshot = try captureCross(fixture)
+        fixture.trace.frames[1]?.origin = CGPoint(x: 300, y: 200)
+        fixture.trace.writes.removeAll()
+
+        // a disabled monitor or the scratchpad layer gives no location
+        let outcome = fixture.engine.dropTiledDrag(
+            snapshot, mode: .crossMonitor(pointer: CGPoint(x: 400, y: 300), swapRequested: false),
+            currentLocation: { (1, fixture.tall, []) }, releaseLocation: { nil })
+
+        guard case .rejectedRestored(reason: .preflight(.noTarget), _) = outcome else {
+            return XCTFail("expected the ordinary no-target restore, got \(outcome)")
+        }
+        XCTAssertEqual(fixture.trace.frames, originals)
+        XCTAssertTrue(Set(fixture.trace.writes).isDisjoint(with: [10, 11]))
+        XCTAssertTrue(fixture.engine.existingTree(forWorkspace: 1, screen: fixture.tall) === sourceTree)
+        XCTAssertTrue(fixture.engine.existingTree(forWorkspace: 2, screen: fixture.wide) === targetTree)
+    }
+
+    func testCrossMonitorResizeCandidateKeepsTheSameTreeRules() throws {
+        let fixture = makeCrossFixture()
+        let targetTree = fixture.engine.existingTree(forWorkspace: 2, screen: fixture.wide)
+        let originals = fixture.trace.frames
+        let snapshot = try captureCross(fixture)
+        // resized well past the threshold and standing on the other screen
+        fixture.trace.frames[1] = CGRect(x: 300, y: 200, width: 600, height: 500)
+
+        let outcome = dropCross(fixture, snapshot, at: CGPoint(x: 500, y: 400), swap: false)
+
+        guard case .rejectedRestored(reason: .preflight(.noTarget), _) = outcome else {
+            return XCTFail("expected the resize candidate to restore, got \(outcome)")
+        }
+        XCTAssertEqual(fixture.trace.frames, originals)
+        XCTAssertTrue(fixture.engine.existingTree(forWorkspace: 2, screen: fixture.wide) === targetTree)
+    }
+
+    func testSameMonitorDropIgnoresTheReleaseLocation() throws {
+        let fixture = makeCrossFixture()
+        let targetTree = fixture.engine.existingTree(forWorkspace: 2, screen: fixture.wide)
+        let snapshot = try captureCross(fixture)
+        fixture.trace.frames[1]?.origin.x += 2
+        fixture.trace.writes.removeAll()
+
+        let outcome = fixture.engine.dropTiledDrag(
+            snapshot, mode: .insert(targetID: 3, edge: .left),
+            currentLocation: { (1, fixture.tall, []) },
+            releaseLocation: { (2, fixture.wide, []) })
+
+        guard case let .committed(candidate, _, _) = outcome else {
+            return XCTFail("expected an ordinary same-tree commit, got \(outcome)")
+        }
+        XCTAssertTrue(fixture.engine.existingTree(forWorkspace: 1, screen: fixture.tall) === candidate)
+        XCTAssertEqual(Set(candidate.allWindows.map(\.windowID)), [1, 2, 3])
+        XCTAssertTrue(fixture.engine.existingTree(forWorkspace: 2, screen: fixture.wide) === targetTree)
+        XCTAssertTrue(Set(fixture.trace.writes).isDisjoint(with: [10, 11]))
+    }
+
     private struct Fixture {
         let engine: TilingEngine
         let screen: NSScreen
@@ -441,6 +659,58 @@ final class TilingEngineTiledDragTests: XCTestCase {
         return snapshot
     }
 
+    private struct CrossFixture {
+        let engine: TilingEngine
+        /// primary, workspace 2
+        let wide: NSScreen
+        /// to its left, workspace 1, where the drags start
+        let tall: NSScreen
+        let trace: DragSizingTrace
+    }
+
+    private func makeCrossFixture(
+        sourceIDs: [CGWindowID] = [1, 2, 3],
+        targetIDs: [CGWindowID] = [10, 11],
+        configure: (TilingEngine, NSScreen) -> Void = { _, _ in }
+    ) -> CrossFixture {
+        let wide = CrossDragScreen(frame: NSRect(x: 0, y: 0, width: 2000, height: 1000),
+                                   name: "Cross drag wide", number: 81)
+        let tall = CrossDragScreen(frame: NSRect(x: -1000, y: 0, width: 1000, height: 1600),
+                                   name: "Cross drag tall", number: 82)
+        let trace = DragSizingTrace()
+        let engine = TilingEngine(displayManager: DisplayManager(screenSource: { [wide, tall] }),
+                                  frameSizingIOFactory: trace.factory)
+        configure(engine, wide)
+        var frames: [CGWindowID: CGRect] = [:]
+        let source = engine.prepareTileLayout(sourceIDs.map { makeWindow(id: $0) },
+                                              onWorkspace: 1, screen: tall)
+        for (window, frame) in source { frames[window.windowID] = frame }
+        if !targetIDs.isEmpty {
+            let target = engine.prepareTileLayout(targetIDs.map { makeWindow(id: $0) },
+                                                  onWorkspace: 2, screen: wide)
+            for (window, frame) in target { frames[window.windowID] = frame }
+        }
+        trace.frames = frames
+        return CrossFixture(engine: engine, wide: wide, tall: tall, trace: trace)
+    }
+
+    private func captureCross(_ fixture: CrossFixture,
+                              floatingIDs: Set<CGWindowID> = []) throws -> TiledDragSnapshot {
+        let result = fixture.engine.captureTiledDrag(draggedID: 1, workspace: 1,
+                                                     screen: fixture.tall, floatingIDs: floatingIDs)
+        guard case let .captured(snapshot) = result else { throw TestFailure.capture }
+        return snapshot
+    }
+
+    private func dropCross(_ fixture: CrossFixture, _ snapshot: TiledDragSnapshot,
+                           at pointer: CGPoint, swap: Bool,
+                           floatingIDs: Set<CGWindowID> = []) -> TiledDragDropOutcome {
+        fixture.engine.dropTiledDrag(
+            snapshot, mode: .crossMonitor(pointer: pointer, swapRequested: swap),
+            currentLocation: { (1, fixture.tall, floatingIDs) },
+            releaseLocation: { (2, fixture.wide, floatingIDs) })
+    }
+
     private enum TestFailure: Error { case capture }
 
     private func center(of frame: CGRect?) -> CGPoint {
@@ -458,6 +728,30 @@ private final class DragTestScreen: NSScreen {
     }
 }
 
+/// One of two side-by-side displays for drops across monitors. Usable
+/// frame is the whole frame, and the display number is fixed.
+private final class CrossDragScreen: NSScreen {
+    private let bounds: NSRect
+    private let name: String
+    private let number: UInt32
+
+    init(frame: NSRect, name: String, number: UInt32) {
+        bounds = frame
+        self.name = name
+        self.number = number
+        super.init()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override var frame: NSRect { bounds }
+    override var visibleFrame: NSRect { bounds }
+    override var localizedName: String { name }
+    override var deviceDescription: [NSDeviceDescriptionKey: Any] {
+        [NSDeviceDescriptionKey("NSScreenNumber"): NSNumber(value: number)]
+    }
+}
+
 private final class DragSizingTrace {
     var frames: [CGWindowID: CGRect] = [:]
     var writes: [CGWindowID] = []
@@ -469,6 +763,13 @@ private final class DragSizingTrace {
     var cleanupError: AXError?
     var readCalls = 0
     var nextReadError: AXError?
+    /// a window never takes a size below its floor, like an app refusing
+    /// to shrink. the answer still returns success
+    var sizeFloors: [CGWindowID: CGSize] = [:]
+    /// off by default: the clock stands still and only the sample limit
+    /// ends a settle loop
+    var advancesClock = false
+    private var time: TimeInterval = 0
 
     func factory(_ windows: [CGWindowID: HyprWindow],
                  _ generation: @escaping () -> UInt64) -> FrameSizingIO {
@@ -483,7 +784,9 @@ private final class DragSizingTrace {
                     remainingWriteFailures -= 1
                     return .cannotComplete
                 }
-                frames[id]?.size = size
+                let floor = sizeFloors[id] ?? .zero
+                frames[id]?.size = CGSize(width: max(size.width, floor.width),
+                                          height: max(size.height, floor.height))
                 writes.append(id)
                 return .success
             },
@@ -505,7 +808,9 @@ private final class DragSizingTrace {
                 return (.success, frames[id]?.origin)
             },
             readSize: { [unowned self] id, _ in (.success, frames[id]?.size) },
-            now: { 0 }, sleep: { _ in }, currentGeneration: generation,
+            now: { [unowned self] in time },
+            sleep: { [unowned self] interval in if advancesClock { time += interval } },
+            currentGeneration: generation,
             endFrameWrite: { [unowned self] _, _, _ in
                 cleanupError.map { .failed($0) } ?? .restored
             }

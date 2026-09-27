@@ -57,6 +57,38 @@ final class TiledDragTargetTests: XCTestCase {
         XCTAssertNil(resolve(CGPoint(x: 75, y: 50), intendedSlots: overlapping))
     }
 
+    // MARK: - nearest tile, for a release on another monitor
+
+    func testNearestInsideATileUsesTheSameEdgeRule() {
+        for point in [CGPoint(x: 111, y: 40), CGPoint(x: 209, y: 40),
+                      CGPoint(x: 160, y: 1), CGPoint(x: 160, y: 79), CGPoint(x: 160, y: 40)] {
+            XCTAssertEqual(nearest(point), resolve(point), "\(point)")
+        }
+    }
+
+    func testNearestTakesTheClosestTileAcrossAGap() {
+        // 1 ends at 100 and 2 starts at 110
+        XCTAssertEqual(nearest(CGPoint(x: 103, y: 40)), target(1, .right))
+        XCTAssertEqual(nearest(CGPoint(x: 108, y: 40)), target(2, .left))
+        // the middle of the gap goes to the lower id
+        XCTAssertEqual(nearest(CGPoint(x: 105, y: 40)), target(1, .right))
+    }
+
+    func testNearestReachesIntoThePadding() {
+        XCTAssertEqual(nearest(CGPoint(x: -20, y: 40)), target(1, .left))
+        XCTAssertEqual(nearest(CGPoint(x: 160, y: 95)), target(2, .bottom))
+        XCTAssertEqual(nearest(CGPoint(x: 400, y: -30)), target(4, .top))
+    }
+
+    func testNearestWithoutTilesOrWithABadPointerHasNoTarget() {
+        XCTAssertNil(TiledDragTargetResolver.nearest(pointer: .zero, slots: [:]))
+        XCTAssertNil(nearest(CGPoint(x: CGFloat.nan, y: 40)))
+    }
+
+    private func nearest(_ pointer: CGPoint) -> TiledDragTarget? {
+        TiledDragTargetResolver.nearest(pointer: pointer, slots: slots)
+    }
+
     private func resolve(_ pointer: CGPoint, draggedID: CGWindowID = 1,
                          intendedSlots: [CGWindowID: CGRect]? = nil) -> TiledDragTarget? {
         TiledDragTargetResolver.resolve(pointer: pointer, draggedID: draggedID,

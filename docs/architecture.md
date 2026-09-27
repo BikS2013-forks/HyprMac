@@ -54,7 +54,7 @@ singleton except `UserConfig.shared` and `MenuBarState.shared`.
 | `TiledFocusRouter` | Focus for hover, Hypr+Arrow, Hypr keydown, the focus invariant and the raise restore. A tile a floater covers is focused through SkyLight alone, checked, and falls back to the usual path. |
 | `WindowStacking` | Pure rules over the CG window list: the frontmost app's open popup, pointer hit-test, floaters above or below a tile, and the tiles covering each floater. |
 | `TiledDragHandler` | Owns captured press/release state, cancellation, and verified cache updates. |
-| `TiledDragTransaction` | Builds isolated insertion, swap, or resize candidates and verifies frames before commit. |
+| `TiledDragTransaction` | Builds isolated insertion, swap, or resize candidates, within one tree or across two monitors' trees, and verifies frames before commit. |
 | `FrameSizingAttempt` | Bounded AX writes and complete frame readback through an injected clock and IO surface. |
 | `FocusBorder` | Visual focus indicator. Persistent panels at `.floating` level with occlusion masking. |
 | `FocusBrackets` | Corner brackets shown around the focus target while the Hypr key is held. |

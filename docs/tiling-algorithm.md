@@ -758,9 +758,10 @@ one point are ignored, so text selection does not rearrange unmoved windows.
 An ordinary move chooses a target from the release point within the source
 workspace and physical display. The nearest normalized target edge selects
 left, right, top, or bottom insertion; ties use that order. A latched Hypr
-gesture or Option at release requests a same-tree swap instead. A release
-without a target restores and verifies the captured frames. Cross-monitor and
-cross-workspace insertion are excluded.
+gesture or Option at release requests a same-tree swap instead. A release on
+the source display without a target restores and verifies the captured
+frames. A release on another display is a drop across monitors, described
+below.
 
 `BSPTree.candidateTree` clones the source, removes the dragged leaf, and
 splits the target on the selected side. Horizontal splits create columns;
@@ -789,6 +790,61 @@ carries no provenance clears every member, because then nothing is provably
 untouched. Clearing only the dragged id would be wrong: a rollback writes
 every captured original. The finishing flag suppresses polling
 through the settle delay and transaction, without a fixed expiry timer.
+
+### Dropping on another monitor
+
+A plain move released on another display lands in the workspace visible
+there (`WorkspaceManager.workspaceForScreen`). The release screen is the one
+whose whole display frame holds the point, menu bar and Dock included. The
+drop places the window the way a same-tree drop does:
+
+- Over a tile, the window is split in beside it on the nearest normalized
+  edge, with the same edge rule and the same split.
+- In a gap or the padding, the nearest tile takes it, the lower id on a tie.
+  The edge is measured from the point clamped into that tile.
+- A latched Hypr gesture or Option at release swaps it with that tile. The
+  two windows trade leaves, trees and workspaces. Both topologies stay as
+  they were. Ratios move only for a known-minimum conflict, as on any drop.
+- A workspace with no tiles takes the window as its tree root, swap or not.
+
+The source tree loses the window the way it would on a close, and a source
+tree left empty is dropped. Visible floaters on the release screen do not
+block the drop. The same-tree release ignores them too.
+
+The release screen's tree is read before anything is written. Its members'
+actual frames become its originals, and the target tile is chosen from them.
+Both candidates are private clones from `BSPTree`, built in the engine's drop
+path. Each must stay within its own screen's Max Splits. Each layout gets the
+same known-minimum ratio adjustment as a same-tree drop. If a known minimum
+still overflows its slot by more than 20 points
+(`TilingConfig.frameToleranceXPx`, the overshoot a readback may show), the
+drop is refused (`noRoom`) before any candidate write. The release screen's
+frames go out first, then the source's. Each screen has its own
+`FrameSizingAttempt` against its own usable frame. A window crossing screens
+takes the engine's write order, and two displays with different backing
+scales get the scale-change budget. Both trees publish together, and only
+after every frame on both screens was accepted.
+
+A refusal or a sizing failure after the release screen was read puts both
+trees back, even when nothing was written there yet. The source's captured
+originals go first, the dragged window's among them, then the release
+screen's. Each set is verified against its own screen. Neither topology
+changes, and every key that has a tree is marked unverified. A release screen
+with no tree has no key to mark. Superseded work writes nothing more, on
+either screen, as on a same-tree drop: a newer operation owns the geometry.
+A failure whose drop went stale before the rollback is reported degraded
+without one. The cache rules above cover both trees' members.
+
+Workspace membership changes only on a commit, through
+`WorkspaceManager.moveWindow`, for the dragged window and for a swapped one.
+It moves in the same synchronous step that published the trees, before the
+drop is reported. After a commit the dragged window keeps focus, and the
+border is drawn on its verified frame rather than on a live AX read.
+
+These cases restore exactly as a release without a target always has: a
+disabled release screen, the scratchpad layer up on any screen, a scratchpad
+source, a point on no screen, and a resize candidate, which keeps the
+same-tree resize rule. A window that did not move is still ignored.
 
 ## `prepareTileLayout` / `prepareSwapLayout` / `prepareToggleSplitLayout`
 

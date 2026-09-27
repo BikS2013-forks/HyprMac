@@ -921,6 +921,176 @@ final class TiledDragTransactionTests: XCTestCase {
         XCTAssertFalse(fake.writes.isEmpty)
     }
 
+    // MARK: - across trees
+
+    func testAcrossTreesInsertCommitsBothCandidatesWithoutTouchingEitherTree() {
+        let (tree, context, target, frames) = crossFixture()
+        let fake = FakeAX(frames: frames)
+        let transaction = TiledDragTransaction(ioFactory: fake.factory)
+        guard case let .captured(snapshot) = transaction.capture(
+            draggedID: 1, tree: tree, context: context, generation: 1,
+            currentContext: { context }) else { return XCTFail("capture failed") }
+        let release = CGRect(origin: CGPoint(x: 1300, y: 100), size: frames[1]!.size)
+        fake.frames[1] = release
+        let slot = frames[11]!
+
+        guard case let .acrossTrees(.committed(source, actual, _), cross) = transaction.dropAcrossTrees(
+            snapshot, into: target, pointer: CGPoint(x: slot.midX, y: slot.maxY - 2),
+            swapRequested: false, releaseFrame: release, currentContext: { context }) else {
+            return XCTFail("expected a committed drop across trees")
+        }
+        XCTAssertEqual(source.allWindows.map(\.windowID), [2, 3])
+        XCTAssertEqual(cross.targetCandidate?.allWindows.map(\.windowID), [10, 11, 1])
+        XCTAssertEqual(cross.moves, [1: 2])
+        XCTAssertEqual(tree.structuralFingerprint(), context.fingerprint)
+        XCTAssertEqual(target.tree.structuralFingerprint(), target.context.fingerprint)
+        XCTAssertEqual(Set(actual.keys), [1, 2, 3, 10, 11])
+        XCTAssertTrue(target.context.usableFrame.contains(actual[1]!))
+        XCTAssertTrue(context.usableFrame.contains(actual[2]!))
+    }
+
+    func testAcrossTreesSwapThatCannotFitAKnownMinimumRestoresBothWithoutCandidateWrites() {
+        let (tree, context, target, frames) = crossFixture()
+        let fake = FakeAX(frames: frames)
+        // 10 cannot shrink into the dragged window's slot, even at 0.85
+        let transaction = TiledDragTransaction(
+            ioFactory: fake.factory,
+            minimumSize: { $0?.windowID == 10 ? CGSize(width: 1100, height: 0) : .zero })
+        guard case let .captured(snapshot) = transaction.capture(
+            draggedID: 1, tree: tree, context: context, generation: 1,
+            currentContext: { context }) else { return XCTFail("capture failed") }
+        let release = CGRect(origin: CGPoint(x: 1300, y: 100), size: frames[1]!.size)
+        fake.frames[1] = release
+
+        let outcome = transaction.dropAcrossTrees(
+            snapshot, into: target, pointer: center(frames[10]!), swapRequested: true,
+            releaseFrame: release, currentContext: { context })
+
+        guard case let .acrossTrees(.rejectedRestored(reason, _), cross) = outcome else {
+            return XCTFail("expected a verified rollback of both trees")
+        }
+        XCTAssertEqual(reason, .preflight(.noRoom))
+        XCTAssertNil(cross.targetCandidate)
+        XCTAssertTrue(cross.moves.isEmpty)
+        XCTAssertEqual(fake.frames, frames)
+        XCTAssertEqual(fake.writes.count, frames.count * 3,
+                       "only the rollback's resize-move-resize per original")
+    }
+
+    func testAcrossTreesSourceWriteFailureAfterTheTargetLandedRestoresBothTrees() {
+        let (tree, context, target, frames) = crossFixture()
+        let fake = FakeAX(frames: frames)
+        let transaction = TiledDragTransaction(ioFactory: fake.factory)
+        guard case let .captured(snapshot) = transaction.capture(
+            draggedID: 1, tree: tree, context: context, generation: 1,
+            currentContext: { context }) else { return XCTFail("capture failed") }
+        let release = CGRect(origin: CGPoint(x: 1300, y: 100), size: frames[1]!.size)
+        fake.frames[1] = release
+        // the release screen's three windows take all nine setters, then the
+        // source's first one fails
+        fake.writeErrors = Array(repeating: .success, count: 9) + [.cannotComplete]
+        let slot = frames[11]!
+
+        let outcome = transaction.dropAcrossTrees(
+            snapshot, into: target, pointer: CGPoint(x: slot.midX, y: slot.maxY - 2),
+            swapRequested: false, releaseFrame: release, currentContext: { context })
+
+        guard case let .acrossTrees(.rejectedRestored(reason, restored), _) = outcome else {
+            return XCTFail("expected a verified rollback of both trees")
+        }
+        XCTAssertEqual(reason, .sizing(.writeFailed(2, .cannotComplete)))
+        XCTAssertEqual(fake.frames, frames)
+        XCTAssertEqual(restored, frames)
+    }
+
+    func testAcrossTreesStaleTargetDuringWritesIsSupersededWithoutRollback() {
+        let (tree, context, fresh, frames) = crossFixture()
+        var targetContext: TiledDragContext? = fresh.context
+        let target = TiledDragCrossTarget(tree: fresh.tree, context: fresh.context,
+                                          currentContext: { targetContext })
+        let fake = FakeAX(frames: frames)
+        let transaction = TiledDragTransaction(ioFactory: fake.factory)
+        guard case let .captured(snapshot) = transaction.capture(
+            draggedID: 1, tree: tree, context: context, generation: 1,
+            currentContext: { context }) else { return XCTFail("capture failed") }
+        let release = CGRect(origin: CGPoint(x: 1300, y: 100), size: frames[1]!.size)
+        fake.frames[1] = release
+        fake.onWrite = { targetContext = nil }
+
+        XCTAssertSuperseded(transaction.dropAcrossTrees(
+            snapshot, into: target, pointer: center(frames[10]!), swapRequested: false,
+            releaseFrame: release, currentContext: { context }))
+        XCTAssertEqual(fake.writes.count, 1, "a newer operation owns the geometry")
+    }
+
+    func testDropReleaseHandsOnlyAPlainMoveToTheCrossTreePath() {
+        let (tree, _, context) = fixture()
+        let frames = layoutFrames(tree, context)
+        let fake = FakeAX(frames: frames)
+        let transaction = TiledDragTransaction(ioFactory: fake.factory)
+        guard case let .captured(snapshot) = transaction.capture(
+            draggedID: 1, tree: tree, context: context, generation: 1,
+            currentContext: { context }) else { return XCTFail("capture failed") }
+        var moved: [CGRect] = []
+        let handoff: (CGRect) -> TiledDragDropOutcome = { frame in
+            moved.append(frame)
+            return .superseded
+        }
+
+        // unmoved: nothing to do
+        guard case .ignored = transaction.dropRelease(snapshot, mode: nil,
+                                                      currentContext: { context },
+                                                      moved: handoff) else {
+            return XCTFail("an unmoved window must be ignored")
+        }
+        // resized off the source: the ordinary restore
+        fake.frames[1] = CGRect(x: 1500, y: 100, width: 300, height: 300)
+        guard case .rejectedRestored(reason: .preflight(.noTarget), _) = transaction.dropRelease(
+            snapshot, mode: nil, currentContext: { context }, moved: handoff) else {
+            return XCTFail("a resize candidate must keep the same-tree rule")
+        }
+        XCTAssertTrue(moved.isEmpty)
+        // a plain move goes across, with the frame it was read at
+        let release = CGRect(origin: CGPoint(x: 1500, y: 100), size: frames[1]!.size)
+        fake.frames[1] = release
+        XCTAssertSuperseded(transaction.dropRelease(snapshot, mode: nil,
+                                                    currentContext: { context }, moved: handoff))
+        XCTAssertEqual(moved, [release])
+    }
+
+    func testReleasePolicyRefusesADisabledMonitorAndTheScratchpadLayer() {
+        XCTAssertEqual(TiledDragReleasePolicy.resolve(monitorDisabled: false, scratchpadVisible: false,
+                                                      visibleWorkspace: { 4 }), .workspace(4))
+        XCTAssertEqual(TiledDragReleasePolicy.resolve(monitorDisabled: true, scratchpadVisible: false,
+                                                      visibleWorkspace: { 4 }),
+                       .refused("monitor disabled"))
+        XCTAssertEqual(TiledDragReleasePolicy.resolve(monitorDisabled: false, scratchpadVisible: true,
+                                                      visibleWorkspace: { 4 }),
+                       .refused("scratchpad visible"))
+    }
+
+    /// The same three-window source as `fixture`, next to a two-window
+    /// tree on a display to its right, workspace 2.
+    private func crossFixture() -> (BSPTree, TiledDragContext, TiledDragCrossTarget,
+                                    [CGWindowID: CGRect]) {
+        let (tree, _, context) = fixture()
+        let targetTree = BSPTree()
+        [makeWindow(id: 10), makeWindow(id: 11)].forEach { _ = targetTree.insert($0, maxDepth: 4) }
+        let targetContext = TiledDragContext(
+            workspace: 2, physicalDisplayID: 78,
+            usableFrame: CGRect(x: 1200, y: 0, width: 1000, height: 800),
+            gap: 8, padding: 8, maxDepth: 3,
+            memberIDs: [10, 11], floatingIDs: [],
+            fingerprint: targetTree.structuralFingerprint())
+        let frames = layoutFrames(tree, context).merging(layoutFrames(targetTree, targetContext)) {
+            first, _ in first
+        }
+        return (tree, context,
+                TiledDragCrossTarget(tree: targetTree, context: targetContext,
+                                     currentContext: { targetContext }),
+                frames)
+    }
+
     private func XCTAssertSuperseded(_ outcome: TiledDragDropOutcome,
                                      file: StaticString = #filePath, line: UInt = #line) {
         guard case .superseded = outcome else {

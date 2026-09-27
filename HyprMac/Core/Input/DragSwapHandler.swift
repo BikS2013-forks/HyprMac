@@ -78,6 +78,22 @@ extension TiledDragTargetResolver {
     }
 }
 
+/// Which workspace a tiled drag released on another monitor lands in: the
+/// one visible there. A disabled monitor tiles nothing, and while the
+/// scratchpad layer is up its scrim covers every other monitor's tiles, so
+/// both refuse and the drop restores.
+enum TiledDragReleasePolicy: Equatable {
+    case workspace(Int)
+    case refused(String)
+
+    static func resolve(monitorDisabled: Bool, scratchpadVisible: Bool,
+                        visibleWorkspace: () -> Int) -> TiledDragReleasePolicy {
+        if monitorDisabled { return .refused("monitor disabled") }
+        if scratchpadVisible { return .refused("scratchpad visible") }
+        return .workspace(visibleWorkspace())
+    }
+}
+
 /// What a finished drag says about each member's cached geometry.
 ///
 /// One decision per window, shared by every cache that holds drag
@@ -121,6 +137,11 @@ struct TiledDragCachePolicy {
             for id in affectedIDs {
                 actions[id] = (written.contains(id) || id == draggedID) ? .invalidate : .preserve
             }
+        case let .acrossTrees(result, cross):
+            // the release screen's tree was captured and possibly written
+            // too, so its members take the same decision
+            return self.actions(for: result, draggedID: draggedID,
+                                affectedIDs: affectedIDs.union(cross.target.memberIDs))
         case .superseded, .ignored:
             break
         }
@@ -163,6 +184,8 @@ struct TiledDragFeedbackPolicy {
             return .rejected
         case .degraded:
             return .degraded
+        case let .acrossTrees(result, _):
+            return feedback(for: result)
         case .committed, .ignored, .superseded:
             return nil
         }
@@ -297,6 +320,8 @@ final class TiledDragSessionCoordinator {
     typealias Schedule = (TimeInterval, @escaping () -> Void) -> Void
     typealias Report = (TiledDragCompletion) -> Void
     typealias CaptureFailureReport = (TiledDragCaptureResult) -> Void
+    /// whether a release with no same-tree target landed on another monitor
+    typealias IsCrossMonitor = (CGPoint, TiledDragSnapshot) -> Bool
 
     private(set) var isFinishingDrag = false
     private let capture: Capture
@@ -305,6 +330,7 @@ final class TiledDragSessionCoordinator {
     private let schedule: Schedule
     private let report: Report
     private let captureFailureReport: CaptureFailureReport
+    private let isCrossMonitor: IsCrossMonitor
     private var pressEpoch: UInt64 = 0
     private var snapshot: TiledDragSnapshot?
     private var captureFailure: TiledDragCaptureResult?
@@ -314,13 +340,15 @@ final class TiledDragSessionCoordinator {
          resolveTarget: @escaping ResolveTarget,
          schedule: @escaping Schedule,
          report: @escaping Report,
-         captureFailureReport: @escaping CaptureFailureReport = { _ in }) {
+         captureFailureReport: @escaping CaptureFailureReport = { _ in },
+         isCrossMonitor: @escaping IsCrossMonitor = { _, _ in false }) {
         self.capture = capture
         self.apply = apply
         self.resolveTarget = resolveTarget
         self.schedule = schedule
         self.report = report
         self.captureFailureReport = captureFailureReport
+        self.isCrossMonitor = isCrossMonitor
     }
 
     func mouseDown(at pointer: CGPoint) {
@@ -370,6 +398,9 @@ final class TiledDragSessionCoordinator {
                 mode = release.swapRequested
                     ? .swap(targetID: target.windowID)
                     : .insert(targetID: target.windowID, edge: target.edge)
+            } else if self.isCrossMonitor(release.pointer, snapshot) {
+                mode = .crossMonitor(pointer: release.pointer,
+                                     swapRequested: release.swapRequested)
             } else {
                 mode = nil
             }
@@ -408,7 +439,8 @@ final class TiledDragHandler {
          readCache: @escaping CacheRead,
          writeCache: @escaping CacheWrite,
          completion: @escaping Completion,
-         captureFailure: @escaping TiledDragSessionCoordinator.CaptureFailureReport) {
+         captureFailure: @escaping TiledDragSessionCoordinator.CaptureFailureReport,
+         isCrossMonitor: @escaping TiledDragSessionCoordinator.IsCrossMonitor = { _, _ in false }) {
         coordinator = TiledDragSessionCoordinator(
             capture: { point in capture(point, capturedFrames) },
             apply: drop,
@@ -420,6 +452,8 @@ final class TiledDragHandler {
                     completion(result)
                     return
                 }
+                // a drop across monitors adds the release screen's members
+                // inside the policy
                 let updated = TiledDragCacheUpdate.applying(
                     result.outcome,
                     draggedID: result.snapshot.draggedID,
@@ -429,7 +463,8 @@ final class TiledDragHandler {
                 writeCache(updated)
                 completion(result)
             },
-            captureFailureReport: captureFailure
+            captureFailureReport: captureFailure,
+            isCrossMonitor: isCrossMonitor
         )
     }
 

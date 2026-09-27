@@ -3200,10 +3200,25 @@ private extension WindowManager {
             },
             drop: { [weak self] snapshot, mode in
                 guard let self, self.isRunning else { return .superseded }
-                return self.tilingEngine.dropTiledDrag(
+                var releaseLocation: () -> (workspace: Int, screen: NSScreen,
+                                            floatingIDs: Set<CGWindowID>)? = { nil }
+                if case let .crossMonitor(pointer, _) = mode {
+                    releaseLocation = self.tiledDragReleaseLocation(pointer, leaving: snapshot)
+                }
+                let outcome = self.tilingEngine.dropTiledDrag(
                     snapshot,
                     mode: mode,
-                    currentLocation: { [weak self] in self?.tiledDragLocation(for: snapshot) })
+                    currentLocation: { [weak self] in self?.tiledDragLocation(for: snapshot) },
+                    releaseLocation: releaseLocation)
+                // membership moves in the same step the engine published both
+                // trees, so nothing between here and the report can split them
+                if case let .acrossTrees(.committed, cross) = outcome {
+                    for (id, workspace) in cross.moves.sorted(by: { $0.key < $1.key }) {
+                        self.workspaceManager.moveWindow(id, toWorkspace: workspace)
+                        self.minimaRevalidation.cancel(id, reason: "tiled drag across monitors")
+                    }
+                }
+                return outcome
             },
             resolveTarget: { pointer, snapshot in
                 guard snapshot.context.usableFrame.contains(pointer) else { return nil }
@@ -3216,12 +3231,61 @@ private extension WindowManager {
             readCache: { [weak self] in self?.stateCache.tiledPositions ?? [:] },
             writeCache: { [weak self] frames in self?.stateCache.tiledPositions = frames },
             completion: { [weak self] completion in self?.completeTiledDrag(completion) },
-            captureFailure: { [weak self] result in self?.reportTiledDragCaptureFailure(result) })
+            captureFailure: { [weak self] result in self?.reportTiledDragCaptureFailure(result) },
+            isCrossMonitor: { [weak self] pointer, snapshot in
+                guard let self, let screen = self.exactFullScreen(containing: pointer) else {
+                    return false
+                }
+                return self.tiledDragDisplayID(screen) != snapshot.context.physicalDisplayID
+            })
     }
 
     private func exactScreen(containing point: CGPoint) -> NSScreen? {
         let matches = displayManager.screens.filter { displayManager.cgRect(for: $0).contains(point) }
         return matches.count == 1 ? matches[0] : nil
+    }
+
+    /// The one screen whose whole display holds `point`, menu bar and Dock
+    /// included, so a release there still counts for that monitor.
+    private func exactFullScreen(containing point: CGPoint) -> NSScreen? {
+        let matches = displayManager.screens.filter { displayManager.cgFullRect(for: $0).contains(point) }
+        return matches.count == 1 ? matches[0] : nil
+    }
+
+    /// Where a tiled drag released over another monitor lands: that screen's
+    /// visible workspace, re-read on every call so the engine can tell when
+    /// it goes stale. A screen that cannot take the window logs why once
+    /// and yields nothing, and the drop restores.
+    private func tiledDragReleaseLocation(_ pointer: CGPoint, leaving snapshot: TiledDragSnapshot)
+        -> () -> (workspace: Int, screen: NSScreen, floatingIDs: Set<CGWindowID>)? {
+        guard let screen = exactFullScreen(containing: pointer) else {
+            hyprLog(.notice, .tiling, "tiled drag across monitors refused: release point on no screen")
+            return { nil }
+        }
+        let displayID = tiledDragDisplayID(screen)
+        guard displayID != snapshot.context.physicalDisplayID else { return { nil } }
+        let policy = tiledDragReleasePolicy(on: screen)
+        guard case let .workspace(workspace) = policy else {
+            if case let .refused(reason) = policy {
+                hyprLog(.notice, .tiling, "tiled drag across monitors refused on "
+                        + "\(screen.localizedName): \(reason)")
+            }
+            return { nil }
+        }
+        return { [weak self] in
+            guard let self, self.isRunning else { return nil }
+            let matches = self.displayManager.screens.filter { self.tiledDragDisplayID($0) == displayID }
+            guard matches.count == 1, let current = matches.first,
+                  self.tiledDragReleasePolicy(on: current) == .workspace(workspace) else { return nil }
+            return (workspace, current, self.stateCache.floatingWindowIDs)
+        }
+    }
+
+    private func tiledDragReleasePolicy(on screen: NSScreen) -> TiledDragReleasePolicy {
+        TiledDragReleasePolicy.resolve(
+            monitorDisabled: workspaceManager.isMonitorDisabled(screen),
+            scratchpadVisible: scratchpad.isVisible,
+            visibleWorkspace: { workspaceManager.workspaceForScreen(screen) })
     }
 
     private func tiledDragLocation(for snapshot: TiledDragSnapshot)
@@ -3256,8 +3320,16 @@ private extension WindowManager {
 
     private func completeTiledDrag(_ completion: TiledDragCompletion) {
         let affected = completion.snapshot.context.memberIDs
+        // a drop onto another monitor wraps the ordinary outcome together
+        // with the release screen's tree
+        var outcome = completion.outcome
+        var crossTree: TiledDragCrossTree?
+        if case let .acrossTrees(result, cross) = completion.outcome {
+            outcome = result
+            crossTree = cross
+        }
         if tiledDragFeedback.hasPendingFeedback {
-            switch completion.outcome {
+            switch outcome {
             case .degraded:
                 // beginDegraded reports the earlier failure before replacing it.
                 break
@@ -3277,32 +3349,42 @@ private extension WindowManager {
                 if !tiledDragFeedback.hasPendingFeedback {
                     pendingTiledDragCompletion = nil
                 }
-            case .ignored, .superseded:
+            case .ignored, .superseded, .acrossTrees:
                 break
             }
         }
+        let scope = crossTree == nil ? "" : " across monitors"
         hyprLog(.debug, .tiling, "tiled drag result: dragged=\(completion.snapshot.draggedID) "
-                + "members=\(affected.sorted()) outcome=\(Self.outcomeName(completion.outcome))")
-        switch completion.outcome {
+                + "members=\(affected.union(crossTree?.target.memberIDs ?? []).sorted()) "
+                + "outcome=\(Self.outcomeName(completion.outcome))")
+        switch outcome {
         case let .rejectedRestored(reason, frames):
-            hyprLog(.notice, .tiling, "tiled drag rejected and restored: reason=\(reason) actual=\(frames)")
+            hyprLog(.notice, .tiling, "tiled drag\(scope) rejected and restored: reason=\(reason) actual=\(frames)")
         case let .degraded(candidateReason, restorationReason, frames, progress):
             let candidate = String(describing: candidateReason)
             let restoration = String(describing: restorationReason)
             let written = (progress?.possiblyWritten ?? []).sorted()
-            hyprLog(.notice, .tiling, "tiled drag degraded: candidate=\(candidate) restoration=\(restoration) "
+            hyprLog(.notice, .tiling, "tiled drag\(scope) degraded: candidate=\(candidate) restoration=\(restoration) "
                     + "written=\(written) actual=\(frames)")
-        case .committed, .superseded, .ignored: break
+        case .committed, .superseded, .ignored, .acrossTrees: break
         }
-        switch completion.outcome {
+        switch outcome {
         case .superseded, .ignored: return
-        case .committed, .rejectedRestored, .degraded: break
+        case .committed, .rejectedRestored, .degraded, .acrossTrees: break
+        }
+        // the drop already moved membership with the trees
+        var committedAcross: [CGWindowID: CGRect]?
+        if crossTree != nil, case let .committed(_, frames, _) = outcome {
+            focusController.recordFocus(completion.snapshot.draggedID,
+                                        reason: "tiled drag across monitors")
+            committedAcross = frames
         }
         if completion.snapshot.context.workspace == ScratchpadController.workspace {
             scratchpad.syncTiledFrames()
         }
         // the same per-window decisions the tiled-position cache just
-        // applied, so the two cannot drift apart
+        // applied, so the two cannot drift apart. a drop across monitors
+        // brings the release screen's members in through the policy
         let actions = TiledDragCachePolicy.actions(for: completion.outcome,
                                                    draggedID: completion.snapshot.draggedID,
                                                    affectedIDs: affected)
@@ -3326,6 +3408,18 @@ private extension WindowManager {
             case .invalidate: focusBrackets.hide()
             case .preserve: break
             }
+        }
+        // the dragged window keeps focus on its new monitor. the border goes
+        // on the verified frame: a live AX read lags the write
+        let draggedID = completion.snapshot.draggedID
+        if let frame = committedAcross?[draggedID], config.showFocusBorder,
+           let window = stateCache.cachedWindows[draggedID],
+           !isFullscreenSuppressed(focused: window) {
+            focusBorder.accentCGColor = config.resolvedFocusBorderColor.cgColor
+            focusBorder.show(around: frame, windowID: draggedID)
+        }
+        if committedAcross != nil {
+            NotificationCenter.default.post(name: .hyprMacWorkspaceChanged, object: nil)
         }
         refreshDimming(tiledRectsOverride: stateCache.tiledPositions)
         switch TiledDragFeedbackPolicy.feedback(for: completion.outcome) {
@@ -3357,6 +3451,8 @@ private extension WindowManager {
         case .rejectedRestored: return "rejectedRestored"
         case .degraded: return "degraded"
         case .superseded: return "superseded"
+        case let .acrossTrees(result, cross):
+            return "acrossTrees(\(outcomeName(result)) ws\(cross.target.workspace))"
         }
     }
 

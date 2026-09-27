@@ -48,7 +48,9 @@ it rather than re-deriving the math inline.
 Tiled insertion captures mouse-down and mouse-up event points before AX
 work or deferred scheduling. It does not sample the live cursor to choose
 the release target. Source matching requires exact screen containment and
-physical display identity; it does not use the nearest-screen fallback.
+physical display identity; it does not use the nearest-screen fallback. A
+release on another monitor matches that screen the same way, by exact
+containment in its full display frame.
 
 ## Multi-monitor
 
