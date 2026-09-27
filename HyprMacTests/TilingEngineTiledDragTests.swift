@@ -611,6 +611,37 @@ final class TilingEngineTiledDragTests: XCTestCase {
                        fixture.engine.intendedRect(for: 1, onWorkspace: 2, screen: fixture.wide))
     }
 
+    func testTitleBarDragTheAppShrinksCrossesMonitorsInsteadOfResizingTheSource() throws {
+        let fixture = makeCrossFixture()
+        let sourceRatio = try XCTUnwrap(fixture.engine.existingTree(forWorkspace: 1,
+                                                                   screen: fixture.tall)).root.splitRatio
+        let original = try XCTUnwrap(fixture.trace.frames[1])
+        let result = fixture.engine.captureTiledDrag(
+            pointer: CGPoint(x: original.midX, y: original.minY + 20), occludingWindows: [],
+            currentLocation: { (1, fixture.tall, []) })
+        guard case let .captured(snapshot) = result else { throw TestFailure.capture }
+        // the 14:50:09 shape: the pointer is over the wide screen's first
+        // tile, the window still mostly on the tall one, and the app took
+        // 178 points off its own height on the way
+        var released = original.offsetBy(dx: 250, dy: -130)
+        released.size.height -= 178
+        fixture.trace.frames[1] = released
+        let slot = try XCTUnwrap(fixture.trace.frames[10])
+
+        let outcome = dropCross(fixture, snapshot,
+                                at: CGPoint(x: slot.minX + 90, y: slot.midY), swap: false)
+
+        guard case .acrossTrees(.committed, _) = outcome else {
+            return XCTFail("a title-bar drag must stay a move, got \(outcome)")
+        }
+        XCTAssertEqual(fixture.engine.windowIDs(inTreeForWorkspace: 1, screen: fixture.tall), [2, 3])
+        XCTAssertEqual(fixture.engine.windowIDs(inTreeForWorkspace: 2, screen: fixture.wide),
+                       [1, 10, 11])
+        XCTAssertEqual(fixture.engine.existingTree(forWorkspace: 1, screen: fixture.tall)?
+            .root.userSetRatio, false)
+        XCTAssertEqual(sourceRatio, TilingConfig.defaultRatio)
+    }
+
     func testSameMonitorDropIgnoresTheReleaseLocation() throws {
         let fixture = makeCrossFixture()
         let targetTree = fixture.engine.existingTree(forWorkspace: 2, screen: fixture.wide)

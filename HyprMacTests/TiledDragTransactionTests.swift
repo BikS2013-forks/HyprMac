@@ -1226,6 +1226,96 @@ final class TiledDragTransactionTests: XCTestCase {
         XCTAssertEqual(TiledDragFailure.preflight(.noTarget).trace, "preflight(noTarget)")
     }
 
+    // MARK: - resize or move, by where the press landed
+
+    func testResizeBorderIsAnEightPointBandAcrossEveryEdge() {
+        let (tree, _, context) = fixture()
+        let frames = layoutFrames(tree, context)
+        let frame = frames[1]!
+        func pressed(_ point: CGPoint?) -> Bool? {
+            TiledDragSnapshot(draggedID: 1, sourceTree: tree, originalTree: tree, context: context,
+                              originalFrames: frames, generation: 1,
+                              pressPoint: point).pressedResizeBorder
+        }
+        XCTAssertEqual(pressed(CGPoint(x: frame.midX, y: frame.midY)), false)
+        XCTAssertEqual(pressed(CGPoint(x: frame.midX, y: frame.minY + 20)), false, "title bar")
+        XCTAssertEqual(pressed(CGPoint(x: frame.minX + 7, y: frame.midY)), true)
+        XCTAssertEqual(pressed(CGPoint(x: frame.maxX - 3, y: frame.midY)), true)
+        XCTAssertEqual(pressed(CGPoint(x: frame.midX, y: frame.minY - 5)), true, "just outside the top")
+        XCTAssertEqual(pressed(CGPoint(x: frame.midX, y: frame.maxY - 1)), true)
+        XCTAssertEqual(pressed(CGPoint(x: frame.maxX + 2, y: frame.maxY + 2)), true, "corner")
+        XCTAssertEqual(pressed(CGPoint(x: frame.minX + 9, y: frame.midY)), false)
+        XCTAssertEqual(pressed(CGPoint(x: frame.midX, y: frame.minY - 9)), false)
+        XCTAssertNil(pressed(nil), "a capture by id does not know")
+    }
+
+    func testTitleBarPressWithAnAppResizeOnAnotherMonitorIsACrossMonitorMove() {
+        let (tree, _, context) = fixture()
+        let frames = layoutFrames(tree, context)
+        let fake = FakeAX(frames: frames)
+        let transaction = TiledDragTransaction(ioFactory: fake.factory)
+        let titleBar = CGPoint(x: frames[1]!.midX, y: frames[1]!.minY + 20)
+        guard case let .captured(snapshot) = transaction.capture(
+            pointer: titleBar, tree: tree, context: context, occludingWindows: [],
+            generation: 1, currentContext: { context }) else { return XCTFail("capture failed") }
+        // dragged by the title bar onto the next display, where the app
+        // takes 279 points off its own height, as Messages did at 14:47:51
+        let released = CGRect(x: 1350, y: 30, width: frames[1]!.width,
+                              height: frames[1]!.height - 279)
+        fake.frames[1] = released
+        var moved: [CGRect] = []
+
+        let outcome = transaction.dropRelease(snapshot, mode: nil, currentContext: { context }) { frame in
+            moved.append(frame)
+            return .superseded
+        }
+
+        XCTAssertSuperseded(outcome)
+        XCTAssertEqual(moved, [released], "a title-bar drag is a move, whatever size the app reports")
+    }
+
+    func testTitleBarPressWithAnAppResizeOnTheSameScreenChangesNoRatio() {
+        let (tree, _, context) = fixture()
+        let frames = layoutFrames(tree, context)
+        let fake = FakeAX(frames: frames)
+        let transaction = TiledDragTransaction(ioFactory: fake.factory)
+        let titleBar = CGPoint(x: frames[1]!.midX, y: frames[1]!.minY + 20)
+        guard case let .captured(snapshot) = transaction.capture(
+            pointer: titleBar, tree: tree, context: context, occludingWindows: [],
+            generation: 1, currentContext: { context }) else { return XCTFail("capture failed") }
+        // the 14:50:09 shape: moved a little, centre still on the source,
+        // 178 points shorter by the app's own doing
+        var released = frames[1]!.offsetBy(dx: 60, dy: 40)
+        released.size.height -= 178
+        fake.frames[1] = released
+
+        guard case .rejectedRestored(reason: .preflight(.noTarget), _) = transaction.dropRelease(
+            snapshot, mode: nil, currentContext: { context }) else {
+            return XCTFail("a move with no target must restore, not resize")
+        }
+        XCTAssertEqual(fake.frames, frames)
+        XCTAssertEqual(tree.structuralFingerprint(), context.fingerprint)
+    }
+
+    func testEdgePressWithASizeChangeIsStillAResize() {
+        let (tree, _, context) = fixture()
+        let frames = layoutFrames(tree, context)
+        let fake = FakeAX(frames: frames)
+        let transaction = TiledDragTransaction(ioFactory: fake.factory)
+        let rightEdge = CGPoint(x: frames[1]!.maxX - 3, y: frames[1]!.midY)
+        guard case let .captured(snapshot) = transaction.capture(
+            pointer: rightEdge, tree: tree, context: context, occludingWindows: [],
+            generation: 1, currentContext: { context }) else { return XCTFail("capture failed") }
+        XCTAssertEqual(snapshot.pressedResizeBorder, true)
+        fake.frames[1]!.size.width += 60
+
+        guard case let .committed(candidate, _, _) = transaction.dropRelease(
+            snapshot, mode: nil, currentContext: { context }) else {
+            return XCTFail("an edge drag must still resize")
+        }
+        XCTAssertTrue(candidate.root.userSetRatio, "the manual resize moved the root split")
+    }
+
     /// The same three-window source as `fixture`, next to a two-window
     /// tree on a display to its right, workspace 2.
     private func crossFixture() -> (BSPTree, TiledDragContext, TiledDragCrossTarget,

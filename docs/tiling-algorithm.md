@@ -761,9 +761,17 @@ The mouse-up event supplies the release point. The mouse lifecycle latches the
 logical Hypr key when it is held at press, pressed during the drag, or still
 held at release. Option at release remains a compatibility shortcut. After
 the 100 ms settle delay, a bounded read of the captured dragged window
-separates manual resizing from movement. A width or height change greater than
-20 AX points produces a resize candidate. Position and size changes within
-one point are ignored, so text selection does not rearrange unmoved windows.
+separates manual resizing from movement. A drag is a resize candidate only
+when the press landed on the window's resize border and the width or height
+changed by more than 20 AX points. The border is a band 8 points either side
+of each edge of the captured frame, corners included
+(`TiledDragSnapshot.resizeBorderBand`). A press anywhere else, such as the
+title bar, is a move whatever size the app reports afterwards: Messages
+changes its own height by up to 279 points when it is dragged onto the
+ultrawide, and reading that as a resize rejected the drop, or grew its tile
+on the source. A capture by window id has no press point, so size alone
+decides there. Position and size changes within one point are ignored, so
+text selection does not rearrange unmoved windows.
 
 An ordinary move chooses a target from the release point within the source
 workspace and physical display. The nearest normalized target edge selects

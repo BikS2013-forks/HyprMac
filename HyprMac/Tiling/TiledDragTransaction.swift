@@ -51,6 +51,23 @@ struct TiledDragSnapshot {
     let context: TiledDragContext
     let originalFrames: [CGWindowID: CGRect]
     let generation: UInt64
+    /// where the press landed, global CG. nil for a capture by id
+    var pressPoint: CGPoint? = nil
+
+    /// How far inside or outside a frame's edge a press still grabs its
+    /// resize border. macOS's own resize zone is a few points either side of
+    /// the frame; a title bar starts below it.
+    static let resizeBorderBand: CGFloat = 8
+
+    /// Whether the press grabbed the dragged window's resize border: within
+    /// `resizeBorderBand` of any edge of its captured frame, corners
+    /// included. nil when the press point is not known.
+    var pressedResizeBorder: Bool? {
+        guard let pressPoint, let frame = originalFrames[draggedID] else { return nil }
+        let band = Self.resizeBorderBand
+        return frame.insetBy(dx: -band, dy: -band).contains(pressPoint)
+            && !frame.insetBy(dx: band, dy: band).contains(pressPoint)
+    }
 }
 
 enum TiledDragCaptureResult {
@@ -178,7 +195,8 @@ struct TiledDragTransaction {
             originalTree: tree.deepClone(),
             context: context,
             originalFrames: originals,
-            generation: generation
+            generation: generation,
+            pressPoint: pointer
         ))
     }
 
@@ -355,10 +373,16 @@ struct TiledDragTransaction {
         }
         guard isCurrent(snapshot, currentContext: currentContext) else { return .superseded }
         let original = snapshot.originalFrames[snapshot.draggedID]
-        let resized = original.map {
+        let sizeChanged = original.map {
             abs(frame.size.width - $0.size.width) > 20
                 || abs(frame.size.height - $0.size.height) > 20
         } ?? false
+        // only a press on the resize border resizes. an app may change its
+        // own size while its title bar is dragged (Messages does, onto the
+        // ultrawide), and that is still a move. a capture by id has no press
+        // point, so size alone decides there, as it always has
+        let pressedBorder = snapshot.pressedResizeBorder
+        let resized = sizeChanged && (pressedBorder ?? true)
         let centeredOnSource = snapshot.context.usableFrame.contains(CGPoint(x: frame.midX,
                                                                              y: frame.midY))
         let unchanged = !resized && original.map { original in
@@ -380,10 +404,12 @@ struct TiledDragTransaction {
         } else {
             decision = mode == nil ? "move — no target, restore" : "move — same-tree drop"
         }
+        let press = snapshot.pressPoint.map { "cg(\(Self.traced($0.x)),\(Self.traced($0.y)))" } ?? "none"
         hyprLog(.notice, .tiling, "tiled drag settle read: dragged=\(snapshot.draggedID) "
                 + "original=\(original.map(Self.traced) ?? "none") read=\(Self.traced(frame)) "
                 + "dw=\(original.map { Self.traced(frame.width - $0.width) } ?? "?") "
                 + "dh=\(original.map { Self.traced(frame.height - $0.height) } ?? "?") "
+                + "press=\(press) pressOnBorder=\(pressedBorder.map(String.init) ?? "unknown") "
                 + "resized=\(resized) centerOnSource=\(centeredOnSource) decision=\(decision)")
         if resized, mode == nil, !centeredOnSource {
             return restore(snapshot, reason: .preflight(.noTarget), attempt: attempt)
