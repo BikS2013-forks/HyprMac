@@ -84,6 +84,8 @@ extension Keybind {
             return "square.and.arrow.down"
         case .restoreLayout:
             return "square.and.arrow.up"
+        case .retileAll:
+            return "rectangle.3.group"
         }
     }
 
@@ -122,6 +124,7 @@ extension Keybind {
         case .runCommand(let label, let cmd): return Keybind.commandDescription(label: label, command: cmd)
         case .saveLayout:                   return "Save Layout"
         case .restoreLayout:                return "Restore Layout"
+        case .retileAll:                    return "Retile All Spaces"
         }
     }
 

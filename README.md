@@ -117,8 +117,20 @@ Everything below is configurable in Settings → Keys. The full reference lives 
 | `Hypr + K` | Show the keybind overlay |
 | `Hypr + O` | Show workspace overview |
 | `Hypr + Ctrl + S` / `Hypr + Ctrl + R` | Save / restore the layout for this display setup |
+| `Hypr + R` | Retile all spaces (also applies workspace pins) |
 | `Hypr + Return` | Launch or focus Terminal |
 | ``Hypr + ` `` | Warp the cursor to the menu bar |
+
+## Pinning apps to workspaces
+
+Settings → General → "Pin apps to workspaces" sends an app to a workspace of your choice. Every
+new window of a pinned app opens there, and HyprMac switches to that workspace with it. If the
+workspace is full, the window goes to the next one with room. **Hypr + R** (Retile all
+spaces) also moves a pinned app's open windows back to its workspace. An app in "Never tile"
+can be pinned too: it goes to its workspace and stays floating.
+
+Apps in "Never tile" can't be tiled by hand either. Hypr+T on one shakes red and says so; remove
+the app from the list to tile it again.
 
 ## Saved layouts
 

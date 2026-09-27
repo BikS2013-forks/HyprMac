@@ -468,7 +468,14 @@ workspace retain that destination's home assignment while parked. A visible
 destination is tiled on its home monitor in the discovery pass. Startup and
 Retile All first fill each monitor's visible workspace in stable screen,
 focus, and frame order. Only the excess probes later workspace numbers across
-monitor homes, wrapping after workspace 10. This count limit does not guarantee
+monitor homes, wrapping after workspace 10.
+
+A window rule changes only the starting workspace. A new window of a pinned
+app starts at its pinned workspace instead of the active one and spills the
+same way; if every workspace is full it stays on the active one, as it would
+unpinned. Startup and Retile All place pinned windows in their own batches
+ahead of the per-monitor ones, so a pin claims its workspace first. See
+"Window rules" in `docs/keybinds-and-actions.md`. This count limit does not guarantee
 that every application's dimensions will fit.
 Hidden assigned nonfloating windows reserve capacity in admission and startup
 packing. Discovery events wait until the initial snapshot completes.

@@ -57,6 +57,47 @@ enum RetileAllPlanner {
         return ordered
     }
 
+    /// Split a Retile All population into one batch per pinned workspace,
+    /// ascending, and the windows no rule pins.
+    ///
+    /// Callers put these batches ahead of the per-screen ones, so a pinned
+    /// window claims its workspace before screen placement fills it. `order`
+    /// sorts each batch the way the screen batches are sorted.
+    static func pinnedStartupBatches(
+        windowIDs: [CGWindowID],
+        pinnedWorkspaceFor: (CGWindowID) -> Int?,
+        order: ([CGWindowID]) -> [CGWindowID]
+    ) -> (batches: [RetileAllBatch], unpinned: [CGWindowID]) {
+        var pinned: [Int: [CGWindowID]] = [:]
+        var unpinned: [CGWindowID] = []
+        for windowID in windowIDs {
+            if let workspace = pinnedWorkspaceFor(windowID) {
+                pinned[workspace, default: []].append(windowID)
+            } else {
+                unpinned.append(windowID)
+            }
+        }
+        let batches = pinned.keys.sorted().map { workspace in
+            RetileAllBatch(preferredWorkspace: workspace, windowIDs: order(pinned[workspace] ?? []))
+        }
+        return (batches, unpinned)
+    }
+
+    /// Floaters Retile All moves to their pinned workspace: those on a
+    /// regular workspace other than their pin. The tiled pass never
+    /// reassigns a floater, so pinned ones are handled here.
+    static func pinnedFloaterMoves(
+        floatingWindowIDs: [CGWindowID],
+        workspaceFor: (CGWindowID) -> Int?,
+        pinnedWorkspaceFor: (CGWindowID) -> Int?
+    ) -> [(windowID: CGWindowID, from: Int, to: Int)] {
+        floatingWindowIDs.sorted().compactMap { windowID in
+            guard let current = workspaceFor(windowID), Constants.workspaceRange.contains(current),
+                  let pinned = pinnedWorkspaceFor(windowID), pinned != current else { return nil }
+            return (windowID, current, pinned)
+        }
+    }
+
     /// Fill every batch's visible home first, then route only its excess
     /// through the global cyclic workspace order.
     static func admitStartupBatches(

@@ -195,6 +195,35 @@ final class KeybindDecoderToleranceTests: XCTestCase {
         XCTAssertEqual(saved.restoreLayoutOnLaunch, true)
     }
 
+    func testRetileAllWireFormatDecodes() throws {
+        let json = #"{"action":{"retileAll":{}},"keyCode":15,"modifiers":1}"#
+        XCTAssertEqual(try JSONDecoder().decode(Keybind.self, from: Data(json.utf8)).action, .retileAll)
+    }
+
+    func testRetileAllRoundTripsThroughSavedConfig() throws {
+        let bind = Keybind(keyCode: 15, modifiers: .hypr, action: .retileAll)
+        let encoded = String(data: try JSONEncoder().encode(bind), encoding: .utf8)!
+        XCTAssertTrue(encoded.contains(#""retileAll":{}"#), encoded)
+        let json = """
+        {"keybinds":[\(encoded)],"gapSize":8,"outerPadding":8,"enabled":true}
+        """
+        let saved = try JSONDecoder().decode(SavedConfig.self, from: Data(json.utf8))
+        let reloaded = try JSONDecoder().decode(SavedConfig.self, from: try JSONEncoder().encode(saved))
+        XCTAssertEqual(reloaded.keybinds.map(\.action), [.retileAll])
+    }
+
+    // an older build meets retileAll as an unknown key and drops only that bind
+    func testUnknownActionBesideRetileAllKeepsTheRest() throws {
+        let json = """
+        {"keybinds":[
+            {"action":{"futureRetileThing":{}},"keyCode":1,"modifiers":1},
+            {"action":{"retileAll":{}},"keyCode":15,"modifiers":1}
+        ],"gapSize":8,"outerPadding":8,"enabled":true}
+        """
+        let saved = try JSONDecoder().decode(SavedConfig.self, from: Data(json.utf8))
+        XCTAssertEqual(saved.keybinds.map(\.action), [.retileAll])
+    }
+
     func testMoveToWorkspaceAndFollowWireFormatDecodes() throws {
         let json = #"{"action":{"moveToWorkspaceAndFollow":{"_0":10}},"keyCode":29,"modifiers":11}"#
         let kb = try JSONDecoder().decode(Keybind.self, from: Data(json.utf8))

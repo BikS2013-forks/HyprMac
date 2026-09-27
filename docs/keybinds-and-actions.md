@@ -32,6 +32,7 @@ enum Action: Equatable {
     case runCommand(label: String, command: String)
     case saveLayout
     case restoreLayout
+    case retileAll
 }
 ```
 
@@ -142,6 +143,61 @@ Downgrade risk: a build older than per-keybind tolerance that shares
 "Per-element tolerance" below. That is not fixable from this side.
 Keep every machine sharing a config on a tolerant build.
 
+## Retile all spaces
+
+`retileAll` defaults to Hypr+R and encodes as `{"retileAll":{}}`.
+It runs the same pass as the menu bar's "Retile all spaces": it hides the
+scratchpad, redistributes every window, and applies window rules (below).
+It ignores key autorepeat, is unavailable while tiling is paused, and is
+dropped while a display transition is settling. `mergeNewDefaults` injects
+it only onto a free chord. No `ConfigMigration` step is involved.
+
+```json
+{"retileAll":{}}
+{"action":{"retileAll":{}},"keyCode":15,"modifiers":1}
+```
+
+## Window rules
+
+`windowRules` in `config.json` pins an app to a workspace. Settings →
+General → "Pin apps to workspaces" edits it, one rule per app:
+
+```
+"windowRules": [
+  { "bundleID": "com.apple.Terminal", "workspace": 2 }
+]
+```
+
+- **New windows.** `ActionDispatcher.assignNewWindows` uses the pin as the
+  preferred workspace instead of the one visible where the window opened.
+  A full pinned workspace spills onward, like any admission. If the pin
+  sent the window somewhere else, HyprMac switches to that workspace and
+  focuses the window afterwards, the Hyprland default. With several such
+  windows in one pass it follows the focused one.
+- **Never tile apps.** They stay floating and still go to their pin.
+  `WorkspaceOrchestrator.placePinnedFloater` carries the floater to the
+  workspace's display, and parks it with that frame saved when the
+  workspace is hidden.
+- **Retile All.** `WindowManager.startupPlacement` gives pinned windows
+  their own batches ahead of the screen batches, so they claim their
+  workspace first. Pinned floaters move too. Hidden windows and scratchpad
+  members keep their workspace. Startup and a Maximum splits change run
+  the same pass.
+- **Skipped:** Quick Look previews (they belong to whichever app opened
+  them), windows on a disabled monitor, a rule naming a workspace outside
+  1–10, and windows that come back from hidden. A new pinned window that
+  finds every workspace full stays on the one where it opened.
+
+Between those moments a pin is not a tether: a window moved elsewhere
+stays there until the next Retile All. The array decodes per element,
+like `keybinds`: a malformed rule is logged and dropped, and an
+unreadable `windowRules` value costs only the rules.
+
+Downgrade: an older build sharing `config.json` over iCloud ignores
+`windowRules` and writes the file without it on its next save, so the
+pins are lost on every machine. Keep machines that share a config on a
+build with window rules. No `ConfigMigration` step is involved.
+
 ## JSON wire format
 
 The `Codable` implementation in `Models/Action.swift` preserves the
@@ -190,7 +246,7 @@ This pattern generalizes — any future case rename should add an
 alias entry rather than break the wire format.
 
 A case added later is frozen at the key it first shipped with, such as
-`moveToNextEmptyWorkspace` or `moveToWorkspaceAndFollow`.
+`moveToNextEmptyWorkspace`, `moveToWorkspaceAndFollow` or `retileAll`.
 
 ## `AnyKey`
 
@@ -463,7 +519,8 @@ every JSON example in this file.
 
 **Other config fields**: `gapSize`, `outerPadding`, `enabled`,
 `focusFollowsMouse`, `excludedBundleIDs` (bundle IDs that never
-tile — auto-float on discovery), `disabledMonitors` (monitor names
+tile — auto-float on discovery, and Hypr+T refuses to tile them),
+`windowRules` (per-app workspace pins, see "Window rules"), `disabledMonitors` (monitor names
 matching `NSScreen.localizedName`, excluded from tiling entirely),
 `scratchpadTileByDefault` (windows sent to the scratchpad tile into
 the layer instead of floating; no-fit windows float regardless),

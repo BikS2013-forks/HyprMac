@@ -64,6 +64,10 @@ enum Action: Equatable {
     case saveLayout
     /// Restore the saved layout for the active display configuration.
     case restoreLayout
+    /// Redistribute every window across its workspaces and retile, the
+    /// menu bar's "Retile all spaces". Also moves pinned apps' windows
+    /// back onto their pinned workspaces.
+    case retileAll
 }
 
 // MARK: - Codable
@@ -108,6 +112,7 @@ extension Action: Codable {
         case runCommand
         case saveLayout
         case restoreLayout
+        case retileAll
     }
 
     /// Accepted-but-not-emitted aliases. Lets a hand-edited config
@@ -183,6 +188,7 @@ extension Action: Codable {
             self = .resizeDirection(try Self.decodeDirection(inner, field: "resizeDirection"))
         case .saveLayout:    self = .saveLayout
         case .restoreLayout: self = .restoreLayout
+        case .retileAll:     self = .retileAll
         }
     }
 
@@ -258,6 +264,8 @@ extension Action: Codable {
             _ = c.nestedContainer(keyedBy: PayloadKey.self, forKey: .saveLayout)
         case .restoreLayout:
             _ = c.nestedContainer(keyedBy: PayloadKey.self, forKey: .restoreLayout)
+        case .retileAll:
+            _ = c.nestedContainer(keyedBy: PayloadKey.self, forKey: .retileAll)
         }
     }
 }

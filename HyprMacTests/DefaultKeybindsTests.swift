@@ -382,6 +382,25 @@ final class DefaultKeybindsTests: XCTestCase {
         XCTAssertEqual(restore.modifiers, [.hypr, .control])
     }
 
+    func testRetileAllDefaultsToHyprR() throws {
+        let bind = try XCTUnwrap(Keybind.defaults.first { $0.action == .retileAll })
+        XCTAssertEqual(bind.keyCode, UInt16(kVK_ANSI_R))
+        XCTAssertEqual(bind.modifiers, .hypr)
+    }
+
+    // a user who already bound Hypr+R keeps it; retile stays in the menu
+    func testDefaultMergeDoesNotShadowOccupiedHyprR() {
+        let custom = Keybind(keyCode: UInt16(kVK_ANSI_R), modifiers: .hypr,
+                             action: .launchApp(bundleID: "com.apple.reminders"))
+
+        let merged = UserConfig.mergeNewDefaults(saved: [custom])
+
+        XCTAssertEqual(merged.filter {
+            $0.keyCode == UInt16(kVK_ANSI_R) && $0.modifiers == .hypr
+        }, [custom])
+        XCTAssertFalse(merged.contains { $0.action == .retileAll })
+    }
+
     // a user who already put something on Hypr+Ctrl+S keeps it; restore
     // still arrives on its own free chord
     func testDefaultMergeDoesNotShadowOccupiedHyprControlS() {

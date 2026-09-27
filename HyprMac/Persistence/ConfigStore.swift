@@ -242,6 +242,7 @@ struct SavedConfig: Codable {
     // `var` with a default so the synthesized memberwise init takes it as a
     // trailing optional — existing `SavedConfig(...)` call sites keep compiling.
     var restoreLayoutOnLaunch: Bool? = nil
+    var windowRules: [WindowRule]? = nil
 }
 
 // MARK: - per-keybind decode tolerance
@@ -269,6 +270,7 @@ extension SavedConfig {
         case chromeFadeDurationSec, windowCornerRadius
         case scratchpadTileByDefault, scratchpadRegionInset
         case restoreLayoutOnLaunch
+        case windowRules
     }
 
     init(from decoder: Decoder) throws {
@@ -336,6 +338,24 @@ extension SavedConfig {
         self.scratchpadTileByDefault = Self.tolerant(c, .scratchpadTileByDefault)
         self.scratchpadRegionInset = Self.tolerant(c, .scratchpadRegionInset)
         self.restoreLayoutOnLaunch = Self.tolerant(c, .restoreLayoutOnLaunch)
+        self.windowRules = Self.tolerantWindowRules(c)
+    }
+
+    // same per-element tolerance as keybinds: the rules are hand-editable
+    // and travel between builds over iCloud, so a bad rule costs only itself
+    private static func tolerantWindowRules(_ c: KeyedDecodingContainer<CodingKeys>) -> [WindowRule]? {
+        guard c.contains(.windowRules), (try? c.decodeNil(forKey: .windowRules)) == false else { return nil }
+        guard var arr = try? c.nestedUnkeyedContainer(forKey: .windowRules) else {
+            hyprLog(.notice, .config, "config.json has a windowRules value this build can't read; using no rules")
+            return nil
+        }
+        var kept: [WindowRule] = []
+        while !arr.isAtEnd {
+            if (try? arr.decodeNil()) == true { continue }
+            guard let element = try? arr.decode(FailableWindowRule.self) else { break }
+            if let rule = element.rule { kept.append(rule) }
+        }
+        return kept
     }
 
     // one optional field. a value this build can't read (a case a newer
@@ -367,6 +387,20 @@ private struct FailableKeybind: Decodable {
             keybind = nil
             // the action key is hand-editable text, so it stays out of the log
             hyprLog(.warning, .config, "skipping keybind with an unknown or malformed action")
+        }
+    }
+}
+
+// one window rule, or nil when it doesn't decode. same trick as FailableKeybind.
+private struct FailableWindowRule: Decodable {
+    let rule: WindowRule?
+
+    init(from decoder: Decoder) throws {
+        do {
+            rule = try WindowRule(from: decoder)
+        } catch {
+            rule = nil
+            hyprLog(.warning, .config, "skipping malformed window rule")
         }
     }
 }
