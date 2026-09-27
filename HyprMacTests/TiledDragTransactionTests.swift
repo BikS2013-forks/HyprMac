@@ -1253,25 +1253,105 @@ final class TiledDragTransactionTests: XCTestCase {
 
     // MARK: - resize or move, by where the press landed
 
-    func testResizeBorderIsAnEightPointBandAcrossEveryEdge() {
+    func testResizeBorderIsAnInnerBandNarrowAtTheTop() {
         let (tree, _, context) = fixture()
         let frames = layoutFrames(tree, context)
         let frame = frames[1]!
-        func pressed(_ point: CGPoint?) -> Bool? {
-            TiledDragSnapshot(draggedID: 1, sourceTree: tree, originalTree: tree, context: context,
-                              originalFrames: frames, generation: 1,
-                              pressPoint: point).pressedResizeBorder
+        func edges(_ point: CGPoint?) -> Set<BSPTargetEdge>? {
+            snapshot(tree, context, frames, press: point).pressedEdges
         }
-        XCTAssertEqual(pressed(CGPoint(x: frame.midX, y: frame.midY)), false)
-        XCTAssertEqual(pressed(CGPoint(x: frame.midX, y: frame.minY + 20)), false, "title bar")
-        XCTAssertEqual(pressed(CGPoint(x: frame.minX + 7, y: frame.midY)), true)
-        XCTAssertEqual(pressed(CGPoint(x: frame.maxX - 3, y: frame.midY)), true)
-        XCTAssertEqual(pressed(CGPoint(x: frame.midX, y: frame.minY - 5)), true, "just outside the top")
-        XCTAssertEqual(pressed(CGPoint(x: frame.midX, y: frame.maxY - 1)), true)
-        XCTAssertEqual(pressed(CGPoint(x: frame.maxX + 2, y: frame.maxY + 2)), true, "corner")
-        XCTAssertEqual(pressed(CGPoint(x: frame.minX + 9, y: frame.midY)), false)
-        XCTAssertEqual(pressed(CGPoint(x: frame.midX, y: frame.minY - 9)), false)
-        XCTAssertNil(pressed(nil), "a capture by id does not know")
+        XCTAssertEqual(edges(CGPoint(x: frame.midX, y: frame.midY)), [])
+        XCTAssertEqual(edges(CGPoint(x: frame.midX, y: frame.minY + 20)), [], "title bar")
+        XCTAssertEqual(edges(CGPoint(x: frame.midX, y: frame.minY + 5)), [], "the title bar's top strip")
+        XCTAssertEqual(edges(CGPoint(x: frame.midX, y: frame.minY + 2)), [.top])
+        XCTAssertEqual(edges(CGPoint(x: frame.minX + 7, y: frame.midY)), [.left])
+        XCTAssertEqual(edges(CGPoint(x: frame.minX + 9, y: frame.midY)), [])
+        XCTAssertEqual(edges(CGPoint(x: frame.maxX - 3, y: frame.midY)), [.right])
+        XCTAssertEqual(edges(CGPoint(x: frame.midX, y: frame.maxY - 1)), [.bottom])
+        XCTAssertEqual(edges(CGPoint(x: frame.maxX - 2, y: frame.maxY - 2)), [.right, .bottom])
+        XCTAssertEqual(edges(CGPoint(x: frame.midX, y: frame.minY - 3)), [], "outside is not a capture")
+        XCTAssertNil(edges(nil), "a capture by id does not know")
+    }
+
+    func testGestureNeedsTheOppositeEdgeHeldToCallItAResize() {
+        let (tree, _, context) = fixture()
+        let frames = layoutFrames(tree, context)
+        let frame = frames[1]!
+        func gesture(press: CGPoint, _ change: (inout CGRect) -> Void) -> TiledDragGesture {
+            var now = frame
+            change(&now)
+            return snapshot(tree, context, frames, press: press).gesture(to: now)
+        }
+        let topStrip = CGPoint(x: frame.midX, y: frame.minY + 2)
+        // real resizes: the edge opposite the grabbed one stays put
+        XCTAssertEqual(gesture(press: CGPoint(x: frame.minX + 3, y: frame.midY)) {
+            $0.origin.x -= 60; $0.size.width += 60
+        }, .resize, "left edge")
+        XCTAssertEqual(gesture(press: topStrip) {
+            $0.origin.y -= 50; $0.size.height += 50
+        }, .resize, "top edge")
+        XCTAssertEqual(gesture(press: CGPoint(x: frame.maxX - 2, y: frame.maxY - 2)) {
+            $0.size.width += 40; $0.size.height -= 90
+        }, .resize, "bottom-right corner")
+        // moves: an app that changes its own size on the way holds no edge
+        XCTAssertEqual(gesture(press: topStrip) {
+            $0.origin = CGPoint(x: 1350, y: 30); $0.size.height -= 279
+        }, .move, "top strip, dragged across and shrunk by the app")
+        XCTAssertEqual(gesture(press: topStrip) { $0.origin.y += 300 }, .move,
+                       "top strip, no size change")
+        XCTAssertEqual(gesture(press: CGPoint(x: frame.maxX - 3, y: frame.midY)) {
+            $0.origin.x += 400; $0.size.width -= 120
+        }, .move, "right edge, but the whole window moved")
+        XCTAssertEqual(gesture(press: CGPoint(x: frame.maxX - 3, y: frame.midY)) {
+            $0.size.width += 60; $0.origin.y += 200
+        }, .move, "right edge held, but the window moved down")
+        XCTAssertEqual(gesture(press: topStrip) { _ in }, .unmoved)
+        // no press point: size alone, as before
+        var byID = frame
+        byID.origin.x += 900
+        byID.size.width += 30
+        XCTAssertEqual(snapshot(tree, context, frames, press: nil).gesture(to: byID), .resize)
+    }
+
+    func testTopStripPressDraggedAcrossIsAMoveWithAPreview() {
+        let (tree, context, target, frames) = crossFixture()
+        let fake = FakeAX(frames: frames)
+        let transaction = TiledDragTransaction(ioFactory: fake.factory)
+        let topStrip = CGPoint(x: frames[1]!.midX, y: frames[1]!.minY + 2)
+        guard case let .captured(snapshot) = transaction.capture(
+            pointer: topStrip, tree: tree, context: context, occludingWindows: [],
+            generation: 1, currentContext: { context }) else { return XCTFail("capture failed") }
+        XCTAssertEqual(snapshot.pressedEdges, [.top])
+        let slot = frames[11]!
+        let point = CGPoint(x: slot.midX, y: slot.maxY - 2)
+        let plan = TiledDropPlanner.plan(pointer: point, draggedID: 1,
+                                         sourceTiles: context.usableFrame,
+                                         sourceSlots: snapshot.originalFrames,
+                                         release: .otherMonitor(slots: TiledDropPlanner.slots(
+                                            of: target.tree, in: target.context.usableFrame,
+                                            gap: 8, padding: 8)))
+        var moved: [CGRect] = []
+        for shrink: CGFloat in [0, 279] {
+            // mid-drag the preview sees a move, and so does the drop
+            let released = CGRect(x: 1300, y: 100, width: frames[1]!.width,
+                                  height: frames[1]!.height - shrink)
+            XCTAssertEqual(snapshot.gesture(to: released), .move, "shrink \(shrink)")
+            XCTAssertNotNil(transaction.previewFrame(snapshot, plan: plan, swap: false,
+                                                     target: target), "shrink \(shrink)")
+            fake.frames[1] = released
+            XCTAssertSuperseded(transaction.dropRelease(snapshot, mode: nil,
+                                                        currentContext: { context }) { frame in
+                moved.append(frame)
+                return .superseded
+            })
+        }
+        XCTAssertEqual(moved.count, 2, "both drops go across as moves")
+    }
+
+    private func snapshot(_ tree: BSPTree, _ context: TiledDragContext,
+                          _ frames: [CGWindowID: CGRect], press: CGPoint?) -> TiledDragSnapshot {
+        TiledDragSnapshot(draggedID: 1, sourceTree: tree, originalTree: tree, context: context,
+                          originalFrames: frames, generation: 1, pressPoint: press)
     }
 
     func testTitleBarPressWithAnAppResizeOnAnotherMonitorIsACrossMonitorMove() {
@@ -1331,7 +1411,7 @@ final class TiledDragTransactionTests: XCTestCase {
         guard case let .captured(snapshot) = transaction.capture(
             pointer: rightEdge, tree: tree, context: context, occludingWindows: [],
             generation: 1, currentContext: { context }) else { return XCTFail("capture failed") }
-        XCTAssertEqual(snapshot.pressedResizeBorder, true)
+        XCTAssertEqual(snapshot.pressedEdges, [.right])
         fake.frames[1]!.size.width += 60
 
         guard case let .committed(candidate, _, _) = transaction.dropRelease(

@@ -761,17 +761,26 @@ The mouse-up event supplies the release point. The mouse lifecycle latches the
 logical Hypr key when it is held at press, pressed during the drag, or still
 held at release. Option at release remains a compatibility shortcut. After
 the 100 ms settle delay, a bounded read of the captured dragged window
-separates manual resizing from movement. A drag is a resize candidate only
-when the press landed on the window's resize border and the width or height
-changed by more than 20 AX points. The border is a band 8 points either side
-of each edge of the captured frame, corners included
-(`TiledDragSnapshot.resizeBorderBand`). A press anywhere else, such as the
-title bar, is a move whatever size the app reports afterwards: Messages
-changes its own height by up to 279 points when it is dragged onto the
-ultrawide, and reading that as a resize rejected the drop, or grew its tile
-on the source. A capture by window id has no press point, so size alone
-decides there. Position and size changes within one point are ignored, so
-text selection does not rearrange unmoved windows.
+separates manual resizing from movement (`TiledDragSnapshot.gesture`). A drag
+is a resize candidate only when all three of these hold:
+
+- The press landed on the window's resize border. The border is a band just
+  inside the captured frame: 8 points at the left, right and bottom edges and
+  4 at the top, corners giving two edges. The top band is narrow because the
+  title bar starts right below it. There is no outer band: a press outside
+  the frame is not a tile press at all.
+- The width or height changed by more than 20 AX points.
+- On every resized axis, the edge opposite a grabbed one stayed within 2
+  points. On an axis it did not resize, the origin stayed within 2 points.
+
+A real edge or corner drag keeps the far edge still. A move keeps no edge
+still, even when the app changes its own size on the way. Messages changes
+its height by up to 279 points when it is dragged onto the ultrawide. Reading
+that as a resize rejected the drop, or grew its tile on the source, and a
+press in the top of the title bar would still have done it under a band
+alone. A capture by window id has no press point, so size alone decides
+there. Position and size changes within one point are ignored, so text
+selection does not rearrange unmoved windows.
 
 An ordinary move chooses a target from the release point within the source
 workspace and physical display. The nearest normalized target edge selects
@@ -876,12 +885,14 @@ border is on, else brand cyan (`UserConfig.resolvedDropPreviewColor`). It has a
 thin border and the window corner radius. It appears only after all of these
 hold:
 
-- the press was captured as a tiled press, not on the resize border
+- the press was captured as a tiled press
 - the pointer has passed the drag threshold
-- the window server reports the dragged window has moved from where the press
-  found it. A press that selects text never moves the window, so it gets no
-  preview. This is a window-list read (`CGWindowListCreateDescriptionFromArray`),
-  not AX, and it stops once the window has moved.
+- the drag is a move by the drop's own rule (`TiledDragSnapshot.gesture`),
+  applied to the dragged window's frame from the window list
+  (`CGWindowListCreateDescriptionFromArray`, not AX) at every update. A press
+  that selects text leaves the window unmoved, and an edge drag becomes a
+  resize, so neither shows a preview. The drop reaches the same verdict from
+  its settle read.
 
 What it shows:
 

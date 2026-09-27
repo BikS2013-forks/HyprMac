@@ -54,20 +54,78 @@ struct TiledDragSnapshot {
     /// where the press landed, global CG. nil for a capture by id
     var pressPoint: CGPoint? = nil
 
-    /// How far inside or outside a frame's edge a press still grabs its
-    /// resize border. macOS's own resize zone is a few points either side of
-    /// the frame; a title bar starts below it.
+    /// How far inside a frame's left, right or bottom edge a press grabs its
+    /// resize border. Inside only: a press has to land on a tile to be
+    /// captured at all.
     static let resizeBorderBand: CGFloat = 8
+    /// The top edge's band, narrower because the title bar starts right
+    /// below it.
+    static let resizeTopBorderBand: CGFloat = 4
+    /// How far the edge opposite a grabbed one may drift and still count as
+    /// held.
+    static let heldEdgeTolerance: CGFloat = 2
 
-    /// Whether the press grabbed the dragged window's resize border: within
-    /// `resizeBorderBand` of any edge of its captured frame, corners
-    /// included. nil when the press point is not known.
-    var pressedResizeBorder: Bool? {
-        guard let pressPoint, let frame = originalFrames[draggedID] else { return nil }
-        let band = Self.resizeBorderBand
-        return frame.insetBy(dx: -band, dy: -band).contains(pressPoint)
-            && !frame.insetBy(dx: band, dy: band).contains(pressPoint)
+    /// The edges whose band holds the press, corners giving two. nil when
+    /// the press point is not known.
+    var pressedEdges: Set<BSPTargetEdge>? {
+        guard let pressPoint else { return nil }
+        guard let frame = originalFrames[draggedID],
+              pressPoint.x >= frame.minX, pressPoint.x <= frame.maxX,
+              pressPoint.y >= frame.minY, pressPoint.y <= frame.maxY else { return [] }
+        var edges = Set<BSPTargetEdge>()
+        if pressPoint.x - frame.minX < Self.resizeBorderBand { edges.insert(.left) }
+        if frame.maxX - pressPoint.x < Self.resizeBorderBand { edges.insert(.right) }
+        if pressPoint.y - frame.minY < Self.resizeTopBorderBand { edges.insert(.top) }
+        if frame.maxY - pressPoint.y < Self.resizeBorderBand { edges.insert(.bottom) }
+        return edges
     }
+
+    /// What the drag has done to the window, judged from `frame` against its
+    /// captured frame. The drop asks with the read 100 ms after release, the
+    /// live preview with the window list as the drag goes, so the two cannot
+    /// disagree.
+    ///
+    /// A resize grabs an edge in its band, changes the size by more than 20
+    /// points, keeps the opposite edge still on every resized axis and the
+    /// origin still on an axis it did not resize. A move keeps no edge still,
+    /// even when the app changes its own size on the way, the way Messages
+    /// does onto the ultrawide. A capture by id has no press point, so size
+    /// alone decides there.
+    func gesture(to frame: CGRect) -> TiledDragGesture {
+        guard let original = originalFrames[draggedID] else { return .move }
+        let tolerance = FrameSizingConfiguration()
+        if abs(frame.minX - original.minX) <= tolerance.positionTolerance,
+           abs(frame.minY - original.minY) <= tolerance.positionTolerance,
+           abs(frame.width - original.width) <= tolerance.sizeTolerance,
+           abs(frame.height - original.height) <= tolerance.sizeTolerance {
+            return .unmoved
+        }
+        let widthChanged = abs(frame.width - original.width) > 20
+        let heightChanged = abs(frame.height - original.height) > 20
+        guard widthChanged || heightChanged else { return .move }
+        guard let edges = pressedEdges else { return .resize }
+        func held(_ now: CGFloat, _ then: CGFloat) -> Bool {
+            abs(now - then) <= Self.heldEdgeTolerance
+        }
+        let horizontal = widthChanged
+            ? (edges.contains(.left) && held(frame.maxX, original.maxX))
+                || (edges.contains(.right) && held(frame.minX, original.minX))
+            : held(frame.minX, original.minX)
+        let vertical = heightChanged
+            ? (edges.contains(.top) && held(frame.maxY, original.maxY))
+                || (edges.contains(.bottom) && held(frame.minY, original.minY))
+            : held(frame.minY, original.minY)
+        return horizontal && vertical ? .resize : .move
+    }
+}
+
+/// What a tiled drag did to the dragged window.
+enum TiledDragGesture: String, Equatable {
+    /// nothing a point or more: a press that selected text, say
+    case unmoved
+    case move
+    /// a manual resize from an edge or corner
+    case resize
 }
 
 enum TiledDragCaptureResult {
@@ -331,25 +389,12 @@ struct TiledDragTransaction {
         }
         guard isCurrent(snapshot, currentContext: currentContext) else { return .superseded }
         let original = snapshot.originalFrames[snapshot.draggedID]
-        let sizeChanged = original.map {
-            abs(frame.size.width - $0.size.width) > 20
-                || abs(frame.size.height - $0.size.height) > 20
-        } ?? false
-        // only a press on the resize border resizes. an app may change its
-        // own size while its title bar is dragged (Messages does, onto the
-        // ultrawide), and that is still a move. a capture by id has no press
-        // point, so size alone decides there, as it always has
-        let pressedBorder = snapshot.pressedResizeBorder
-        let resized = sizeChanged && (pressedBorder ?? true)
+        // the same rule the live preview applies as the drag goes
+        let gesture = snapshot.gesture(to: frame)
+        let resized = gesture == .resize
+        let unchanged = gesture == .unmoved
         let centeredOnSource = snapshot.context.usableFrame.contains(CGPoint(x: frame.midX,
                                                                              y: frame.midY))
-        let unchanged = !resized && original.map { original in
-            let tolerance = FrameSizingConfiguration()
-            return abs(frame.minX - original.minX) <= tolerance.positionTolerance
-                && abs(frame.minY - original.minY) <= tolerance.positionTolerance
-                && abs(frame.size.width - original.size.width) <= tolerance.sizeTolerance
-                && abs(frame.size.height - original.size.height) <= tolerance.sizeTolerance
-        } ?? false
         let decision: String
         if resized, mode == nil, !centeredOnSource {
             decision = "resize off the source tiles — restore"
@@ -363,12 +408,15 @@ struct TiledDragTransaction {
             decision = mode == nil ? "move — no target, restore" : "move — same-tree drop"
         }
         let press = snapshot.pressPoint.map { "cg(\(Self.traced($0.x)),\(Self.traced($0.y)))" } ?? "none"
+        let edges = snapshot.pressedEdges.map { edges in
+            "[" + BSPTargetEdge.allCases.filter(edges.contains).map { "\($0)" }.joined(separator: ",") + "]"
+        } ?? "unknown"
         hyprLog(.notice, .tiling, "tiled drag settle read: dragged=\(snapshot.draggedID) "
                 + "original=\(original.map(Self.traced) ?? "none") read=\(Self.traced(frame)) "
                 + "dw=\(original.map { Self.traced(frame.width - $0.width) } ?? "?") "
                 + "dh=\(original.map { Self.traced(frame.height - $0.height) } ?? "?") "
-                + "press=\(press) pressOnBorder=\(pressedBorder.map(String.init) ?? "unknown") "
-                + "resized=\(resized) centerOnSource=\(centeredOnSource) decision=\(decision)")
+                + "press=\(press) pressEdges=\(edges) gesture=\(gesture.rawValue) "
+                + "centerOnSource=\(centeredOnSource) decision=\(decision)")
         if resized, mode == nil, !centeredOnSource {
             return restore(snapshot, reason: .preflight(.noTarget), attempt: attempt)
         }

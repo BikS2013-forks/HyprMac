@@ -87,9 +87,6 @@ class WindowManager {
     // per drag: each other display's tree as a drop there would find it,
     // looked up once, the first time the pointer reaches that display
     private var dropPreviewTargets: [CGDirectDisplayID: TiledDragCrossTarget?] = [:]
-    // per drag: the window server has shown the dragged window moving. a
-    // press that selects text never moves it, and gets no preview
-    private var dropPreviewSawMove = false
     private var dragOptionDown = false
     private var dragFlagsMonitor: Any?
 
@@ -3278,19 +3275,17 @@ private extension WindowManager {
     }
 
     /// Start or move the live drop preview. Only a press the tiled capture
-    /// took gets one, once it is past the drag threshold, and never a press
-    /// on the window's resize border: that drag is a resize.
+    /// took gets one, once it is past the drag threshold. Whether it shows
+    /// is the drop's own call: see `tiledDropPreviewFrame`.
     private func updateTiledDropPreview(_ event: NSEvent) {
         let point = TiledDragEvent.point(event: event, primaryHeight: displayManager.primaryScreenHeight)
         dragOptionDown = event.modifierFlags.contains(.option)
         if !dropPreview.isActive {
             guard isRunning, config.enabled, let snapshot = tiledDragHandler.pressSnapshot,
-                  snapshot.pressedResizeBorder == false,
                   TiledDragEvent.isDrag(from: mouseDownPointCG, to: point, sawDragEvent: true) else {
                 return
             }
             dropPreviewTargets = [:]
-            dropPreviewSawMove = false
             dropPreviewPanel.primaryScreenHeight = displayManager.primaryScreenHeight
             dropPreviewPanel.accentColor = config.resolvedDropPreviewColor
             dropPreviewPanel.cornerRadius = config.windowCornerRadius
@@ -3305,8 +3300,10 @@ private extension WindowManager {
     /// the drop would restore. The drop's own planner and candidates, fed
     /// the press capture and the trees; no AX.
     private func tiledDropPreviewFrame(at point: CGPoint, snapshot: TiledDragSnapshot) -> CGRect? {
+        // a drop only acts on a move: an unmoved window is ignored and a
+        // resize resizes. judged by the drop's own rule, on the window list
         guard isRunning, tiledDragHandler.pressSnapshot?.generation == snapshot.generation,
-              tiledDragWindowMoved(snapshot) else { return nil }
+              tiledDragGesture(snapshot) == .move else { return nil }
         let swap = mouseDragLifecycle.releaseRequestsSwap(hyprHeld: hyprHeld, optionDown: dragOptionDown)
         var release = TiledDropRelease.source
         var target: TiledDragCrossTarget?
@@ -3345,19 +3342,16 @@ private extension WindowManager {
                                gap: target.context.gap, padding: target.context.padding)
     }
 
-    /// Whether the window server shows the dragged window away from where
-    /// the press found it. A press that selects text never moves it. Read
-    /// from the window list, not AX, and only until it has moved once.
-    private func tiledDragWindowMoved(_ snapshot: TiledDragSnapshot) -> Bool {
-        if dropPreviewSawMove { return true }
-        guard let original = snapshot.originalFrames[snapshot.draggedID] else { return false }
+    /// What the drag is doing to the dragged window right now, by the drop's
+    /// own rule, from the window list rather than AX. A press that selects
+    /// text is `.unmoved`, an edge drag `.resize`.
+    private func tiledDragGesture(_ snapshot: TiledDragSnapshot) -> TiledDragGesture? {
         var id = UnsafeRawPointer(bitPattern: UInt(snapshot.draggedID))
         guard let ids = CFArrayCreate(kCFAllocatorDefault, &id, 1, nil),
               let list = CGWindowListCreateDescriptionFromArray(ids) as? [[String: Any]],
               let raw = list.first?[kCGWindowBounds as String] as? NSDictionary,
-              let bounds = CGRect(dictionaryRepresentation: raw as CFDictionary) else { return false }
-        dropPreviewSawMove = abs(bounds.minX - original.minX) > 1 || abs(bounds.minY - original.minY) > 1
-        return dropPreviewSawMove
+              let bounds = CGRect(dictionaryRepresentation: raw as CFDictionary) else { return nil }
+        return snapshot.gesture(to: bounds)
     }
 
     private func exactScreen(containing point: CGPoint) -> NSScreen? {
