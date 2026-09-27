@@ -1322,44 +1322,56 @@ final class TiledDragTransactionTests: XCTestCase {
         XCTAssertNil(edges(nil), "a capture by id does not know")
     }
 
-    func testGestureNeedsTheOppositeEdgeHeldToCallItAResize() {
+    func testGestureIsAResizeOnlyWhenEveryGrabbedEdgesOppositeHeld() {
         let (tree, _, context) = fixture()
-        let frames = layoutFrames(tree, context)
-        let frame = frames[1]!
-        func gesture(press: CGPoint, _ change: (inout CGRect) -> Void) -> TiledDragGesture {
-            var now = frame
-            change(&now)
-            return snapshot(tree, context, frames, press: press).gesture(to: now)
+        // an 800x600 window: minX 100, maxX 900, minY 100, maxY 700
+        let frame = CGRect(x: 100, y: 100, width: 800, height: 600)
+        func gesture(press: CGPoint, to now: CGRect) -> TiledDragGesture {
+            snapshot(tree, context, [1: frame], press: press).gesture(to: now)
         }
-        let topStrip = CGPoint(x: frame.midX, y: frame.minY + 2)
-        // real resizes: the edge opposite the grabbed one stays put
-        XCTAssertEqual(gesture(press: CGPoint(x: frame.minX + 3, y: frame.midY)) {
-            $0.origin.x -= 60; $0.size.width += 60
-        }, .resize, "left edge")
-        XCTAssertEqual(gesture(press: topStrip) {
-            $0.origin.y -= 50; $0.size.height += 50
-        }, .resize, "top edge")
-        XCTAssertEqual(gesture(press: CGPoint(x: frame.maxX - 2, y: frame.maxY - 2)) {
-            $0.size.width += 40; $0.size.height -= 90
-        }, .resize, "bottom-right corner")
-        // moves: an app that changes its own size on the way holds no edge
-        XCTAssertEqual(gesture(press: topStrip) {
-            $0.origin = CGPoint(x: 1350, y: 30); $0.size.height -= 279
-        }, .move, "top strip, dragged across and shrunk by the app")
-        XCTAssertEqual(gesture(press: topStrip) { $0.origin.y += 300 }, .move,
-                       "top strip, no size change")
-        XCTAssertEqual(gesture(press: CGPoint(x: frame.maxX - 3, y: frame.midY)) {
-            $0.origin.x += 400; $0.size.width -= 120
-        }, .move, "right edge, but the whole window moved")
-        XCTAssertEqual(gesture(press: CGPoint(x: frame.maxX - 3, y: frame.midY)) {
-            $0.size.width += 60; $0.origin.y += 200
-        }, .move, "right edge held, but the window moved down")
-        XCTAssertEqual(gesture(press: topStrip) { _ in }, .unmoved)
-        // no press point: size alone, as before
-        var byID = frame
-        byID.origin.x += 900
-        byID.size.width += 30
-        XCTAssertEqual(snapshot(tree, context, frames, press: nil).gesture(to: byID), .resize)
+        let bottomLeft = CGPoint(x: 103, y: 697)
+        let topRight = CGPoint(x: 897, y: 102)
+        let bottomRight = CGPoint(x: 897, y: 697)
+        let leftEdge = CGPoint(x: 103, y: 400)
+        let topStrip = CGPoint(x: 500, y: 102)
+        XCTAssertEqual(snapshot(tree, context, [1: frame], press: bottomLeft).pressedEdges,
+                       [.left, .bottom])
+
+        let cases: [(String, CGPoint, CGRect, TiledDragGesture)] = [
+            ("bottom-left corner, down 100 / left 10", bottomLeft,
+             CGRect(x: 90, y: 100, width: 810, height: 700), .resize),
+            ("bottom-left corner, down 100 / left 30", bottomLeft,
+             CGRect(x: 70, y: 100, width: 830, height: 700), .resize),
+            ("top-right corner, right 100 / up 10", topRight,
+             CGRect(x: 100, y: 90, width: 900, height: 610), .resize),
+            ("bottom-right corner, down 100 / right 10", bottomRight,
+             CGRect(x: 100, y: 100, width: 810, height: 700), .resize),
+            ("left edge, aspect-locked height, top held", leftEdge,
+             CGRect(x: 40, y: 100, width: 860, height: 645), .resize),
+            ("left edge, a 10 pt drag", leftEdge,
+             CGRect(x: 90, y: 100, width: 810, height: 600), .resize),
+            ("a corner-ish drag that registered only the right edge", CGPoint(x: 897, y: 690),
+             CGRect(x: 100, y: 100, width: 810, height: 700), .resize),
+            ("top strip, the app shrinks across screens", topStrip,
+             CGRect(x: 1350, y: 30, width: 800, height: 321), .move),
+            ("top strip, no size change", topStrip,
+             CGRect(x: 100, y: 400, width: 800, height: 600), .move),
+            ("left band, a vertical move the app shortens", leftEdge,
+             CGRect(x: 100, y: 300, width: 800, height: 450), .move),
+            ("left edge, the whole window moved and shrank", leftEdge,
+             CGRect(x: 500, y: 100, width: 780, height: 600), .move),
+            ("a press that selects text", CGPoint(x: 500, y: 400), frame, .unmoved),
+            ("a mid-window press whose window moved", CGPoint(x: 500, y: 400),
+             CGRect(x: 110, y: 100, width: 780, height: 600), .move)
+        ]
+        for (name, press, now, expected) in cases {
+            XCTAssertEqual(gesture(press: press, to: now), expected, name)
+        }
+
+        // no press point: size alone decides, over 20 points as before
+        let byID = snapshot(tree, context, [1: frame], press: nil)
+        XCTAssertEqual(byID.gesture(to: CGRect(x: 1000, y: 100, width: 830, height: 600)), .resize)
+        XCTAssertEqual(byID.gesture(to: CGRect(x: 1000, y: 100, width: 810, height: 600)), .move)
     }
 
     func testTopStripPressDraggedAcrossIsAMoveWithAPreview() {

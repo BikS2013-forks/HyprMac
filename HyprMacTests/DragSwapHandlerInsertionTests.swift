@@ -701,6 +701,31 @@ final class DragSwapHandlerInsertionTests: XCTestCase {
         XCTAssertEqual(reconciler.reconcile(.terminalFailure(key: release)), [], "shown once")
     }
 
+    func testASecondFailureFromTheSameSourceKeepsWaitingOnTheReleaseScreen() {
+        var reconciler = TiledDragFeedbackReconciler()
+        let source = TiledDragFeedbackKey(workspace: 1, displayID: 2)
+        let release = TiledDragFeedbackKey(workspace: 2, displayID: 4)
+        _ = reconciler.beginDegraded(key: source, generation: 10, affectedIDs: [1, 2],
+                                     alsoAwaiting: [release: [10, 11]])
+        // a same-tree drop from the same source then degrades too
+        XCTAssertEqual(reconciler.beginDegraded(key: source, generation: 12, affectedIDs: [1, 3]), [])
+        XCTAssertEqual(Set(reconciler.pendingKeys), [source, release])
+
+        // the source must publish both failures' windows, after the second one
+        XCTAssertEqual(reconciler.reconcile(.accepted(key: source, generation: 11,
+                                                      publishedIDs: [1, 2, 3],
+                                                      expectedIDs: [1, 2, 3])), [],
+                       "older than the second failure")
+        XCTAssertEqual(reconciler.reconcile(.accepted(key: source, generation: 13,
+                                                      publishedIDs: [1, 2, 3],
+                                                      expectedIDs: [1, 2, 3])), [])
+        XCTAssertEqual(reconciler.pendingKeys, [release])
+        XCTAssertEqual(reconciler.reconcile(.accepted(key: release, generation: 14,
+                                                      publishedIDs: [10, 11],
+                                                      expectedIDs: [10, 11])),
+                       [.cancelDegraded(key: source)])
+    }
+
     func testANewestPassMustReachEveryAwaitedKey() {
         let source = TiledDragFeedbackKey(workspace: 1, displayID: 2)
         let release = TiledDragFeedbackKey(workspace: 2, displayID: 4)

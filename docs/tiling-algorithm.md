@@ -761,17 +761,25 @@ The mouse-up event supplies the release point. The mouse lifecycle latches the
 logical Hypr key when it is held at press, pressed during the drag, or still
 held at release. Option at release remains a compatibility shortcut. After
 the 100 ms settle delay, a bounded read of the captured dragged window
-separates manual resizing from movement (`TiledDragSnapshot.gesture`). A drag
-is a resize candidate only when all three of these hold:
+separates manual resizing from movement (`TiledDragSnapshot.gesture`). The
+window is unmoved when its position and size are each within a point of the
+captured frame, so text selection does not rearrange unmoved windows. It is a
+resize only when all three of these hold:
 
 - The press landed on the window's resize border. The border is a band just
   inside the captured frame: 8 points at the left, right and bottom edges and
   4 at the top, corners giving two edges. The top band is narrow because the
   title bar starts right below it. There is no outer band: a press outside
   the frame is not a tile press at all.
-- The width or height changed by more than 20 AX points.
-- On every resized axis, the edge opposite a grabbed one stayed within 2
-  points. On an axis it did not resize, the origin stayed within 2 points.
+- The edge opposite every grabbed edge stayed within 3 points: maxX for a
+  left edge, minY for a bottom edge, and so on.
+- At least one grabbed axis changed size by more than 4 points.
+
+Anything else is a move. A size change on an axis nobody grabbed counts
+neither way. An aspect-locked side resize moves the other axis, and a corner
+press the band reads as one edge is still that edge's resize. A small resize
+reads as one from its first few points, which keeps the live preview from
+flashing at the start of an edge drag.
 
 A real edge or corner drag keeps the far edge still. A move keeps no edge
 still, even when the app changes its own size on the way. Messages changes
@@ -779,8 +787,7 @@ its height by up to 279 points when it is dragged onto the ultrawide. Reading
 that as a resize rejected the drop, or grew its tile on the source, and a
 press in the top of the title bar would still have done it under a band
 alone. A capture by window id has no press point, so size alone decides
-there. Position and size changes within one point are ignored, so text
-selection does not rearrange unmoved windows.
+there, a change over 20 points as before.
 
 An ordinary move chooses a target from the release point within the source
 workspace and physical display. The nearest normalized target edge selects
@@ -856,10 +863,14 @@ after every frame on both screens was accepted.
 A call that times out on either screen gets its one longer try first.
 Messages took 101 ms to answer a position write right after crossing
 displays, just past the 100 ms call timeout. All of a drop's attempts share
-one 2.5-second budget (`TiledDragBudget`). Once it is spent, a timeout gets
-no longer try and the drop goes straight to its plain outcome. That caps a
-drop that could otherwise hold the main thread for over ten seconds. The cut
-logs `frame attempt AX timeout recovery skipped`.
+one 2.5-second budget for those longer tries (`TiledDragBudget`). Once it is
+spent, a timeout gets no longer try, and the drop goes on with its plain
+attempts to its plain outcome. The cut logs `frame attempt AX timeout
+recovery skipped`. The budget bounds the retries, not the drop. Each
+capture, candidate and rollback still runs with its own deadline of 0.36
+seconds, or 1 second under the scale-change budget. So a drop that ends up
+rolling both trees back can still hold the main thread past 2.5 seconds,
+though no longer for the ten or more that every retry could add up to.
 
 A refusal before the first write puts back only the source. The release
 screen was read but never written. These refusals are no target, no room,

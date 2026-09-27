@@ -946,11 +946,13 @@ in this order. Points and frames are global CG coordinates (top-left origin).
   target: … ws<N> on '<name>' members=[…]`.
 - `tiled drag settle read: dragged=<id> original=<rect> read=<rect> dw=<n>
   dh=<n> press=cg(<x>,<y>) pressEdges=[<edges>]|unknown
-  gesture=unmoved|move|resize centerOnSource=<bool> decision=<…>`. This is
-  the read 100 ms after release. A resize needs a press in an edge's band, a
-  width or height change over 20 points, and the opposite edge held on every
-  resized axis. One centred off the source tiles restores. A failed read logs
-  `tiled drag settle read failed: … reason=<trace>` instead.
+  oppositeDrift=[<edge>:<n>,…] gesture=unmoved|move|resize
+  centerOnSource=<bool> decision=<…>`. This is the read 100 ms after release.
+  `oppositeDrift` is how far the edge opposite each grabbed one moved. A
+  resize needs a press in an edge's band, every drift within 3 points, and a
+  grabbed axis changed by more than 4. One centred off the source tiles
+  restores. A failed read logs `tiled drag settle read failed: …
+  reason=<trace>` instead.
 - For a plain move across monitors:
   - `tiled drag across monitors targets: point=cg(…) tiles=[<id>
     frame=(x,y,w,h) dist=<d> l=<> r=<> t=<> b=<>; …] chosen=<id> <edge>`. The

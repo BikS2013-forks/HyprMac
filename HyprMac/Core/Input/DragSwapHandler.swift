@@ -232,6 +232,11 @@ struct TiledDragFeedbackReconciler {
 
     /// `alsoAwaiting` names other keys the drop touched, each with the ids a
     /// verified layout there must publish before the feedback is cancelled.
+    ///
+    /// A second failure from the same source adds to what the first is still
+    /// waiting for rather than replacing it, so a cross drop's release screen
+    /// is not forgotten. A failure from another source reports the pending
+    /// one first, as before, since its feedback cannot cancel under this key.
     mutating func beginDegraded(key: TiledDragFeedbackKey, generation: UInt64,
                                 affectedIDs: Set<CGWindowID>,
                                 alsoAwaiting: [TiledDragFeedbackKey: Set<CGWindowID>] = [:])
@@ -245,10 +250,15 @@ struct TiledDragFeedbackReconciler {
         } else {
             actions = []
         }
-        var awaiting = [key: Waiting(ids: affectedIDs, generation: generation)]
-        for (other, ids) in alsoAwaiting where other != key {
-            awaiting[other] = Waiting(ids: ids, generation: generation)
+        var touched = alsoAwaiting
+        touched[key, default: []].formUnion(affectedIDs)
+        if let pending, pending.key == key {
+            for (earlier, waiting) in pending.awaiting {
+                touched[earlier, default: []].formUnion(waiting.ids)
+            }
         }
+        // every key waits for a verified layout newer than this failure
+        let awaiting = touched.mapValues { Waiting(ids: $0, generation: generation) }
         pending = Pending(key: key, generation: generation, awaiting: awaiting, shownGeneration: nil)
         return actions
     }

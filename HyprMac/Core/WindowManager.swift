@@ -879,7 +879,7 @@ class WindowManager {
         dumpStateSignalSource?.cancel()
         dumpStateSignalSource = nil
         tiledDragHandler.cancel()
-        dropPreview.end()
+        endTiledDropPreview()
         tiledDragFeedback.cancel()
         pendingTiledDragCompletion = nil
         activeTiledDragFeedback = nil
@@ -1097,7 +1097,7 @@ class WindowManager {
             let draggedFloatingFrame = self?.mouseDownFloatingFrame
             var floaterDragged = false
             // the drop decides now; the preview has said all it can
-            self?.dropPreview.end()
+            self?.endTiledDropPreview()
             if let self {
                 let primaryHeight = self.displayManager.primaryScreenHeight
                 let releasePoint = TiledDragEvent.point(event: event, primaryHeight: primaryHeight)
@@ -1186,7 +1186,7 @@ class WindowManager {
         mouseDragMonitor = nil
         mouseUpMonitor = nil
         dragFlagsMonitor = nil
-        dropPreview.end()
+        endTiledDropPreview()
         mouseDownPointCG = nil
         mouseDownFloatingWindowID = 0
         mouseDownFloatingFrame = nil
@@ -3206,6 +3206,12 @@ class WindowManager {
     /// menu bar's "Retile All" action.
     @objc private func tiledDropPreviewWorkspacesChanged() {
         dropPreview.refresh()
+    }
+
+    /// Hide the drop preview and forget the drag's release trees.
+    private func endTiledDropPreview() {
+        dropPreview.end()
+        dropPreviewTargets = [:]
     }
 
     @objc private func retileAllRequested() {
