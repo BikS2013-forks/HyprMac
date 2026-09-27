@@ -78,6 +78,21 @@ class WindowManager {
     private var activeTiledDragFeedback: (key: TiledDragFeedbackKey,
                                            layoutGeneration: UInt64, borderToken: Int)?
 
+    // live highlight of where a tiled drag will land. the frames come from
+    // the press capture and the trees, never from AX while the pointer moves
+    private let dropPreviewPanel = TiledDropPreviewPanel()
+    private lazy var dropPreview = TiledDragPreviewSession(presenter: .init(
+        show: { [weak self] rect in self?.dropPreviewPanel.show(rect) },
+        hide: { [weak self] in self?.dropPreviewPanel.hide() }))
+    // per drag: each other display's tree as a drop there would find it,
+    // looked up once, the first time the pointer reaches that display
+    private var dropPreviewTargets: [CGDirectDisplayID: TiledDragCrossTarget?] = [:]
+    // per drag: the window server has shown the dragged window moving. a
+    // press that selects text never moves it, and gets no preview
+    private var dropPreviewSawMove = false
+    private var dragOptionDown = false
+    private var dragFlagsMonitor: Any?
+
     // Action → service routing. dispatch(_:) replaces the handleAction switch.
     private var actionDispatcher: ActionDispatcher!
 
@@ -351,6 +366,8 @@ class WindowManager {
             self.hyprHeld = true
             let mousePressActive = self.mouseDragLifecycle.buttonDown
             self.mouseDragLifecycle.noteHyprKeyDown()
+            // a latched Hypr turns the drop into a swap
+            self.dropPreview.refresh()
             // Do not repair focus while a mouse gesture is in flight. A stale
             // tracker can otherwise focus a fallback window and redirect the
             // native title-bar drag when Hypr is pressed mid-gesture.
@@ -857,6 +874,7 @@ class WindowManager {
         dumpStateSignalSource?.cancel()
         dumpStateSignalSource = nil
         tiledDragHandler.cancel()
+        dropPreview.end()
         tiledDragFeedback.cancel()
         pendingTiledDragCompletion = nil
         activeTiledDragFeedback = nil
@@ -1044,9 +1062,10 @@ class WindowManager {
         // when the user drags a floating window, its frame changes 60Hz but our
         // border only repositions on the discovery poll — so it lags behind ugly. hide
         // the border for the duration of the drag and restore it on mouseUp.
-        mouseDragMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDragged) { [weak self] _ in
+        mouseDragMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDragged) { [weak self] event in
             guard let self = self else { return }
             self.mouseDragLifecycle.observeDrag(hyprHeld: self.hyprHeld)
+            self.updateTiledDropPreview(event)
             if self.mouseDownFloatingWindowID != 0 {
                 self.focusBorder.hideFloatingBorder(for: self.mouseDownFloatingWindowID)
             }
@@ -1060,11 +1079,20 @@ class WindowManager {
             // the scrim stays: re-shown later it would come back above the members
             if !self.scratchpad.isVisible { self.dimmingOverlay.hideAll() }
         }
+        // Option held during a tiled drag turns its drop into a swap, and the
+        // preview must say so even when the pointer is standing still
+        dragFlagsMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+            guard let self, self.dropPreview.isActive else { return }
+            self.dragOptionDown = event.modifierFlags.contains(.option)
+            self.dropPreview.refresh()
+        }
         mouseUpMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseUp) { [weak self] event in
             let shouldDetectDrag = self?.mouseDraggedSinceDown ?? false
             let draggedFloatingID = self?.mouseDownFloatingWindowID ?? 0
             let draggedFloatingFrame = self?.mouseDownFloatingFrame
             var floaterDragged = false
+            // the drop decides now; the preview has said all it can
+            self?.dropPreview.end()
             if let self {
                 let primaryHeight = self.displayManager.primaryScreenHeight
                 let releasePoint = TiledDragEvent.point(event: event, primaryHeight: primaryHeight)
@@ -1147,10 +1175,13 @@ class WindowManager {
         if let m = mouseDownMonitor { NSEvent.removeMonitor(m) }
         if let m = mouseDragMonitor { NSEvent.removeMonitor(m) }
         if let m = mouseUpMonitor { NSEvent.removeMonitor(m) }
+        if let m = dragFlagsMonitor { NSEvent.removeMonitor(m) }
         mouseMoveMonitor = nil
         mouseDownMonitor = nil
         mouseDragMonitor = nil
         mouseUpMonitor = nil
+        dragFlagsMonitor = nil
+        dropPreview.end()
         mouseDownPointCG = nil
         mouseDownFloatingWindowID = 0
         mouseDownFloatingFrame = nil
@@ -3222,8 +3253,10 @@ private extension WindowManager {
             },
             resolveTarget: { [weak self] pointer, snapshot in
                 let onSourceTiles = snapshot.context.usableFrame.contains(pointer)
-                let target = onSourceTiles
-                    ? TiledDragTargetResolver.resolve(pointer: pointer, snapshot: snapshot) : nil
+                // the planner the live preview uses, on the same press capture
+                let target = TiledDropPlanner.sameTreeTarget(
+                    pointer: pointer, draggedID: snapshot.draggedID,
+                    sourceTiles: snapshot.context.usableFrame, sourceSlots: snapshot.originalFrames)
                 self?.noteTiledDragRelease(pointer, snapshot: snapshot,
                                            onSourceTiles: onSourceTiles, target: target)
                 return target
@@ -3242,6 +3275,89 @@ private extension WindowManager {
                 }
                 return self.tiledDragDisplayID(screen) != snapshot.context.physicalDisplayID
             })
+    }
+
+    /// Start or move the live drop preview. Only a press the tiled capture
+    /// took gets one, once it is past the drag threshold, and never a press
+    /// on the window's resize border: that drag is a resize.
+    private func updateTiledDropPreview(_ event: NSEvent) {
+        let point = TiledDragEvent.point(event: event, primaryHeight: displayManager.primaryScreenHeight)
+        dragOptionDown = event.modifierFlags.contains(.option)
+        if !dropPreview.isActive {
+            guard isRunning, config.enabled, let snapshot = tiledDragHandler.pressSnapshot,
+                  snapshot.pressedResizeBorder == false,
+                  TiledDragEvent.isDrag(from: mouseDownPointCG, to: point, sawDragEvent: true) else {
+                return
+            }
+            dropPreviewTargets = [:]
+            dropPreviewSawMove = false
+            dropPreviewPanel.primaryScreenHeight = displayManager.primaryScreenHeight
+            dropPreviewPanel.accentColor = config.resolvedFocusBorderColor
+            dropPreviewPanel.cornerRadius = config.windowCornerRadius
+            dropPreview.begin { [weak self] point in
+                self?.tiledDropPreviewFrame(at: point, snapshot: snapshot)
+            }
+        }
+        dropPreview.move(to: point)
+    }
+
+    /// Where the dragged window would land if released at `point`, nil where
+    /// the drop would restore. The drop's own planner and candidates, fed
+    /// the press capture and the trees; no AX.
+    private func tiledDropPreviewFrame(at point: CGPoint, snapshot: TiledDragSnapshot) -> CGRect? {
+        guard isRunning, tiledDragHandler.pressSnapshot?.generation == snapshot.generation,
+              tiledDragWindowMoved(snapshot) else { return nil }
+        let swap = mouseDragLifecycle.releaseRequestsSwap(hyprHeld: hyprHeld, optionDown: dragOptionDown)
+        var release = TiledDropRelease.source
+        var target: TiledDragCrossTarget?
+        if let screen = exactFullScreen(containing: point),
+           tiledDragDisplayID(screen) != snapshot.context.physicalDisplayID {
+            let found = dropPreviewTarget(on: screen, snapshot: snapshot)
+            target = found?.target
+            release = .otherMonitor(slots: found?.slots)
+        }
+        let plan = TiledDropPlanner.plan(pointer: point, draggedID: snapshot.draggedID,
+                                         sourceTiles: snapshot.context.usableFrame,
+                                         sourceSlots: snapshot.originalFrames, release: release)
+        return tilingEngine.tiledDragPreviewFrame(snapshot, plan: plan, swap: swap, target: target)
+    }
+
+    /// Another display's tree as a drop there would find it, looked up once
+    /// per drag: disabled monitors and the scratchpad refuse, as they do at
+    /// release.
+    private func dropPreviewTarget(on screen: NSScreen, snapshot: TiledDragSnapshot)
+        -> (target: TiledDragCrossTarget, slots: [CGWindowID: CGRect])? {
+        let displayID = tiledDragDisplayID(screen)
+        if let cached = dropPreviewTargets[displayID] {
+            return cached.map { ($0, Self.slots(of: $0)) }
+        }
+        var found: TiledDragCrossTarget?
+        if case let .workspace(workspace) = tiledDragReleasePolicy(on: screen) {
+            found = tilingEngine.tiledDragPreviewTarget(
+                for: snapshot, location: (workspace, screen, stateCache.floatingWindowIDs))
+        }
+        dropPreviewTargets[displayID] = found
+        return found.map { ($0, Self.slots(of: $0)) }
+    }
+
+    private static func slots(of target: TiledDragCrossTarget) -> [CGWindowID: CGRect] {
+        TiledDropPlanner.slots(of: target.tree, in: target.context.usableFrame,
+                               gap: target.context.gap, padding: target.context.padding)
+    }
+
+    /// Whether the window server shows the dragged window away from where
+    /// the press found it. A press that selects text never moves it. Read
+    /// from the window list, not AX, and only until it has moved once.
+    private func tiledDragWindowMoved(_ snapshot: TiledDragSnapshot) -> Bool {
+        if dropPreviewSawMove { return true }
+        guard let original = snapshot.originalFrames[snapshot.draggedID] else { return false }
+        var id = UnsafeRawPointer(bitPattern: UInt(snapshot.draggedID))
+        guard let ids = CFArrayCreate(kCFAllocatorDefault, &id, 1, nil),
+              let list = CGWindowListCreateDescriptionFromArray(ids) as? [[String: Any]],
+              let raw = list.first?[kCGWindowBounds as String] as? NSDictionary,
+              let bounds = CGRect(dictionaryRepresentation: raw as CFDictionary) else { return false }
+        dropPreviewSawMove = abs(bounds.minX - original.minX) > 1 || abs(bounds.minY - original.minY) > 1
+        return dropPreviewSawMove
     }
 
     private func exactScreen(containing point: CGPoint) -> NSScreen? {

@@ -81,3 +81,62 @@ struct TiledDragTargetResolver {
         }.0
     }
 }
+
+/// What a tiled release at a point would do. The drop and its live preview
+/// both come from `TiledDropPlanner`, so they cannot disagree.
+enum TiledDropPlan: Equatable {
+    /// a tile of the source tree: insert beside it, or swap with it
+    case sameTree(TiledDragTarget)
+    /// another monitor's tree: beside or swapped with its nearest tile, or
+    /// its root when it has none
+    case otherMonitor(TiledDragTarget?)
+    /// nothing takes the window here, so the drop restores
+    case none
+}
+
+/// Where the release point is, as far as the plan cares.
+enum TiledDropRelease: Equatable {
+    /// the source display, or a point on no display
+    case source
+    /// another display. `slots` is its tree's layout, empty for a workspace
+    /// with no tiles, nil when the drop there would decline
+    case otherMonitor(slots: [CGWindowID: CGRect]?)
+}
+
+struct TiledDropPlanner {
+    static func plan(pointer: CGPoint, draggedID: CGWindowID, sourceTiles: CGRect,
+                     sourceSlots: [CGWindowID: CGRect],
+                     release: TiledDropRelease) -> TiledDropPlan {
+        if let target = sameTreeTarget(pointer: pointer, draggedID: draggedID,
+                                       sourceTiles: sourceTiles, sourceSlots: sourceSlots) {
+            return .sameTree(target)
+        }
+        guard case let .otherMonitor(slots) = release, let slots else { return .none }
+        if slots.isEmpty { return .otherMonitor(nil) }
+        return otherMonitorTarget(pointer: pointer, slots: slots).map { .otherMonitor($0) } ?? .none
+    }
+
+    /// The source tile under the point. Only a point on the source's tiling
+    /// rect counts, and a gap there takes nothing.
+    static func sameTreeTarget(pointer: CGPoint, draggedID: CGWindowID, sourceTiles: CGRect,
+                               sourceSlots: [CGWindowID: CGRect]) -> TiledDragTarget? {
+        guard sourceTiles.contains(pointer) else { return nil }
+        return TiledDragTargetResolver.resolve(pointer: pointer, draggedID: draggedID,
+                                               intendedSlots: sourceSlots)
+    }
+
+    /// The tile of another monitor's tree the point is nearest.
+    static func otherMonitorTarget(pointer: CGPoint,
+                                   slots: [CGWindowID: CGRect]) -> TiledDragTarget? {
+        TiledDragTargetResolver.nearest(pointer: pointer, slots: slots)
+    }
+
+    /// A tree's slots as the engine lays them out. The drop and the preview
+    /// both pick the release screen's target from these, never from a live
+    /// read, so both see the same tiles.
+    static func slots(of tree: BSPTree, in usableFrame: CGRect, gap: CGFloat,
+                      padding: CGFloat) -> [CGWindowID: CGRect] {
+        Dictionary(tree.layout(in: usableFrame, gap: gap, padding: padding)
+            .map { ($0.0.windowID, $0.1) }, uniquingKeysWith: { first, _ in first })
+    }
+}

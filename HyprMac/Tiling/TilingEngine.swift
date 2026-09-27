@@ -857,7 +857,7 @@ class TilingEngine {
     /// the release screen, or an empty stand-in when it has none. nil when
     /// that screen cannot take the window: no location, the scratchpad on
     /// either side, the source's own workspace or display, or a tree that
-    /// holds a floater.
+    /// holds a floater. Logs the answer either way.
     private func crossMonitorTarget(
         for snapshot: TiledDragSnapshot,
         currentLocation: () -> (workspace: Int, screen: NSScreen, floatingIDs: Set<CGWindowID>)?,
@@ -869,10 +869,51 @@ class TilingEngine {
                     + "reason=\(reason) — restoring as a release with no target")
             return nil
         }
+        guard let source = currentLocation() else { return decline("the source location is gone") }
+        let target: CrossMonitorTarget
+        switch resolveCrossMonitorTarget(for: snapshot, releaseLocation: releaseLocation) {
+        case let .success(found): target = found
+        case let .failure(declined): return decline(declined.reason)
+        }
+        let context = target.drop.context
+        let release = releaseLocation()
+        hyprLog(.notice, .tiling, "tiled drag across monitors target: dragged=\(snapshot.draggedID) "
+                + "ws\(context.workspace) on '\(release?.screen.localizedName ?? "?")' "
+                + "display=\(context.physicalDisplayID) "
+                + "members=\(target.drop.tree.allWindows.map(\.windowID)) "
+                + "tree=\(target.live == nil ? "none" : "live") usable=\(context.usableFrame)")
+        // the release point is on another display, so a swap or a rollback
+        // carries a window across. a scale change gets the longer budget,
+        // as a verified layout does
+        guard let release else { return decline("the release location is gone") }
+        let from = source.screen.backingScaleFactor
+        let to = release.screen.backingScaleFactor
+        guard from != to else { return target }
+        let configuration = FrameSizingConfiguration().withScaleChangeBudget
+        hyprLog(.notice, .tiling, "tiled drag across monitors scale change: "
+                + "\(Self.scale(from))→\(Self.scale(to)) "
+                + "deadline=\(Int((configuration.deadline * 1000).rounded()))ms")
+        return CrossMonitorTarget(drop: target.drop, live: target.live, location: target.location,
+                                  configuration: configuration)
+    }
+
+    private struct CrossMonitorDecline: Error {
+        let reason: String
+    }
+
+    /// `crossMonitorTarget` without the logging or the scale budget, for the
+    /// drop and its live preview alike. Reads no AX.
+    private func resolveCrossMonitorTarget(
+        for snapshot: TiledDragSnapshot,
+        releaseLocation: @escaping () -> (workspace: Int, screen: NSScreen,
+                                          floatingIDs: Set<CGWindowID>)?
+    ) -> Result<CrossMonitorTarget, CrossMonitorDecline> {
+        func decline(_ reason: String) -> Result<CrossMonitorTarget, CrossMonitorDecline> {
+            .failure(CrossMonitorDecline(reason: reason))
+        }
         guard snapshot.context.workspace != Self.scratchpadWorkspace else {
             return decline("the source is the scratchpad")
         }
-        guard let source = currentLocation() else { return decline("the source location is gone") }
         guard let release = releaseLocation() else {
             return decline("no release location (see the refusal above)")
         }
@@ -904,25 +945,31 @@ class TilingEngine {
             return decline("floaters \(context.floatingIDs.intersection(context.memberIDs).sorted()) "
                            + "are in the release tree")
         }
-        hyprLog(.notice, .tiling, "tiled drag across monitors target: dragged=\(snapshot.draggedID) "
-                + "ws\(release.workspace) on '\(release.screen.localizedName)' "
-                + "display=\(context.physicalDisplayID) members=\(tree.allWindows.map(\.windowID)) "
-                + "tree=\(live == nil ? "none" : "live") usable=\(context.usableFrame)")
-        // the release point is on another display, so a swap or a rollback
-        // carries a window across. a scale change gets the longer budget,
-        // as a verified layout does
-        var configuration = FrameSizingConfiguration()
-        let from = source.screen.backingScaleFactor
-        let to = release.screen.backingScaleFactor
-        if from != to {
-            configuration = configuration.withScaleChangeBudget
-            hyprLog(.notice, .tiling, "tiled drag across monitors scale change: "
-                    + "\(Self.scale(from))→\(Self.scale(to)) "
-                    + "deadline=\(Int((configuration.deadline * 1000).rounded()))ms")
-        }
-        return CrossMonitorTarget(
+        return .success(CrossMonitorTarget(
             drop: TiledDragCrossTarget(tree: tree, context: context, currentContext: currentContext),
-            live: live, location: releaseLocation, configuration: configuration)
+            live: live, location: releaseLocation, configuration: FrameSizingConfiguration()))
+    }
+
+    // MARK: - live drop preview
+
+    /// The release screen's side of a drop, for the live preview: the same
+    /// tree and context a drop there would use, found the same way, without
+    /// reading AX and without logging. nil when that drop would decline.
+    func tiledDragPreviewTarget(
+        for snapshot: TiledDragSnapshot,
+        location: (workspace: Int, screen: NSScreen, floatingIDs: Set<CGWindowID>)
+    ) -> TiledDragCrossTarget? {
+        guard case let .success(target) = resolveCrossMonitorTarget(
+            for: snapshot, releaseLocation: { location }) else { return nil }
+        return target.drop
+    }
+
+    /// Where the dragged window would land for `plan`, from the candidates
+    /// and layouts the drop itself builds. nil when that drop would restore.
+    func tiledDragPreviewFrame(_ snapshot: TiledDragSnapshot, plan: TiledDropPlan, swap: Bool,
+                               target: TiledDragCrossTarget?) -> CGRect? {
+        TiledDragTransaction(ioFactory: frameSizingIOFactory, minimumSize: minimumSize(for:))
+            .previewFrame(snapshot, plan: plan, swap: swap, target: target)
     }
 
     /// Publish a cross-monitor drop, both trees together, or mark both keys

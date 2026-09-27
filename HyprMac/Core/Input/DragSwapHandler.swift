@@ -324,6 +324,9 @@ final class TiledDragSessionCoordinator {
     typealias IsCrossMonitor = (CGPoint, TiledDragSnapshot) -> Bool
 
     private(set) var isFinishingDrag = false
+    /// the tiled press being dragged, for the live drop preview. nil once
+    /// the release is finishing
+    var pressSnapshot: TiledDragSnapshot? { isFinishingDrag ? nil : snapshot }
     private let capture: Capture
     private let apply: Apply
     private let resolveTarget: ResolveTarget
@@ -442,6 +445,7 @@ final class TiledDragHandler {
 
     private let coordinator: TiledDragSessionCoordinator
     var isFinishingDrag: Bool { coordinator.isFinishingDrag }
+    var pressSnapshot: TiledDragSnapshot? { coordinator.pressSnapshot }
 
     init(capture: @escaping Capture,
          drop: @escaping TiledDragSessionCoordinator.Apply,

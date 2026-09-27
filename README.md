@@ -71,8 +71,10 @@ permissions, and the recommended macOS settings.
 You'll feel at home. The differences are mostly macOS being macOS:
 
 - **Tiling:** BSP dwindle, like Hyprland's default layout. New windows split the focused one,
-  and **Hypr + J** flips the split direction. Drag a tiled window onto another tile's edge to
-  insert it there, or hold Hypr while dragging to swap the two.
+  and **Hypr + J** flips the split direction. Drag a tiled window by its title bar onto another
+  tile's edge to insert it there, or hold Hypr while dragging to swap the two. The tile can be on
+  another monitor, and an empty workspace there takes the window whole. A highlight shows where
+  the window will land before you let go.
 - **Workspaces:** ten of them (keys 1–9 and 0), plus a scratchpad and an overview on
   **Hypr + O**. macOS has no public API for this, so HyprMac keeps its own virtual workspaces and
   hides the other workspaces' windows when you switch.

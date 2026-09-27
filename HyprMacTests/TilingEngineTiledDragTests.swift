@@ -642,6 +642,113 @@ final class TilingEngineTiledDragTests: XCTestCase {
         XCTAssertEqual(sourceRatio, TilingConfig.defaultRatio)
     }
 
+    // MARK: - live drop preview
+
+    func testPreviewShowsExactlyWhereEachDropAcrossMonitorsLands() throws {
+        // points relative to the wide screen's two tiles, 10 left and 11 right
+        let cases: [(name: String, swap: Bool, point: (CGRect, CGRect) -> CGPoint)] = [
+            ("left of 10", false, { a, _ in CGPoint(x: a.minX + 5, y: a.midY) }),
+            ("bottom of 11", false, { _, b in CGPoint(x: b.midX, y: b.maxY - 3) }),
+            ("in the gap", false, { a, _ in CGPoint(x: a.maxX + 3, y: a.midY) }),
+            ("in the top padding", false, { _, b in CGPoint(x: b.midX, y: 2) }),
+            ("swap with 11", true, { _, b in CGPoint(x: b.midX, y: b.midY) })
+        ]
+        for testCase in cases {
+            let fixture = makeCrossFixture()
+            let snapshot = try captureCross(fixture)
+            let point = testCase.point(try XCTUnwrap(fixture.trace.frames[10]),
+                                       try XCTUnwrap(fixture.trace.frames[11]))
+            let preview = previewFrame(fixture, snapshot, at: point, swap: testCase.swap)
+            XCTAssertNotNil(preview, testCase.name)
+            fixture.trace.frames[1]?.origin = CGPoint(x: 300, y: 200)
+
+            let outcome = dropCross(fixture, snapshot, at: point, swap: testCase.swap)
+
+            guard case .acrossTrees(.committed, _) = outcome else {
+                XCTFail("\(testCase.name): expected a commit, got \(outcome)")
+                continue
+            }
+            XCTAssertEqual(preview, fixture.trace.frames[1], testCase.name)
+        }
+    }
+
+    func testPreviewOfAnEmptyWorkspaceIsItsWholeTilingRect() throws {
+        let fixture = makeCrossFixture(targetIDs: [])
+        let snapshot = try captureCross(fixture)
+        let point = CGPoint(x: 1000, y: 500)
+        let preview = previewFrame(fixture, snapshot, at: point, swap: false)
+        fixture.trace.frames[1]?.origin = CGPoint(x: 300, y: 200)
+
+        guard case .acrossTrees(.committed, _) = dropCross(fixture, snapshot, at: point,
+                                                           swap: false) else {
+            return XCTFail("expected the empty workspace to take the window")
+        }
+        let usable = fixture.engine.displayManager.cgRect(for: fixture.wide)
+        let padding = fixture.engine.outerPadding
+        XCTAssertEqual(preview, usable.insetBy(dx: padding, dy: padding))
+        XCTAssertEqual(preview, fixture.trace.frames[1])
+    }
+
+    func testPreviewOfASameTreeDropIsWhereThatDropLands() throws {
+        let fixture = makeCrossFixture()
+        let snapshot = try captureCross(fixture)
+        let slot = try XCTUnwrap(fixture.trace.frames[3])
+        let point = CGPoint(x: slot.midX, y: slot.maxY - 3)
+        let plan = TiledDropPlanner.plan(pointer: point, draggedID: 1,
+                                         sourceTiles: snapshot.context.usableFrame,
+                                         sourceSlots: snapshot.originalFrames, release: .source)
+        guard case let .sameTree(target) = plan else { return XCTFail("expected tile 3, got \(plan)") }
+        let preview = fixture.engine.tiledDragPreviewFrame(snapshot, plan: plan, swap: false,
+                                                           target: nil)
+        fixture.trace.frames[1]?.origin.x += 40
+
+        guard case .committed = fixture.engine.dropTiledDrag(
+            snapshot, mode: .insert(targetID: target.windowID, edge: target.edge),
+            currentLocation: { (1, fixture.tall, []) }) else {
+            return XCTFail("expected a same-tree commit")
+        }
+        XCTAssertNotNil(preview)
+        XCTAssertEqual(preview, fixture.trace.frames[1])
+    }
+
+    func testNoPreviewWhereTheDropWouldRestore() throws {
+        let fixture = makeCrossFixture { engine, wide in
+            engine.maxSplitsPerMonitor[wide.localizedName] = 1
+        }
+        let snapshot = try captureCross(fixture)
+        let slot = try XCTUnwrap(fixture.trace.frames[10])
+        let point = CGPoint(x: slot.minX + 5, y: slot.midY)
+
+        XCTAssertNil(previewFrame(fixture, snapshot, at: point, swap: false), "past max splits")
+        let gap = CGPoint(x: -500, y: fixture.trace.frames[1]!.maxY + 4)
+        XCTAssertNil(fixture.engine.tiledDragPreviewFrame(
+            snapshot, plan: TiledDropPlanner.plan(pointer: gap, draggedID: 1,
+                                                  sourceTiles: snapshot.context.usableFrame,
+                                                  sourceSlots: snapshot.originalFrames,
+                                                  release: .source),
+            swap: false, target: nil), "a gap on the source")
+        fixture.trace.frames[1]?.origin = CGPoint(x: 300, y: 200)
+        guard case .acrossTrees(.rejectedRestored, _) = dropCross(fixture, snapshot, at: point,
+                                                                  swap: false) else {
+            return XCTFail("the drop past max splits must restore")
+        }
+    }
+
+    func testPreviewTargetIsDeclinedWhereTheDropWouldBe() throws {
+        let fixture = makeCrossFixture()
+        let snapshot = try captureCross(fixture)
+        XCTAssertNotNil(fixture.engine.tiledDragPreviewTarget(for: snapshot,
+                                                              location: (2, fixture.wide, [])))
+        XCTAssertNil(fixture.engine.tiledDragPreviewTarget(for: snapshot,
+                                                           location: (1, fixture.wide, [])),
+                     "the source's own workspace")
+        XCTAssertNil(fixture.engine.tiledDragPreviewTarget(
+            for: snapshot, location: (TilingEngine.scratchpadWorkspace, fixture.wide, [])))
+        XCTAssertNil(fixture.engine.tiledDragPreviewTarget(for: snapshot,
+                                                           location: (2, fixture.wide, [10])),
+                     "a floater in the release tree")
+    }
+
     func testSameMonitorDropIgnoresTheReleaseLocation() throws {
         let fixture = makeCrossFixture()
         let targetTree = fixture.engine.existingTree(forWorkspace: 2, screen: fixture.wide)
@@ -761,6 +868,22 @@ final class TilingEngineTiledDragTests: XCTestCase {
             snapshot, mode: .crossMonitor(pointer: pointer, swapRequested: swap),
             currentLocation: { (1, fixture.tall, floatingIDs) },
             releaseLocation: { (2, fixture.wide, floatingIDs) })
+    }
+
+    /// what the live preview shows for a release at `point` on the wide screen
+    private func previewFrame(_ fixture: CrossFixture, _ snapshot: TiledDragSnapshot,
+                              at point: CGPoint, swap: Bool) -> CGRect? {
+        let target = fixture.engine.tiledDragPreviewTarget(for: snapshot,
+                                                           location: (2, fixture.wide, []))
+        let slots = target.map {
+            TiledDropPlanner.slots(of: $0.tree, in: $0.context.usableFrame,
+                                   gap: $0.context.gap, padding: $0.context.padding)
+        }
+        let plan = TiledDropPlanner.plan(pointer: point, draggedID: snapshot.draggedID,
+                                         sourceTiles: snapshot.context.usableFrame,
+                                         sourceSlots: snapshot.originalFrames,
+                                         release: .otherMonitor(slots: slots))
+        return fixture.engine.tiledDragPreviewFrame(snapshot, plan: plan, swap: swap, target: target)
     }
 
     private enum TestFailure: Error { case capture }

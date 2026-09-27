@@ -953,7 +953,9 @@ in this order. Points and frames are global CG coordinates (top-left origin).
 - For a plain move across monitors:
   - `tiled drag across monitors targets: point=cg(…) tiles=[<id>
     frame=(x,y,w,h) dist=<d> l=<> r=<> t=<> b=<>; …] chosen=<id> <edge>`. The
-    four fractions are the normalized distances to each edge, measured from
+    frames are the release tree's layout slots, the same ones the live drop
+    preview uses. The four fractions are the normalized distances to each
+    edge, measured from
     the point clamped into that tile. The smallest picks the edge, with ties
     going left, right, top, bottom.
   - Then `tiled drag across monitors: … placement=<edge> of <id>|swap with

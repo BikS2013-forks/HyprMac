@@ -1226,6 +1226,31 @@ final class TiledDragTransactionTests: XCTestCase {
         XCTAssertEqual(TiledDragFailure.preflight(.noTarget).trace, "preflight(noTarget)")
     }
 
+    // MARK: - live drop preview
+
+    func testPreviewOfASwapIsTheWholeTargetTileAndNoRoomShowsNothing() {
+        let (tree, context, target, frames) = crossFixture()
+        let transaction = TiledDragTransaction(ioFactory: FakeAX(frames: frames).factory)
+        guard case let .captured(snapshot) = transaction.capture(
+            draggedID: 1, tree: tree, context: context, generation: 1,
+            currentContext: { context }) else { return XCTFail("capture failed") }
+        let hit = TiledDragTarget(windowID: 11, edge: .left)
+
+        XCTAssertEqual(transaction.previewFrame(snapshot, plan: .otherMonitor(hit), swap: true,
+                                                target: target), frames[11])
+        XCTAssertNil(transaction.previewFrame(snapshot, plan: .none, swap: false, target: target))
+        XCTAssertNil(transaction.previewFrame(snapshot, plan: .otherMonitor(hit), swap: false,
+                                              target: nil))
+
+        // 11 cannot shrink into the dragged window's slot, so the drop would
+        // restore with noRoom, and the preview shows nothing
+        let crowded = TiledDragTransaction(
+            ioFactory: FakeAX(frames: frames).factory,
+            minimumSize: { $0?.windowID == 11 ? CGSize(width: 1100, height: 0) : .zero })
+        XCTAssertNil(crowded.previewFrame(snapshot, plan: .otherMonitor(hit), swap: true,
+                                          target: target))
+    }
+
     // MARK: - resize or move, by where the press landed
 
     func testResizeBorderIsAnEightPointBandAcrossEveryEdge() {

@@ -829,8 +829,9 @@ The source tree loses the window the way it would on a close, and a source
 tree left empty is dropped. Visible floaters on the release screen do not
 block the drop. The same-tree release ignores them too.
 
-The release screen's tree is read before anything is written. Its members'
-actual frames become its originals, and the target tile is chosen from them.
+The release screen's tree is read before anything is written, and its
+members' actual frames become its originals for a rollback. The target tile is
+chosen from that tree's own layout slots, the same ones the live preview uses.
 Both candidates are private clones from `BSPTree`, built in the engine's drop
 path. Each must stay within its own screen's Max Splits. Each layout gets the
 same known-minimum ratio adjustment as a same-tree drop. If a known minimum
@@ -865,6 +866,54 @@ These cases restore exactly as a release without a target always has: a
 disabled release screen, the scratchpad layer up on any screen, a scratchpad
 source, a point on no screen, and a resize candidate, which keeps the
 same-tree resize rule. A window that did not move is still ignored.
+
+### Live drop preview
+
+While a tiled drag is in progress, a translucent highlight shows where the
+window will land. It uses the accent (focus border) color at low alpha, with a
+thin border and the window corner radius. It appears only after all of these
+hold:
+
+- the press was captured as a tiled press, not on the resize border
+- the pointer has passed the drag threshold
+- the window server reports the dragged window has moved from where the press
+  found it. A press that selects text never moves the window, so it gets no
+  preview. This is a window-list read (`CGWindowListCreateDescriptionFromArray`),
+  not AX, and it stops once the window has moved.
+
+What it shows:
+
+- **Plain insert, on either monitor:** the rect the dragged window would get.
+  That is its slot in the candidate tree the drop would build, with the same
+  known-minimum adjustment.
+- **Swap (Hypr latched or held, or Option):** the whole target tile.
+- **An empty workspace on another monitor:** that screen's tiling rect, inside
+  the outer padding.
+- **Nothing** wherever the drop would restore: a gap on the source, a disabled
+  monitor, the scratchpad, a point on no screen, past Max Splits, or no room
+  for a known minimum.
+
+Preview and drop cannot disagree, because both come from the same parts:
+
+- `TiledDropPlanner` picks the target and edge. The drop calls it too: its
+  same-tree target at release, and its target on another monitor.
+- The source tiles are the press capture, which the drop resolves against as
+  well.
+- Another monitor's tiles are that tree's own layout slots
+  (`TiledDropPlanner.slots`), not a live read. The drop now picks its target
+  from those slots too. It still reads that screen's frames first, for the
+  rollback.
+- The rect comes from `TiledDragTransaction.previewFrame`, which builds the
+  same candidates as `drop` and `dropAcrossTrees`.
+
+No AX call runs while the pointer moves. Another monitor's tree is looked up
+once per drag, the first time the pointer reaches it. Updates come at most 60
+times a second. A move inside that interval is held and applied when it ends,
+so the last position always shows. The panel redraws only when the rect
+changes. A Hypr press or an Option change asks again at the last point. The
+highlight hides at mouse-up, on a stop, and when there is nowhere to land.
+Nothing keeps running after the drag: one held update at most, and it does
+nothing once the drag has ended.
 
 ## `prepareTileLayout` / `prepareSwapLayout` / `prepareToggleSplitLayout`
 

@@ -95,6 +95,39 @@ final class TiledDragTargetTests: XCTestCase {
                        + "2 frame=(110,0,100,80) dist=0 l=0.950 r=0.050 t=0.500 b=0.500")
     }
 
+    // MARK: - the drop planner
+
+    func testPlannerPrefersASourceTileThenAnotherMonitorThenNothing() {
+        let sourceTiles = CGRect(x: 0, y: 0, width: 440, height: 100)
+        let other: [CGWindowID: CGRect] = [10: CGRect(x: 1000, y: 0, width: 200, height: 100)]
+        func plan(_ point: CGPoint, _ release: TiledDropRelease) -> TiledDropPlan {
+            TiledDropPlanner.plan(pointer: point, draggedID: 1, sourceTiles: sourceTiles,
+                                  sourceSlots: slots, release: release)
+        }
+        // a source tile wins, whatever display the release is filed under
+        XCTAssertEqual(plan(CGPoint(x: 111, y: 40), .otherMonitor(slots: other)),
+                       .sameTree(target(2, .left)))
+        // a gap on the source takes nothing
+        XCTAssertEqual(plan(CGPoint(x: 105, y: 40), .source), .none)
+        // the dragged window's own slot is not a target
+        XCTAssertEqual(plan(CGPoint(x: 50, y: 40), .source), .none)
+        // another monitor: its nearest tile, from its padding too
+        XCTAssertEqual(plan(CGPoint(x: 990, y: 50), .otherMonitor(slots: other)),
+                       .otherMonitor(target(10, .left)))
+        // an empty workspace takes the root; a declined one takes nothing
+        XCTAssertEqual(plan(CGPoint(x: 990, y: 50), .otherMonitor(slots: [:])), .otherMonitor(nil))
+        XCTAssertEqual(plan(CGPoint(x: 990, y: 50), .otherMonitor(slots: nil)), .none)
+    }
+
+    func testPlannerSlotsAreTheTreesOwnLayout() {
+        let tree = BSPTree()
+        [makeWindow(id: 10), makeWindow(id: 11)].forEach { _ = tree.insert($0, maxDepth: 3) }
+        let rect = CGRect(x: 1000, y: 0, width: 1000, height: 800)
+        let expected = Dictionary(uniqueKeysWithValues: tree.layout(in: rect, gap: 8, padding: 8)
+            .map { ($0.0.windowID, $0.1) })
+        XCTAssertEqual(TiledDropPlanner.slots(of: tree, in: rect, gap: 8, padding: 8), expected)
+    }
+
     private func nearest(_ pointer: CGPoint) -> TiledDragTarget? {
         TiledDragTargetResolver.nearest(pointer: pointer, slots: slots)
     }

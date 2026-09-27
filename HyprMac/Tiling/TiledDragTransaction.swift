@@ -21,7 +21,7 @@ enum TiledDragMode {
     case crossMonitor(pointer: CGPoint, swapRequested: Bool)
 }
 
-enum TiledDragRejection: Equatable {
+enum TiledDragRejection: Equatable, Error {
     case notTiled
     case floating
     case invalidTarget
@@ -265,53 +265,11 @@ struct TiledDragTransaction {
         guard let mode else {
             return restore(snapshot, reason: .preflight(.noTarget), attempt: attempt)
         }
-        let targetID: CGWindowID?
-        switch mode {
-        case let .insert(id, _), let .swap(id): targetID = id
-        case .resize, .crossMonitor: targetID = nil
-        }
-        guard targetID.map({ $0 != snapshot.draggedID
-            && snapshot.context.memberIDs.contains($0) }) ?? true else {
-            return restore(snapshot, reason: .preflight(.invalidTarget), attempt: attempt)
-        }
-
-        let candidate: BSPTree?
-        switch mode {
-        case let .insert(targetID, edge):
-            candidate = snapshot.originalTree.candidateTree(
-                draggedID: snapshot.draggedID, targetID: targetID,
-                edge: edge, maxDepth: snapshot.context.maxDepth)
-        case let .swap(targetID):
-            let clone = snapshot.originalTree.deepClone()
-            guard let dragged = clone.allWindows.first(where: { $0.windowID == snapshot.draggedID }),
-                  let target = clone.allWindows.first(where: { $0.windowID == targetID }) else {
-                return restore(snapshot, reason: .preflight(.invalidTarget), attempt: attempt)
-            }
-            clone.swap(dragged, target)
-            candidate = clone
-        case let .resize(frame):
-            let clone = snapshot.originalTree.deepClone()
-            guard let dragged = clone.allWindows.first(where: {
-                $0.windowID == snapshot.draggedID
-            }) else {
-                return restore(snapshot, reason: .preflight(.invalidTarget), attempt: attempt)
-            }
-            clone.applyResizeDelta(for: dragged, newFrame: frame,
-                                   in: snapshot.context.usableFrame,
-                                   gap: snapshot.context.gap,
-                                   padding: snapshot.context.padding)
-            candidate = clone
-        case .crossMonitor:
-            // another screen's tree is the engine's to resolve
-            return restore(snapshot, reason: .preflight(.noTarget), attempt: attempt)
-        }
-        guard let candidate else {
-            return restore(snapshot, reason: .preflight(.maxDepthExceeded), attempt: attempt)
-        }
-        guard candidate.root.allLeavesRightToLeft().allSatisfy({
-            $0.depth <= snapshot.context.maxDepth
-        }) else {
-            return restore(snapshot, reason: .preflight(.maxDepthExceeded), attempt: attempt)
+        let candidate: BSPTree
+        switch sameTreeCandidate(snapshot, mode: mode) {
+        case let .success(built): candidate = built
+        case let .failure(rejection):
+            return restore(snapshot, reason: .preflight(rejection), attempt: attempt)
         }
         let layouts = adjustedLayouts(candidate, context: snapshot.context)
         guard valid(layouts, context: snapshot.context, attempt: attempt) else {
@@ -486,77 +444,46 @@ struct TiledDragTransaction {
                           reason: reason, attempt: attempt, candidate: candidate, cross: untouched)
         }
 
-        var moves: [CGWindowID: Int] = [dragged.windowID: target.context.workspace]
-        let sourceCandidate: BSPTree?
-        let targetCandidate: BSPTree?
-        // why a nil target candidate is refused
-        var refusal = TiledDragRejection.invalidTarget
-        let placement: String
-        if targetIDs.isEmpty {
-            sourceCandidate = snapshot.originalTree.candidateTree(removing: dragged.windowID)
-            targetCandidate = target.tree.candidateTree(rootedAt: dragged)
-            placement = "root"
-        } else {
-            let hit = TiledDragTargetResolver.nearest(pointer: pointer, slots: targetOriginals)
+        // the target comes from the tree's own slots, as the live preview's
+        // does, never from the frames just read
+        var hit: TiledDragTarget?
+        if !targetIDs.isEmpty {
+            let slots = TiledDropPlanner.slots(of: target.tree, in: target.context.usableFrame,
+                                               gap: target.context.gap,
+                                               padding: target.context.padding)
+            hit = TiledDropPlanner.otherMonitorTarget(pointer: pointer, slots: slots)
             hyprLog(.notice, .tiling, "tiled drag across monitors targets: dragged=\(dragged.windowID) "
                     + "point=cg(\(Self.traced(pointer.x)),\(Self.traced(pointer.y))) "
-                    + "tiles=[\(TiledDragTargetResolver.trace(pointer: pointer, slots: targetOriginals))] "
+                    + "tiles=[\(TiledDragTargetResolver.trace(pointer: pointer, slots: slots))] "
                     + "chosen=\(hit.map { "\($0.windowID) \($0.edge)" } ?? "none")")
-            guard let hit else { return restoreBoth(.preflight(.noTarget)) }
-            if swapRequested {
-                guard let swapped = targetWindows.first(where: { $0.windowID == hit.windowID }) else {
-                    return restoreBoth(.preflight(.invalidTarget))
-                }
-                sourceCandidate = snapshot.originalTree.candidateTree(replacing: dragged.windowID,
-                                                                      with: swapped)
-                targetCandidate = target.tree.candidateTree(replacing: swapped.windowID, with: dragged)
-                moves[swapped.windowID] = snapshot.context.workspace
-                placement = "swap with \(swapped.windowID)"
-            } else {
-                sourceCandidate = snapshot.originalTree.candidateTree(removing: dragged.windowID)
-                targetCandidate = target.tree.candidateTree(inserting: dragged, beside: hit.windowID,
-                                                            edge: hit.edge,
-                                                            maxDepth: target.context.maxDepth)
-                refusal = .maxDepthExceeded
-                placement = "\(hit.edge) of \(hit.windowID)"
-            }
+            guard hit != nil else { return restoreBoth(.preflight(.noTarget)) }
+        }
+        let built: CrossCandidates
+        switch crossCandidates(snapshot, into: target, hit: hit, swap: swapRequested) {
+        case let .success(value): built = value
+        case let .failure(rejection):
+            hyprLog(.notice, .tiling, "tiled drag across monitors: dragged=\(dragged.windowID) "
+                    + "ws\(snapshot.context.workspace) → ws\(target.context.workspace) "
+                    + "refused: \(rejection)")
+            return restoreBoth(.preflight(rejection))
         }
         hyprLog(.notice, .tiling, "tiled drag across monitors: dragged=\(dragged.windowID) "
                 + "ws\(snapshot.context.workspace) → ws\(target.context.workspace) "
-                + "placement=\(placement)")
-        guard let sourceCandidate else { return restoreBoth(.preflight(.invalidTarget)) }
-        guard let targetCandidate else { return restoreBoth(.preflight(refusal)) }
-        // max splits holds for both screens, including a limit lowered
-        // under an existing tree
-        guard sourceCandidate.root.allLeavesRightToLeft().allSatisfy({
-            $0.depth <= snapshot.context.maxDepth
-        }), targetCandidate.root.allLeavesRightToLeft().allSatisfy({
-            $0.depth <= target.context.maxDepth
-        }) else {
-            return restoreBoth(.preflight(.maxDepthExceeded))
-        }
-        let staying = Set(sourceCandidate.allWindows.map(\.windowID))
-        let arriving = Set(targetCandidate.allWindows.map(\.windowID))
-        guard staying.isDisjoint(with: arriving),
-              staying.union(arriving) == snapshot.context.memberIDs.union(target.context.memberIDs),
-              arriving.contains(dragged.windowID) else {
-            return restoreBoth(.preflight(.invalidTarget))
-        }
-        let sourceLayouts = adjustedLayouts(sourceCandidate, context: snapshot.context)
-        let targetLayouts = adjustedLayouts(targetCandidate, context: target.context)
-        if let crowded = (sourceLayouts + targetLayouts).first(where: { window, frame in
-            let minimum = minimumSize(window)
-            return minimum.width > frame.width + TilingConfig.frameToleranceXPx
-                || minimum.height > frame.height + TilingConfig.frameToleranceXPx
-        }) {
-            hyprLog(.notice, .tiling, "tiled drag across monitors: no room for \(crowded.0.windowID) "
-                    + "min=\(minimumSize(crowded.0)) slot=\(crowded.1.size)")
+                + "placement=\(built.placement)")
+        let sourceCandidate = built.source
+        let targetCandidate = built.target
+        let moves = built.moves
+        let sourceLayouts: [(HyprWindow, CGRect)]
+        let targetLayouts: [(HyprWindow, CGRect)]
+        switch crossLayouts(built, snapshot: snapshot, target: target, attempt: attempt) {
+        case let .fitted(source, arriving):
+            sourceLayouts = source
+            targetLayouts = arriving
+        case let .noRoom(window, slot):
+            hyprLog(.notice, .tiling, "tiled drag across monitors: no room for \(window.windowID) "
+                    + "min=\(minimumSize(window)) slot=\(slot.size)")
             return restoreBoth(.preflight(.noRoom))
-        }
-        guard valid(sourceLayouts, memberIDs: staying, usableFrame: snapshot.context.usableFrame,
-                    gap: snapshot.context.gap, attempt: attempt),
-              valid(targetLayouts, memberIDs: arriving, usableFrame: target.context.usableFrame,
-                    gap: target.context.gap, attempt: attempt) else {
+        case .invalid:
             return restoreBoth(.preflight(.invalidTarget))
         }
         guard isCurrent() else { return .superseded }
@@ -599,6 +526,189 @@ struct TiledDragTransaction {
                                 untouched)
         }
         return restoreBoth(.sizing(reason), candidate: candidateProgress)
+    }
+
+    /// The source tree after a same-tree `mode`, within Max Splits, or why
+    /// the drop refuses it. The drop and its preview both build it here.
+    private func sameTreeCandidate(_ snapshot: TiledDragSnapshot,
+                                   mode: TiledDragMode) -> Result<BSPTree, TiledDragRejection> {
+        let targetID: CGWindowID?
+        switch mode {
+        case let .insert(id, _), let .swap(id): targetID = id
+        case .resize, .crossMonitor: targetID = nil
+        }
+        guard targetID.map({ $0 != snapshot.draggedID
+            && snapshot.context.memberIDs.contains($0) }) ?? true else {
+            return .failure(.invalidTarget)
+        }
+
+        let candidate: BSPTree?
+        switch mode {
+        case let .insert(targetID, edge):
+            candidate = snapshot.originalTree.candidateTree(
+                draggedID: snapshot.draggedID, targetID: targetID,
+                edge: edge, maxDepth: snapshot.context.maxDepth)
+        case let .swap(targetID):
+            let clone = snapshot.originalTree.deepClone()
+            guard let dragged = clone.allWindows.first(where: { $0.windowID == snapshot.draggedID }),
+                  let target = clone.allWindows.first(where: { $0.windowID == targetID }) else {
+                return .failure(.invalidTarget)
+            }
+            clone.swap(dragged, target)
+            candidate = clone
+        case let .resize(frame):
+            let clone = snapshot.originalTree.deepClone()
+            guard let dragged = clone.allWindows.first(where: {
+                $0.windowID == snapshot.draggedID
+            }) else {
+                return .failure(.invalidTarget)
+            }
+            clone.applyResizeDelta(for: dragged, newFrame: frame,
+                                   in: snapshot.context.usableFrame,
+                                   gap: snapshot.context.gap,
+                                   padding: snapshot.context.padding)
+            candidate = clone
+        case .crossMonitor:
+            // another screen's tree is the engine's to resolve
+            return .failure(.noTarget)
+        }
+        guard let candidate else { return .failure(.maxDepthExceeded) }
+        guard candidate.root.allLeavesRightToLeft().allSatisfy({
+            $0.depth <= snapshot.context.maxDepth
+        }) else {
+            return .failure(.maxDepthExceeded)
+        }
+        return .success(candidate)
+    }
+
+    /// Where the dragged window lands for `plan`, from the same candidates
+    /// and layouts the drop builds, without a single AX call. nil when the
+    /// drop would restore. `target` is the release screen's side for an
+    /// `.otherMonitor` plan.
+    func previewFrame(_ snapshot: TiledDragSnapshot, plan: TiledDropPlan, swap: Bool,
+                      target: TiledDragCrossTarget?) -> CGRect? {
+        // frame checks only; nothing here reads or writes a window
+        let attempt = FrameSizingAttempt(io: ioFactory([:]) { snapshot.generation })
+        let layouts: [(HyprWindow, CGRect)]
+        switch plan {
+        case .none:
+            return nil
+        case let .sameTree(hit):
+            let mode: TiledDragMode = swap
+                ? .swap(targetID: hit.windowID) : .insert(targetID: hit.windowID, edge: hit.edge)
+            guard case let .success(candidate) = sameTreeCandidate(snapshot, mode: mode) else {
+                return nil
+            }
+            layouts = adjustedLayouts(candidate, context: snapshot.context)
+            guard valid(layouts, context: snapshot.context, attempt: attempt) else { return nil }
+        case let .otherMonitor(hit):
+            guard let target,
+                  case let .success(built) = crossCandidates(snapshot, into: target, hit: hit,
+                                                             swap: swap),
+                  case let .fitted(_, arriving) = crossLayouts(built, snapshot: snapshot,
+                                                               target: target,
+                                                               attempt: attempt) else { return nil }
+            layouts = arriving
+        }
+        return layouts.first { $0.0.windowID == snapshot.draggedID }?.1
+    }
+
+    private struct CrossCandidates {
+        let source: BSPTree
+        let target: BSPTree
+        let moves: [CGWindowID: Int]
+        let placement: String
+    }
+
+    /// Both trees after a drop onto another monitor's tree, within each
+    /// screen's Max Splits and with every member accounted for, or why the
+    /// drop refuses them. A nil `hit` is an empty tree taking its root. The
+    /// drop and its preview both build them here.
+    private func crossCandidates(_ snapshot: TiledDragSnapshot, into target: TiledDragCrossTarget,
+                                 hit: TiledDragTarget?,
+                                 swap: Bool) -> Result<CrossCandidates, TiledDragRejection> {
+        guard let dragged = snapshot.sourceTree.allWindows.first(where: {
+            $0.windowID == snapshot.draggedID
+        }) else { return .failure(.invalidTarget) }
+        var moves: [CGWindowID: Int] = [dragged.windowID: target.context.workspace]
+        let sourceCandidate: BSPTree?
+        let targetCandidate: BSPTree?
+        // why a nil target candidate is refused
+        var refusal = TiledDragRejection.invalidTarget
+        let placement: String
+        if let hit {
+            if swap {
+                guard let swapped = target.tree.allWindows.first(where: {
+                    $0.windowID == hit.windowID
+                }) else { return .failure(.invalidTarget) }
+                sourceCandidate = snapshot.originalTree.candidateTree(replacing: dragged.windowID,
+                                                                      with: swapped)
+                targetCandidate = target.tree.candidateTree(replacing: swapped.windowID, with: dragged)
+                moves[swapped.windowID] = snapshot.context.workspace
+                placement = "swap with \(swapped.windowID)"
+            } else {
+                sourceCandidate = snapshot.originalTree.candidateTree(removing: dragged.windowID)
+                targetCandidate = target.tree.candidateTree(inserting: dragged, beside: hit.windowID,
+                                                            edge: hit.edge,
+                                                            maxDepth: target.context.maxDepth)
+                refusal = .maxDepthExceeded
+                placement = "\(hit.edge) of \(hit.windowID)"
+            }
+        } else {
+            sourceCandidate = snapshot.originalTree.candidateTree(removing: dragged.windowID)
+            targetCandidate = target.tree.candidateTree(rootedAt: dragged)
+            placement = "root"
+        }
+        guard let sourceCandidate else { return .failure(.invalidTarget) }
+        guard let targetCandidate else { return .failure(refusal) }
+        // max splits holds for both screens, including a limit lowered
+        // under an existing tree
+        guard sourceCandidate.root.allLeavesRightToLeft().allSatisfy({
+            $0.depth <= snapshot.context.maxDepth
+        }), targetCandidate.root.allLeavesRightToLeft().allSatisfy({
+            $0.depth <= target.context.maxDepth
+        }) else {
+            return .failure(.maxDepthExceeded)
+        }
+        let staying = Set(sourceCandidate.allWindows.map(\.windowID))
+        let arriving = Set(targetCandidate.allWindows.map(\.windowID))
+        guard staying.isDisjoint(with: arriving),
+              staying.union(arriving) == snapshot.context.memberIDs.union(target.context.memberIDs),
+              arriving.contains(dragged.windowID) else {
+            return .failure(.invalidTarget)
+        }
+        return .success(CrossCandidates(source: sourceCandidate, target: targetCandidate,
+                                        moves: moves, placement: placement))
+    }
+
+    private enum CrossLayouts {
+        case fitted(source: [(HyprWindow, CGRect)], target: [(HyprWindow, CGRect)])
+        /// a known minimum still overflows this slot after ratio adjustment
+        case noRoom(HyprWindow, CGRect)
+        case invalid
+    }
+
+    /// Both screens' layouts for `built`, with the same known-minimum ratio
+    /// adjustment as any drop.
+    private func crossLayouts(_ built: CrossCandidates, snapshot: TiledDragSnapshot,
+                              target: TiledDragCrossTarget,
+                              attempt: FrameSizingAttempt) -> CrossLayouts {
+        let sourceLayouts = adjustedLayouts(built.source, context: snapshot.context)
+        let targetLayouts = adjustedLayouts(built.target, context: target.context)
+        if let crowded = (sourceLayouts + targetLayouts).first(where: { window, frame in
+            let minimum = minimumSize(window)
+            return minimum.width > frame.width + TilingConfig.frameToleranceXPx
+                || minimum.height > frame.height + TilingConfig.frameToleranceXPx
+        }) {
+            return .noRoom(crowded.0, crowded.1)
+        }
+        guard valid(sourceLayouts, memberIDs: Set(built.source.allWindows.map(\.windowID)),
+                    usableFrame: snapshot.context.usableFrame, gap: snapshot.context.gap,
+                    attempt: attempt),
+              valid(targetLayouts, memberIDs: Set(built.target.allWindows.map(\.windowID)),
+                    usableFrame: target.context.usableFrame, gap: target.context.gap,
+                    attempt: attempt) else { return .invalid }
+        return .fitted(source: sourceLayouts, target: targetLayouts)
     }
 
     private func isCurrent(_ snapshot: TiledDragSnapshot,
