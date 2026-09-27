@@ -304,6 +304,7 @@ class WindowManager {
         scratchpad.updatePositionCache = { [weak self] in self?.updatePositionCache() }
         scratchpad.updateFocusBorder = { [weak self] w in self?.updateFocusBorder(for: w) }
         scratchpad.refocusUnderCursor = { [weak self] in self?.mouseTracker.refocusUnderCursor() }
+        scratchpad.isNeverTile = { [weak self] w in self?.floatingController.isNeverTile(w) ?? false }
         scratchpad.animatedRetile = { [weak self] prepare, completion in
             self?.animatedRetile(prepare: prepare, completion: completion)
         }
@@ -415,6 +416,7 @@ class WindowManager {
         floatingController.updatePositionCache = { [weak self] in self?.updatePositionCache() }
         floatingController.isMenuTracking = { [weak self] in self?.mouseTracker.menuTracking ?? false }
         floatingController.isScratchpadVisible = { [weak self] in self?.scratchpad.isVisible ?? false }
+        floatingController.excludedBundleIDs = { [weak self] in Set(self?.config.excludedBundleIDs ?? []) }
         floatingController.findPopup = { [weak self] windows, front in
             self?.mouseTracker.livePopup(in: windows, frontmostPID: front)
         }
@@ -531,6 +533,18 @@ class WindowManager {
         actionDispatcher.enforceScratchpadFocus = { [weak self] in self?.scratchpad.enforceFocus() }
         actionDispatcher.saveLayout = { [weak self] in self?.saveLayoutSnapshot(manual: true) }
         actionDispatcher.restoreLayout = { [weak self] in self?.restoreLayoutSnapshot(manual: true) }
+        actionDispatcher.retileAll = { [weak self] in self?.retileAllRequested() }
+        actionDispatcher.followPinnedWindow = { [weak self] windowID, workspace in
+            guard let self else { return }
+            // a workspace switch like any other: not mid-transition, and the
+            // scratchpad layer doesn't survive it
+            guard !self.displayTransitionPending else {
+                hyprLog(.notice, .lifecycle, "window rule follow dropped mid-display-transition")
+                return
+            }
+            self.scratchpad.hide(reason: .workspaceAction)
+            self.workspaceOrchestrator.switchWorkspace(workspace, preferredWindowID: windowID)
+        }
 
         configureLiveConfigUpdates()
         hotkeyManager.updateHyprKey(config.hyprKey)
@@ -2070,6 +2084,9 @@ class WindowManager {
             excludedWindowIDs: excludedWids
         )
 
+        // floaters first: the tiled pass below can return early
+        placePinnedFloaters(allWindows)
+
         guard !tilingWids.isEmpty else { return }
 
         let plan = startupPlacement(windowIDs: tilingWids, windows: allWindows, screens: screens)
@@ -2103,6 +2120,30 @@ class WindowManager {
         }
 
         hyprLog(.debug, .lifecycle, "distributed \(tilingWids.count) windows across \(plan.assignments.count) slot(s), \(screens.count) monitor(s)")
+    }
+
+    /// Retile All's half of window rules for floaters: a pinned app's
+    /// floating window (Never tile, fixed size) goes to its pin too. Hidden
+    /// windows keep their workspace, scratchpad members stay in the layer,
+    /// and a floater on a disabled monitor stays there.
+    private func placePinnedFloaters(_ allWindows: [HyprWindow]) {
+        guard !config.windowRules.isEmpty else { return }
+        let byID = Dictionary(allWindows.map { ($0.windowID, $0) }, uniquingKeysWith: { first, _ in first })
+        let candidates = stateCache.floatingWindowIDs.filter { id in
+            guard let window = byID[id], !stateCache.hiddenWindowIDs.contains(id),
+                  !scratchpad.contains(id) else { return false }
+            return displayManager.screen(for: window).map(workspaceManager.isMonitorDisabled) != true
+        }
+        let moves = RetileAllPlanner.pinnedFloaterMoves(
+            floatingWindowIDs: Array(candidates),
+            workspaceFor: workspaceManager.workspaceFor,
+            pinnedWorkspaceFor: { [self] id in byID[id].flatMap(actionDispatcher.pinnedWorkspace(for:)) }
+        )
+        for move in moves {
+            guard let window = byID[move.windowID] else { continue }
+            workspaceManager.moveWindow(move.windowID, toWorkspace: move.to)
+            workspaceOrchestrator.placePinnedFloater(window, onWorkspace: move.to, fromWorkspace: move.from)
+        }
     }
 
     /// Resolve a window by ID against a fresh list, falling back to the
@@ -2369,7 +2410,7 @@ class WindowManager {
     static func isDroppedMidDisplayTransition(_ action: Action) -> Bool {
         switch action {
         case .switchWorkspace, .moveToWorkspace, .moveToWorkspaceAndFollow, .moveWindowToMonitor,
-             .cycleWorkspace, .moveToNextEmptyWorkspace, .saveLayout, .restoreLayout:
+             .cycleWorkspace, .moveToNextEmptyWorkspace, .saveLayout, .restoreLayout, .retileAll:
             return true
         default:
             return false
@@ -3418,18 +3459,31 @@ private extension WindowManager {
             window.frame.map { (window.windowID, $0) }
         })
         let focusedID = accessibility.getFocusedWindow()?.windowID
-        let batches = screens.map { screen in
-            let localIDs = windowIDs.filter { id in
+        let order = { (ids: [CGWindowID]) in
+            RetileAllPlanner.startupWindowOrder(windowIDs: ids, framesByID: frames, focusedWindowID: focusedID)
+        }
+        // pinned apps' windows go to their rule's workspace, whichever display
+        // they sit on, and claim it before the screen batches fill it. a
+        // parked window AX omits is looked up in the cache
+        let pinned = RetileAllPlanner.pinnedStartupBatches(
+            windowIDs: windowIDs,
+            pinnedWorkspaceFor: { [self] id in
+                (byID[id] ?? stateCache.cachedWindows[id]).flatMap(actionDispatcher.pinnedWorkspace(for:))
+            },
+            order: order
+        )
+        let screenBatches = screens.map { screen in
+            let localIDs = pinned.unpinned.filter { id in
                 let assignedHome = workspaceManager.workspaceFor(id).flatMap(workspaceManager.homeScreenForWorkspace)
                 let home = assignedHome ?? byID[id].flatMap(displayManager.screen(for:)) ?? screens[0]
                 return home == screen
             }
             return RetileAllBatch(
                 preferredWorkspace: workspaceManager.workspaceForScreen(screen),
-                windowIDs: RetileAllPlanner.startupWindowOrder(
-                    windowIDs: localIDs, framesByID: frames, focusedWindowID: focusedID)
+                windowIDs: order(localIDs)
             )
         }
+        let batches = pinned.batches + screenBatches
         let reserved = Dictionary(uniqueKeysWithValues: Constants.workspaceRange.map { workspace in
             (workspace, workspaceManager.windowIDs(onWorkspace: workspace)
                 .intersection(stateCache.reservedHiddenWindowIDs)

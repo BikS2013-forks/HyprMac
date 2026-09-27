@@ -81,6 +81,10 @@ extension Keybind {
         binds.append(Keybind(keyCode: UInt16(kVK_ANSI_R), modifiers: [.hypr, .control],
                              action: .restoreLayout))
 
+        // hypr + shift + r: retile all spaces (also re-applies workspace pins)
+        binds.append(Keybind(keyCode: UInt16(kVK_ANSI_R), modifiers: [.hypr, .shift],
+                             action: .retileAll))
+
         // hypr + t: toggle floating
         binds.append(Keybind(keyCode: UInt16(kVK_ANSI_T), modifiers: .hypr,
                              action: .toggleFloating))

@@ -20,6 +20,9 @@ enum FloatingAdmissionPolicy {
         if isSizeSettable == false { return .fixedSize }
         return nil
     }
+
+    /// Shown when the user tries to tile a window of an app in Never tile.
+    static let neverTileMessage = "App not allowed to tile. Change it in Settings"
 }
 
 /// Every frame HyprMac writes to a floating window goes through here: the
@@ -248,6 +251,8 @@ final class FloatingWindowController {
     var updatePositionCache: (() -> Void)?
     var isMenuTracking: () -> Bool = { false }
     var isScratchpadVisible: () -> Bool = { false }
+    // the Never tile list, read live so a settings change applies at once
+    var excludedBundleIDs: () -> Set<String> = { [] }
     var windowListForZOrder: () -> [[String: Any]]? = {
         CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
@@ -351,6 +356,15 @@ final class FloatingWindowController {
             if let frame = window.frame ?? stateCache.cachedWindows[window.windowID]?.frame {
                 focusBorder.flashError(around: frame, windowID: window.windowID, window: window,
                                        message: "Quick Look previews stay floating")
+            }
+            return
+        }
+        if wasFloating && isNeverTile(window) {
+            // the user put this app in Never tile. say so, and where to change it
+            hyprLog(.notice, .floating, "float→tile refused: \(window.windowID) belongs to a never-tile app")
+            if let frame = window.frame ?? stateCache.cachedWindows[window.windowID]?.frame {
+                focusBorder.flashError(around: frame, windowID: window.windowID, window: window,
+                                       message: FloatingAdmissionPolicy.neverTileMessage)
             }
             return
         }
@@ -795,6 +809,13 @@ final class FloatingWindowController {
             }
             self.onRestack()
         }
+    }
+
+    /// Whether `window` belongs to an app in the Never tile list.
+    func isNeverTile(_ window: HyprWindow) -> Bool {
+        guard let bundleID = window.bundleID
+                ?? NSRunningApplication(processIdentifier: window.ownerPID)?.bundleIdentifier else { return false }
+        return excludedBundleIDs().contains(bundleID)
     }
 
     /// `true` when `window` should auto-float on first discovery.

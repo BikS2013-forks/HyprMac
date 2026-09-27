@@ -123,11 +123,12 @@ final class WorkspaceOrchestrator {
         // the desired end state. Repeated Hypr+F is therefore a no-op, even if
         // that sole window is currently floating.
         guard sourceIDs.count > 1 else { return }
-        guard FloatingAdmissionPolicy.reason(
+        if let reason = FloatingAdmissionPolicy.reason(
             isExcluded: focused.bundleID.map(excludedBundleIDs().contains) ?? false,
             isSizeSettable: focused.isSizeSettable
-        ) == nil else {
-            rejectTransfer(focused, message: "This window cannot be tiled")
+        ) {
+            rejectTransfer(focused, message: reason == .excludedApp
+                ? FloatingAdmissionPolicy.neverTileMessage : "This window cannot be tiled")
             return
         }
         // a workspace with nothing on screen is empty, same as the menu bar:
@@ -463,8 +464,10 @@ final class WorkspaceOrchestrator {
         hyprLog(.notice, .workspace, "moveToWorkspace(\(number)): '\(focused.title ?? "?")' (\(focused.windowID)) floating=\(isFloating) follow=\(follow) currentWs=\(currentWorkspace.map(String.init) ?? "nil") srcScreen=\(screen.localizedName)")
 
         // when coming from disabled monitor, unfloat so it enters tiling on
-        // target. a quick look preview stays floating wherever it goes.
-        let willTile = (onDisabledMonitor || !isFloating) && !focused.isQuickLookPanel
+        // target. a quick look preview, or an app in Never tile, stays
+        // floating wherever it goes.
+        let isNeverTile = focused.bundleID.map(excludedBundleIDs().contains) ?? false
+        let willTile = ((onDisabledMonitor && !isNeverTile) || !isFloating) && !focused.isQuickLookPanel
 
         // target screen is the workspace's static home — same answer
         // whether the workspace is currently visible or hidden.
@@ -541,7 +544,7 @@ final class WorkspaceOrchestrator {
         }
 
         // unfloat if coming from disabled monitor
-        if onDisabledMonitor && isFloating && !focused.isQuickLookPanel {
+        if onDisabledMonitor && isFloating && willTile {
             stateCache.floatingWindowIDs.remove(focused.windowID)
             focused.isFloating = false
             hyprLog(.debug, .workspace, "unfloating '\(focused.title ?? "?")' from disabled monitor → workspace \(number)")
@@ -593,6 +596,13 @@ final class WorkspaceOrchestrator {
                 // monitor so the next show is a single-screen transition).
                 if isFloating && !onDisabledMonitor {
                     workspaceManager.saveFloatingFrame(focused)
+                } else if isFloating && isNeverTile, let frame = focused.frame {
+                    // still floating off a disabled monitor: save a frame on
+                    // the target's display for the reveal to restore
+                    workspaceManager.setSavedFloatingFrame(
+                        Self.carriedFloaterFrame(frame, from: displayManager.cgRect(for: screen),
+                                                 to: displayManager.cgRect(for: targetScreen)),
+                        for: focused.windowID)
                 }
                 hyprLog(.notice, .workspace, "moveToWorkspace(\(number)): parking '\(focused.title ?? "?")' (\(focused.windowID)) homeScreen=\(targetScreen.localizedName) at \(workspaceManager.hidePosition())")
                 workspaceManager.hideInCorner(focused, on: targetScreen)
@@ -673,7 +683,18 @@ final class WorkspaceOrchestrator {
         if frame.isSubstantiallyVisible(on: targetRect, threshold: 0.5) { return frame }
 
         let sourceScreen = displayManager.screen(for: window) ?? screen
-        let sourceRect = displayManager.cgRect(for: sourceScreen)
+        let carried = window.placeFloating(
+            Self.carriedFloaterFrame(frame, from: displayManager.cgRect(for: sourceScreen), to: targetRect),
+            reason: "carry to another screen", on: screen, from: frame, displayManager: displayManager)
+        return carried
+    }
+
+    /// Where a floater at `frame` lands when carried from the screen at
+    /// `sourceRect` to the one at `targetRect`: the same size, capped to the
+    /// target, at the same relative position, clamped inside it. Unchanged
+    /// when the frame is already mostly on the target.
+    static func carriedFloaterFrame(_ frame: CGRect, from sourceRect: CGRect, to targetRect: CGRect) -> CGRect {
+        if frame.isSubstantiallyVisible(on: targetRect, threshold: 0.5) { return frame }
         let relX = sourceRect.width > 0 ? (frame.midX - sourceRect.minX) / sourceRect.width : 0.5
         let relY = sourceRect.height > 0 ? (frame.midY - sourceRect.minY) / sourceRect.height : 0.5
         let size = CGSize(width: min(frame.width, targetRect.width),
@@ -682,9 +703,40 @@ final class WorkspaceOrchestrator {
                              y: targetRect.minY + relY * targetRect.height - size.height / 2)
         origin.x = max(targetRect.minX, min(origin.x, targetRect.maxX - size.width))
         origin.y = max(targetRect.minY, min(origin.y, targetRect.maxY - size.height))
-        let carried = window.placeFloating(CGRect(origin: origin, size: size), reason: "carry to another screen",
-                                           on: screen, from: frame, displayManager: displayManager)
-        return carried
+        return CGRect(origin: origin, size: size)
+    }
+
+    /// Seat a floater on the workspace its app is pinned to. Membership is
+    /// the caller's. The frame is worked out from what is known, never read
+    /// back after a write (AX reads lag writes on Tahoe): a parked floater
+    /// starts from its saved frame, anything else from its live one. That
+    /// frame is carried onto the workspace's display, then either placed
+    /// there or, when the workspace is hidden, saved for the reveal while
+    /// the window parks.
+    func placePinnedFloater(_ window: HyprWindow, onWorkspace workspace: Int, fromWorkspace source: Int?) {
+        guard let home = workspaceManager.homeScreenForWorkspace(workspace) else { return }
+        let id = window.windowID
+        let parked = source.map { !workspaceManager.isWorkspaceVisible($0) } ?? false
+        let start = parked ? workspaceManager.savedFloatingFrame(for: id) : window.frame
+        let targetVisible = workspaceManager.isWorkspaceVisible(workspace)
+        hyprLog(.notice, .workspace, "window rule: floater '\(window.title ?? "?")' (\(id)) → ws\(workspace)"
+                + " visible=\(targetVisible) parked=\(parked)")
+        guard let start else {
+            // nothing known to carry: park it, and the reveal leaves it where it is
+            if !targetVisible { workspaceManager.hideInCorner(window, on: home) }
+            return
+        }
+        let sourceRect = displayManager.screen(at: CGPoint(x: start.midX, y: start.midY))
+            .map(displayManager.cgRect(for:)) ?? displayManager.cgRect(for: home)
+        let carried = Self.carriedFloaterFrame(start, from: sourceRect, to: displayManager.cgRect(for: home))
+        if targetVisible {
+            workspaceManager.clearSavedFloatingFrame(for: id)
+            window.placeFloating(carried, reason: "window rule", on: home, from: start,
+                                 displayManager: displayManager)
+        } else {
+            workspaceManager.setSavedFloatingFrame(carried, for: id)
+            workspaceManager.hideInCorner(window, on: home)
+        }
     }
 
     /// Where the cursor goes when focus follows `window` to `workspace` on

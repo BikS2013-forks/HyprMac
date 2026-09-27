@@ -64,6 +64,8 @@ final class ScratchpadController {
     var updatePositionCache: () -> Void = {}
     var updateFocusBorder: (HyprWindow) -> Void = { _ in }
     var refocusUnderCursor: () -> Void = {}
+    // the app is in Never tile: the layer keeps it floating
+    var isNeverTile: (HyprWindow) -> Bool = { _ in false }
     var raiseScrim: () -> Void = {}
     /// Order the scrim panels directly below this window (cross-app window
     /// number). The settle passes use it to tuck the scrim under the
@@ -467,7 +469,7 @@ final class ScratchpadController {
             return
         }
         let entryMode = Self.entryMode(isExistingMember: contains(id),
-                                       tileByDefault: tileNewMembers)
+                                       tileByDefault: tileNewMembers && !isNeverTile(focused))
         if entryMode == .preserve {
             // parked member (layer hidden, or minimized through a show) —
             // already where it belongs
@@ -606,6 +608,9 @@ final class ScratchpadController {
             tilingEngine.removeWindow(focused, fromWorkspace: Self.workspace)
         }
 
+        // a floating member of a never-tile app leaves the layer floating
+        let staysFloating = isNeverTile(focused)
+
         // drop membership first so hide() parks only the remaining members
         summonedIDs.remove(id)
         mruOrder.removeAll { $0 == id }
@@ -615,7 +620,7 @@ final class ScratchpadController {
         hide(reason: .workspaceAction)
 
         animatedRetile({ [weak self] in
-            guard let self else { return }
+            guard let self, !staysFloating else { return }
             stateCache.floatingWindowIDs.remove(id)
             focused.isFloating = false
         }, { [weak self] in
@@ -663,6 +668,17 @@ final class ScratchpadController {
             noteFocus(id)
             updatePositionCache()
             hyprLog(.notice, .lifecycle, "scratchpad: untiled '\(focused.title ?? "?")' (\(id)) → floating")
+            return true
+        }
+
+        if isNeverTile(focused) {
+            if let f = focused.frame {
+                focusBorder.flashError(around: f, windowID: id, window: focused,
+                                       message: FloatingAdmissionPolicy.neverTileMessage)
+            } else {
+                NSSound.beep()
+            }
+            hyprLog(.notice, .lifecycle, "scratchpad: tile refused for never-tile app '\(focused.title ?? "?")' (\(id))")
             return true
         }
 

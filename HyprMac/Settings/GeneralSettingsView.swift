@@ -3,8 +3,8 @@
 import SwiftUI
 
 /// "General" tab. Enable toggle, accessibility status,
-/// focus-follows-mouse, never-tile list, System panel (menu bar
-/// indicator, iCloud sync, launch-at-login), and a footer with
+/// focus-follows-mouse, never-tile list, workspace pins, System panel
+/// (menu bar indicator, iCloud sync, launch-at-login), and a footer with
 /// replay-the-tour + reset.
 struct GeneralSettingsView: View {
     let showTutorial: () -> Void
@@ -17,6 +17,7 @@ struct GeneralSettingsView: View {
             statusPanel
             mousePanel
             neverTilePanel
+            workspacePinsPanel
             systemPanel
             layoutsPanel
             footerPanel
@@ -143,6 +144,78 @@ struct GeneralSettingsView: View {
         }
     }
 
+    // MARK: workspace pins
+
+    private var workspacePinsPanel: some View {
+        HyprPanel("Pin apps to workspaces",
+                  footer: "New windows from these apps open on the chosen workspace, and HyprMac "
+                        + "switches to it. Retile all spaces also moves their open windows there.") {
+            if config.windowRules.isEmpty {
+                HyprRow("No pinned apps", icon: "pin.slash",
+                        subtitle: "New windows open on the display they appear on", divider: false) { EmptyView() }
+            } else {
+                let sorted = config.windowRules.sorted {
+                    appDisplayName(for: $0.bundleID).localizedCaseInsensitiveCompare(
+                        appDisplayName(for: $1.bundleID)) == .orderedAscending
+                }
+                ForEach(Array(sorted.enumerated()), id: \.element.id) { idx, rule in
+                    pinnedRow(rule: rule, isLast: idx == sorted.count - 1)
+                }
+            }
+            HyprRow("Add app", icon: "plus", divider: false) {
+                Button("Choose…") { pickPinnedApp() }
+                    .controlSize(.small)
+            }
+        }
+    }
+
+    private func pinnedRow(rule: WindowRule, isLast: Bool) -> some View {
+        HStack(spacing: HyprSpacing.md) {
+            if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: rule.bundleID) {
+                Image(nsImage: NSWorkspace.shared.icon(forFile: url.path))
+                    .resizable()
+                    .frame(width: 22, height: 22)
+            } else {
+                Image(systemName: "app").font(.system(size: 16)).foregroundStyle(Color.hyprTextTertiary)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(appDisplayName(for: rule.bundleID)).font(.hyprBody)
+                Text(rule.bundleID).font(.hyprMonoXs).foregroundStyle(Color.hyprTextTertiary)
+            }
+            Spacer()
+            Picker("", selection: Binding(
+                get: { rule.workspace },
+                set: { setPinnedWorkspace($0, for: rule.bundleID) }
+            )) {
+                ForEach(Constants.workspaceRange, id: \.self) { Text("Workspace \($0)").tag($0) }
+            }
+            .labelsHidden()
+            .fixedSize()
+            Button {
+                config.windowRules.removeAll { $0.bundleID == rule.bundleID }
+            } label: {
+                Image(systemName: "minus.circle.fill")
+                    .foregroundStyle(.red.opacity(0.75))
+            }
+            .buttonStyle(.borderless)
+        }
+        .padding(.horizontal, HyprSpacing.md)
+        .padding(.vertical, HyprSpacing.sm)
+        .overlay(alignment: .bottom) {
+            if !isLast {
+                Rectangle()
+                    .fill(Color.hyprSeparator)
+                    .frame(height: 0.5)
+                    .padding(.leading, HyprSpacing.md + 22 + HyprSpacing.md)
+            }
+        }
+    }
+
+    private func setPinnedWorkspace(_ workspace: Int, for bundleID: String) {
+        guard let index = config.windowRules.firstIndex(where: { $0.bundleID == bundleID }) else { return }
+        config.windowRules[index].workspace = workspace
+    }
+
     // MARK: system — menu bar + iCloud + login items
 
     private var systemPanel: some View {
@@ -257,6 +330,22 @@ struct GeneralSettingsView: View {
         if panel.runModal() == .OK, let url = panel.url,
            let bundle = Bundle(url: url), let id = bundle.bundleIdentifier {
             config.excludedBundleIDs.insert(id)
+        }
+    }
+
+    // one rule per app: picking an app that already has one leaves it as is
+    private func pickPinnedApp() {
+        let panel = NSOpenPanel()
+        panel.title = "Select Application to Pin"
+        panel.allowedContentTypes = [.application]
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.canChooseDirectories = false
+
+        if panel.runModal() == .OK, let url = panel.url,
+           let bundle = Bundle(url: url), let id = bundle.bundleIdentifier,
+           !config.windowRules.contains(where: { $0.bundleID == id }) {
+            config.windowRules.append(WindowRule(bundleID: id, workspace: 1))
         }
     }
 }

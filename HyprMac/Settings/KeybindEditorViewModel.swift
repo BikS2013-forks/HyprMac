@@ -47,6 +47,7 @@ final class KeybindEditorViewModel: ObservableObject {
         case runCommand             = "Run a command"
         case saveLayout             = "Save Layout"
         case restoreLayout          = "Restore Layout"
+        case retileAll              = "Retile All Spaces"
     }
 
     /// nil unless the command action is selected and its line is unusable
@@ -93,6 +94,7 @@ final class KeybindEditorViewModel: ObservableObject {
             commandParam = cmd
         case .saveLayout:                    selectedAction = .saveLayout
         case .restoreLayout:                 selectedAction = .restoreLayout
+        case .retileAll:                     selectedAction = .retileAll
         }
     }
 
@@ -129,6 +131,7 @@ final class KeybindEditorViewModel: ObservableObject {
                 command: commandParam.trimmingCharacters(in: .whitespaces))
         case .saveLayout:             action = .saveLayout
         case .restoreLayout:          action = .restoreLayout
+        case .retileAll:              action = .retileAll
         }
         return Keybind(keyCode: recordedKeyCode, modifiers: mods, action: action)
     }

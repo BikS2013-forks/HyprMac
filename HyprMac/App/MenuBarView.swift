@@ -140,6 +140,10 @@ struct MenuBarView: View {
             }
             MenuBarRow("Retile all spaces", icon: "rectangle.3.group") {
                 NotificationCenter.default.post(name: .hyprMacRetileAll, object: nil)
+            } trailing: {
+                if let binding = config.keybinds.first(where: { $0.action == .retileAll }) {
+                    KeybadgeView(bind: binding, fontSize: 11)
+                }
             }
             #if !HYPRMAC_DEBUG_VARIANT
             MenuBarRow("Check for updates…", icon: "arrow.down.circle") {
