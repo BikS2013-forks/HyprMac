@@ -928,6 +928,43 @@ now adjust their private ratios for known minimum sizes before AX writes,
 then pass through the existing readback and restoration checks. This does
 not publish unverified frames or change admission recovery.
 
+### Tiled drag decisions and drops across monitors
+
+Every tiled release logs its decision at `.notice` under `category: tiling`,
+in this order. Points and frames are global CG coordinates (top-left origin).
+
+- `tiled drag release: dragged=<id> point=cg(<x>,<y>) source=ws<N> on
+  '<name>' display=<n> full=<rect> sourceTiles=<rect> onSourceTiles=<bool>
+  release='<name>' display=<n> full=<rect> sameTree=<id edge|none>`. When
+  the point is on the source tiles it adds `tiles=[…]`, one entry per source
+  tile.
+- `tiled drag mode: dragged=<id> swap=<bool> mode=<insert(<id> <edge>)|swap(<id>)|crossMonitor|none …>`.
+- For `crossMonitor`, WindowManager may log `tiled drag across monitors
+  refused on '<name>': <reason>` (a disabled monitor, the scratchpad). The
+  engine then logs either `tiled drag across monitors declined: …
+  reason=<…>`, and the release restores, or `tiled drag across monitors
+  target: … ws<N> on '<name>' members=[…]`.
+- `tiled drag settle read: dragged=<id> original=<rect> read=<rect> dw=<n>
+  dh=<n> resized=<bool> centerOnSource=<bool> decision=<…>`. This is the read
+  100 ms after release. A width or height change over 20 points makes a
+  resize candidate, and one centred off the source tiles restores. A failed
+  read logs `tiled drag settle read failed: … reason=<trace>` instead.
+- For a plain move across monitors:
+  - `tiled drag across monitors targets: point=cg(…) tiles=[<id>
+    frame=(x,y,w,h) dist=<d> l=<> r=<> t=<> b=<>; …] chosen=<id> <edge>`. The
+    four fractions are the normalized distances to each edge, measured from
+    the point clamped into that tile. The smallest picks the edge, with ties
+    going left, right, top, bottom.
+  - Then `tiled drag across monitors: … placement=<edge> of <id>|swap with
+    <id>|root`.
+
+Failure reasons print raw AX codes, for example `writeFailed(77705, -25204)`
+(`-25204` is `kAXErrorCannotComplete`, what an AX messaging timeout
+returns). A drag call that times out gets one longer try, logged as `frame
+attempt AX timeout recovery: phase=<capture|candidate|restoration>
+reason=<trace> ids=[…] timeout=250ms deadline=750ms`, then `… accepted` or
+`… refused: reason=<trace>`.
+
 ### Tab detach followed by a false restoration warning
 
 A September 15, 2026 capture separates two Safari events. Window `64757`

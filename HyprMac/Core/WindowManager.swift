@@ -3220,9 +3220,13 @@ private extension WindowManager {
                 }
                 return outcome
             },
-            resolveTarget: { pointer, snapshot in
-                guard snapshot.context.usableFrame.contains(pointer) else { return nil }
-                return TiledDragTargetResolver.resolve(pointer: pointer, snapshot: snapshot)
+            resolveTarget: { [weak self] pointer, snapshot in
+                let onSourceTiles = snapshot.context.usableFrame.contains(pointer)
+                let target = onSourceTiles
+                    ? TiledDragTargetResolver.resolve(pointer: pointer, snapshot: snapshot) : nil
+                self?.noteTiledDragRelease(pointer, snapshot: snapshot,
+                                           onSourceTiles: onSourceTiles, target: target)
+                return target
             },
             schedule: { delay, work in
                 DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
@@ -3243,6 +3247,31 @@ private extension WindowManager {
     private func exactScreen(containing point: CGPoint) -> NSScreen? {
         let matches = displayManager.screens.filter { displayManager.cgRect(for: $0).contains(point) }
         return matches.count == 1 ? matches[0] : nil
+    }
+
+    /// One notice line per tiled release: the point in global CG coordinates,
+    /// the source and release screens, and the same-tree target with every
+    /// source tile it weighed. The drop decision reads from here.
+    private func noteTiledDragRelease(_ pointer: CGPoint, snapshot: TiledDragSnapshot,
+                                      onSourceTiles: Bool, target: TiledDragTarget?) {
+        func describe(_ screen: NSScreen?) -> String {
+            guard let screen else { return "none" }
+            return "'\(screen.localizedName)' display=\(tiledDragDisplayID(screen)) "
+                + "full=\(displayManager.cgFullRect(for: screen))"
+        }
+        let source = displayManager.screens.first {
+            tiledDragDisplayID($0) == snapshot.context.physicalDisplayID
+        }
+        var slots = snapshot.originalFrames
+        slots.removeValue(forKey: snapshot.draggedID)
+        let tiles = onSourceTiles
+            ? " tiles=[\(TiledDragTargetResolver.trace(pointer: pointer, slots: slots))]" : ""
+        hyprLog(.notice, .tiling, "tiled drag release: dragged=\(snapshot.draggedID) "
+                + String(format: "point=cg(%g,%g) ", Double(pointer.x), Double(pointer.y))
+                + "source=ws\(snapshot.context.workspace) on \(describe(source)) "
+                + "sourceTiles=\(snapshot.context.usableFrame) onSourceTiles=\(onSourceTiles) "
+                + "release=\(describe(exactFullScreen(containing: pointer))) "
+                + "sameTree=\(target.map { "\($0.windowID) \($0.edge)" } ?? "none")" + tiles)
     }
 
     /// The one screen whose whole display holds `point`, menu bar and Dock
@@ -3359,10 +3388,10 @@ private extension WindowManager {
                 + "outcome=\(Self.outcomeName(completion.outcome))")
         switch outcome {
         case let .rejectedRestored(reason, frames):
-            hyprLog(.notice, .tiling, "tiled drag\(scope) rejected and restored: reason=\(reason) actual=\(frames)")
+            hyprLog(.notice, .tiling, "tiled drag\(scope) rejected and restored: reason=\(reason.trace) actual=\(frames)")
         case let .degraded(candidateReason, restorationReason, frames, progress):
-            let candidate = String(describing: candidateReason)
-            let restoration = String(describing: restorationReason)
+            let candidate = candidateReason?.trace ?? "nil"
+            let restoration = restorationReason?.trace ?? "nil"
             let written = (progress?.possiblyWritten ?? []).sorted()
             hyprLog(.notice, .tiling, "tiled drag\(scope) degraded: candidate=\(candidate) restoration=\(restoration) "
                     + "written=\(written) actual=\(frames)")

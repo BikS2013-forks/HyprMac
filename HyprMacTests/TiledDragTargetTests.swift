@@ -85,6 +85,16 @@ final class TiledDragTargetTests: XCTestCase {
         XCTAssertNil(nearest(CGPoint(x: CGFloat.nan, y: 40)))
     }
 
+    func testTraceListsEveryTileWithItsDistanceAndEdgeFractions() {
+        let trace = TiledDragTargetResolver.trace(
+            pointer: CGPoint(x: 205, y: 40),
+            slots: [2: CGRect(x: 110, y: 0, width: 100, height: 80),
+                    1: CGRect(x: 0, y: 0, width: 100, height: 80)])
+        XCTAssertEqual(trace,
+                       "1 frame=(0,0,100,80) dist=105 l=1.000 r=0.000 t=0.500 b=0.500; "
+                       + "2 frame=(110,0,100,80) dist=0 l=0.950 r=0.050 t=0.500 b=0.500")
+    }
+
     private func nearest(_ pointer: CGPoint) -> TiledDragTarget? {
         TiledDragTargetResolver.nearest(pointer: pointer, slots: slots)
     }

@@ -34,6 +34,14 @@ enum TiledDragRejection: Equatable {
 enum TiledDragFailure: Equatable {
     case preflight(TiledDragRejection)
     case sizing(FrameSizingFailure)
+
+    /// the failure with raw AX codes, for logs
+    var trace: String {
+        switch self {
+        case let .preflight(rejection): return "preflight(\(rejection))"
+        case let .sizing(failure): return "sizing(\(failure.trace))"
+        }
+    }
 }
 
 struct TiledDragSnapshot {
@@ -292,7 +300,7 @@ struct TiledDragTransaction {
             return restore(snapshot, reason: .preflight(.invalidTarget), attempt: attempt)
         }
         guard isCurrent(snapshot, currentContext: currentContext) else { return .superseded }
-        let transaction = FrameSizingTransaction(attempt: attempt)
+        let transaction = FrameSizingTransaction(attempt: attempt, recoversTimeouts: true)
         let result = transaction.apply(
             targets: layouts.map { .init(windowID: $0.0.windowID, frame: $0.1) },
             originalFrames: snapshot.originalFrames,
@@ -331,8 +339,8 @@ struct TiledDragTransaction {
                 ? snapshot.generation : snapshot.generation &+ 1
         }
         let attempt = FrameSizingAttempt(io: io)
-        let classified = attempt.captureFrames(windowIDs: [snapshot.draggedID],
-                                               generation: snapshot.generation)
+        let classified = FrameSizingTransaction(attempt: attempt, recoversTimeouts: true)
+            .capture(windowIDs: [snapshot.draggedID], generation: snapshot.generation)
         guard case .accepted = classified.verdict,
               let frame = classified.actualFrames[snapshot.draggedID] else {
             let failure: FrameSizingFailure
@@ -341,6 +349,8 @@ struct TiledDragTransaction {
             case let .rejected(reason), let .unknown(reason): failure = reason
             }
             if failure == .superseded { return .superseded }
+            hyprLog(.notice, .tiling, "tiled drag settle read failed: dragged=\(snapshot.draggedID) "
+                    + "reason=\(failure.trace) — restoring")
             return restore(snapshot, reason: .sizing(failure), attempt: attempt)
         }
         guard isCurrent(snapshot, currentContext: currentContext) else { return .superseded }
@@ -349,18 +359,36 @@ struct TiledDragTransaction {
             abs(frame.size.width - $0.size.width) > 20
                 || abs(frame.size.height - $0.size.height) > 20
         } ?? false
-        if resized, case nil = mode,
-           !snapshot.context.usableFrame.contains(CGPoint(x: frame.midX, y: frame.midY)) {
-            return restore(snapshot, reason: .preflight(.noTarget), attempt: attempt)
-        }
-        if !resized, let original {
+        let centeredOnSource = snapshot.context.usableFrame.contains(CGPoint(x: frame.midX,
+                                                                             y: frame.midY))
+        let unchanged = !resized && original.map { original in
             let tolerance = FrameSizingConfiguration()
-            let unchanged = abs(frame.minX - original.minX) <= tolerance.positionTolerance
+            return abs(frame.minX - original.minX) <= tolerance.positionTolerance
                 && abs(frame.minY - original.minY) <= tolerance.positionTolerance
                 && abs(frame.size.width - original.size.width) <= tolerance.sizeTolerance
                 && abs(frame.size.height - original.size.height) <= tolerance.sizeTolerance
-            if unchanged { return .ignored }
+        } ?? false
+        let decision: String
+        if resized, mode == nil, !centeredOnSource {
+            decision = "resize off the source tiles — restore"
+        } else if unchanged {
+            decision = "unmoved — ignored"
+        } else if resized {
+            decision = "resize — same-tree resize"
+        } else if moved != nil {
+            decision = "move — across monitors"
+        } else {
+            decision = mode == nil ? "move — no target, restore" : "move — same-tree drop"
         }
+        hyprLog(.notice, .tiling, "tiled drag settle read: dragged=\(snapshot.draggedID) "
+                + "original=\(original.map(Self.traced) ?? "none") read=\(Self.traced(frame)) "
+                + "dw=\(original.map { Self.traced(frame.width - $0.width) } ?? "?") "
+                + "dh=\(original.map { Self.traced(frame.height - $0.height) } ?? "?") "
+                + "resized=\(resized) centerOnSource=\(centeredOnSource) decision=\(decision)")
+        if resized, mode == nil, !centeredOnSource {
+            return restore(snapshot, reason: .preflight(.noTarget), attempt: attempt)
+        }
+        if unchanged { return .ignored }
         let outcome: TiledDragDropOutcome
         if !resized, let moved {
             outcome = moved(frame)
@@ -413,11 +441,14 @@ struct TiledDragTransaction {
             return restore(snapshot, reason: .preflight(.invalidTarget), attempt: attempt)
         }
 
-        let captured = attempt.captureFrames(windowIDs: targetIDs, generation: snapshot.generation)
+        let captured = FrameSizingTransaction(attempt: attempt, recoversTimeouts: true)
+            .capture(windowIDs: targetIDs, generation: snapshot.generation)
         guard case .accepted = captured.verdict, captured.actualFrames.count == targetIDs.count else {
             let failure = Self.failure(of: captured.verdict)
                 ?? .windowUnavailable(targetIDs.first ?? snapshot.draggedID)
             if failure == .superseded { return .superseded }
+            hyprLog(.notice, .tiling, "tiled drag across monitors: release screen read failed "
+                    + "reason=\(failure.trace) — restoring the source")
             // nothing was written over there, so only the source goes back
             return restore(snapshot, reason: .sizing(failure), attempt: attempt)
         }
@@ -440,10 +471,12 @@ struct TiledDragTransaction {
             targetCandidate = target.tree.candidateTree(rootedAt: dragged)
             placement = "root"
         } else {
-            guard let hit = TiledDragTargetResolver.nearest(pointer: pointer,
-                                                            slots: targetOriginals) else {
-                return restoreBoth(.preflight(.noTarget))
-            }
+            let hit = TiledDragTargetResolver.nearest(pointer: pointer, slots: targetOriginals)
+            hyprLog(.notice, .tiling, "tiled drag across monitors targets: dragged=\(dragged.windowID) "
+                    + "point=cg(\(Self.traced(pointer.x)),\(Self.traced(pointer.y))) "
+                    + "tiles=[\(TiledDragTargetResolver.trace(pointer: pointer, slots: targetOriginals))] "
+                    + "chosen=\(hit.map { "\($0.windowID) \($0.edge)" } ?? "none")")
+            guard let hit else { return restoreBoth(.preflight(.noTarget)) }
             if swapRequested {
                 guard let swapped = targetWindows.first(where: { $0.windowID == hit.windowID }) else {
                     return restoreBoth(.preflight(.invalidTarget))
@@ -513,10 +546,10 @@ struct TiledDragTransaction {
             var screenAttempt = attempt
             screenAttempt.configuration.positionSettleWindowIDs =
                 positionFirst(standing, layouts, context.usableFrame)
-            let result = screenAttempt.apply(
-                targets: layouts.map { .init(windowID: $0.0.windowID, frame: $0.1) },
-                usableFrame: context.usableFrame, gap: context.gap,
-                generation: snapshot.generation)
+            let result = FrameSizingTransaction(attempt: screenAttempt, recoversTimeouts: true)
+                .candidate(targets: layouts.map { .init(windowID: $0.0.windowID, frame: $0.1) },
+                           usableFrame: context.usableFrame, gap: context.gap,
+                           generation: snapshot.generation)
             progress = progress.map { Self.merged($0, result.progress) } ?? result.progress
             frames.merge(result.actualFrames) { _, read in read }
             failure = Self.failure(of: result.verdict)
@@ -550,7 +583,7 @@ struct TiledDragTransaction {
 
     private func restore(_ snapshot: TiledDragSnapshot, reason: TiledDragFailure,
                          attempt: FrameSizingAttempt) -> TiledDragDropOutcome {
-        let result = FrameSizingTransaction(attempt: attempt).restore(
+        let result = FrameSizingTransaction(attempt: attempt, recoversTimeouts: true).restore(
             originalFrames: snapshot.originalFrames,
             usableFrame: snapshot.context.usableFrame,
             gap: snapshot.context.gap,
@@ -580,7 +613,7 @@ struct TiledDragTransaction {
                                attempt: FrameSizingAttempt,
                                candidate: FrameSizingAttempt.Progress?,
                                cross: TiledDragCrossTree) -> TiledDragDropOutcome {
-        let restorer = FrameSizingTransaction(attempt: attempt)
+        let restorer = FrameSizingTransaction(attempt: attempt, recoversTimeouts: true)
         let source = restorer.restore(originalFrames: snapshot.originalFrames,
                                       usableFrame: snapshot.context.usableFrame,
                                       gap: snapshot.context.gap,
@@ -649,6 +682,14 @@ struct TiledDragTransaction {
         return attempt.validateFrames(targets: targets, actualFrames: frames,
                                       usableFrame: usableFrame,
                                       gap: gap).verdict == .accepted
+    }
+
+    private static func traced(_ value: CGFloat) -> String {
+        String(format: "%g", Double(value))
+    }
+
+    private static func traced(_ rect: CGRect) -> String {
+        "(\(traced(rect.minX)),\(traced(rect.minY)),\(traced(rect.width)),\(traced(rect.height)))"
     }
 
     private static func failure(of verdict: FrameSizingAttempt.Verdict) -> FrameSizingFailure? {

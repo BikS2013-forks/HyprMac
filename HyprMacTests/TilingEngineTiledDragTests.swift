@@ -590,6 +590,27 @@ final class TilingEngineTiledDragTests: XCTestCase {
         XCTAssertTrue(fixture.engine.existingTree(forWorkspace: 2, screen: fixture.wide) === targetTree)
     }
 
+    func testCrossMonitorDropOfASlowAppLandsOnItsLongerTry() throws {
+        let fixture = makeCrossFixture()
+        let snapshot = try captureCross(fixture)
+        let slot = try XCTUnwrap(fixture.trace.frames[10])
+        fixture.trace.frames[1]?.origin = CGPoint(x: 300, y: 200)
+        // Messages, live: 101 ms to refuse the position write
+        fixture.trace.positionWriteAnswer[1] = 0.15
+
+        let outcome = dropCross(fixture, snapshot,
+                                at: CGPoint(x: slot.minX + 5, y: slot.midY), swap: false)
+
+        guard case let .acrossTrees(.committed, cross) = outcome else {
+            return XCTFail("expected the longer try to commit, got \(outcome)")
+        }
+        XCTAssertEqual(cross.moves, [1: 2])
+        XCTAssertEqual(fixture.engine.windowIDs(inTreeForWorkspace: 2, screen: fixture.wide),
+                       [1, 10, 11])
+        XCTAssertEqual(fixture.trace.frames[1],
+                       fixture.engine.intendedRect(for: 1, onWorkspace: 2, screen: fixture.wide))
+    }
+
     func testSameMonitorDropIgnoresTheReleaseLocation() throws {
         let fixture = makeCrossFixture()
         let targetTree = fixture.engine.existingTree(forWorkspace: 2, screen: fixture.wide)
@@ -769,6 +790,9 @@ private final class DragSizingTrace {
     /// off by default: the clock stands still and only the sample limit
     /// ends a settle loop
     var advancesClock = false
+    /// seconds a window takes to answer a position write. a shorter call
+    /// timeout is used up whole and gets `cannotComplete`
+    var positionWriteAnswer: [CGWindowID: TimeInterval] = [:]
     private var time: TimeInterval = 0
 
     func factory(_ windows: [CGWindowID: HyprWindow],
@@ -790,9 +814,13 @@ private final class DragSizingTrace {
                 writes.append(id)
                 return .success
             },
-            writePosition: { [unowned self] id, point, _ in
+            writePosition: { [unowned self] id, point, timeout in
                 writeCalls += 1
                 onWrite?(writeCalls)
+                if let answer = positionWriteAnswer[id] {
+                    time += min(answer, timeout)
+                    if answer > timeout { return .cannotComplete }
+                }
                 frames[id]?.origin = point
                 writes.append(id)
                 return .success

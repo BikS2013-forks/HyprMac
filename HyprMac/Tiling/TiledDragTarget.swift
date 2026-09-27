@@ -44,6 +44,29 @@ struct TiledDragTargetResolver {
         return TiledDragTarget(windowID: best.windowID, edge: edge(of: clamped, in: best.frame))
     }
 
+    /// Every tile `nearest` weighed, in id order: its frame, its distance
+    /// from the pointer, and the normalized distance to each edge from the
+    /// pointer clamped into it. For the drop decision's log line.
+    static func trace(pointer: CGPoint, slots: [CGWindowID: CGRect]) -> String {
+        func number(_ value: CGFloat) -> String { String(format: "%g", Double(value)) }
+        func fraction(_ value: CGFloat) -> String { String(format: "%.3f", Double(value)) }
+        return slots.sorted { $0.key < $1.key }.map { windowID, frame in
+            let dx = max(frame.minX - pointer.x, 0, pointer.x - frame.maxX)
+            let dy = max(frame.minY - pointer.y, 0, pointer.y - frame.maxY)
+            let clamped = CGPoint(x: min(max(pointer.x, frame.minX), frame.maxX),
+                                  y: min(max(pointer.y, frame.minY), frame.maxY))
+            let width = max(frame.width, 1)
+            let height = max(frame.height, 1)
+            return "\(windowID) frame=(\(number(frame.minX)),\(number(frame.minY)),"
+                + "\(number(frame.width)),\(number(frame.height))) "
+                + "dist=\(number((dx * dx + dy * dy).squareRoot())) "
+                + "l=\(fraction((clamped.x - frame.minX) / width)) "
+                + "r=\(fraction((frame.maxX - clamped.x) / width)) "
+                + "t=\(fraction((clamped.y - frame.minY) / height)) "
+                + "b=\(fraction((frame.maxY - clamped.y) / height))"
+        }.joined(separator: "; ")
+    }
+
     /// Nearest normalized edge of `frame` to `pointer`. Ties go left, right,
     /// top, bottom.
     private static func edge(of pointer: CGPoint, in frame: CGRect) -> BSPTargetEdge {

@@ -179,6 +179,16 @@ the Swift deadline. Stable off-target frames wait at least 0.24 seconds
 before becoming a geometry rejection. Failed reads and superseded work
 never become accepted geometry.
 
+A call that AX gives up on after using nearly all of its messaging timeout
+returns `cannotComplete`. That covers a setter, a frame read, or the
+enhanced-UI read that opens a window's writes. Such a call is a timeout,
+not a refusal, and gets one more try with a 0.25-second call timeout and a
+0.75-second deadline (`withTimeoutRecoveryBudget`). A verified layout takes
+that try after its rollback verifies. A tiled drag takes it straight away,
+on the settle read, the release screen's read, each candidate and each
+rollback. A `cannotComplete` that comes back at once is AX refusing, and
+gets no second try.
+
 A pass that moves a window onto a screen with a different backing scale
 factor gets a 1-second deadline instead, with the sample limit raised to
 match. The engine compares the scale of the screen holding most of each
@@ -825,8 +835,10 @@ takes the engine's write order, and two displays with different backing
 scales get the scale-change budget. Both trees publish together, and only
 after every frame on both screens was accepted.
 
-A refusal or a sizing failure after the release screen was read puts both
-trees back, even when nothing was written there yet. The source's captured
+A call that times out on either screen gets its one longer try first; Messages
+took 101 ms to answer a position write right after crossing displays, just
+past the 100 ms call timeout. A refusal or a sizing failure after the release
+screen was read puts both trees back, even when nothing was written there yet. The source's captured
 originals go first, the dragged window's among them, then the release
 screen's. Each set is verified against its own screen. Neither topology
 changes, and every key that has a tree is marked unverified. A release screen

@@ -18,12 +18,28 @@ final class TiledDragTransactionTests: XCTestCase {
         var sizeUndershoot: CGFloat = 0
         var readDrift: CGFloat = 0
         var readNumber: CGFloat = 0
+        /// seconds a window takes to answer a position write, a position
+        /// read, or the enhanced-UI read before its writes. a call whose
+        /// timeout is shorter uses the whole timeout and gets
+        /// `cannotComplete`, the way AX gives up on a busy app
+        var positionWriteAnswer: [CGWindowID: TimeInterval] = [:]
+        var positionReadAnswer: [CGWindowID: TimeInterval] = [:]
+        var beginAnswer: [CGWindowID: TimeInterval] = [:]
+        /// the call timeout each slow call was given, in order
+        var slowCallTimeouts: [TimeInterval] = []
 
         init(frames: [CGWindowID: CGRect]) { self.frames = frames }
 
+        private func answers(_ answer: TimeInterval?, within timeout: TimeInterval) -> Bool {
+            guard let answer else { return true }
+            slowCallTimeouts.append(timeout)
+            time += min(answer, timeout)
+            return answer <= timeout
+        }
+
         func factory(windows: [CGWindowID: HyprWindow], current: @escaping () -> UInt64) -> FrameSizingIO {
             var pendingSizes: [CGWindowID: CGSize] = [:]
-            return FrameSizingIO(
+            var io = FrameSizingIO(
                 setMessagingTimeout: { _, _ in .success },
                 writeSize: { [unowned self] id, size, _ in
                     onWrite?()
@@ -38,8 +54,9 @@ final class TiledDragTransactionTests: XCTestCase {
                     writes.append((id, frames[id] ?? CGRect(origin: .zero, size: size)))
                     return .success
                 },
-                writePosition: { [unowned self] id, point, _ in
+                writePosition: { [unowned self] id, point, timeout in
                     onWrite?()
+                    guard answers(positionWriteAnswer[id], within: timeout) else { return .cannotComplete }
                     if !writeErrors.isEmpty {
                         let error = writeErrors.removeFirst()
                         if error != .success { return error }
@@ -49,10 +66,13 @@ final class TiledDragTransactionTests: XCTestCase {
                     writes.append((id, frames[id] ?? CGRect(origin: point, size: .zero)))
                     return .success
                 },
-                readPosition: { [unowned self] id, _ in
+                readPosition: { [unowned self] id, timeout in
                     reads += 1
                     readIDs.append(id)
                     time += callAdvance
+                    guard answers(positionReadAnswer[id], within: timeout) else {
+                        return (.cannotComplete, nil)
+                    }
                     if let readError { return (readError, nil) }
                     if !readErrors.isEmpty {
                         let error = readErrors.removeFirst()
@@ -78,6 +98,11 @@ final class TiledDragTransactionTests: XCTestCase {
                 sleep: { [unowned self] interval in time += interval },
                 currentGeneration: current
             )
+            io.beginFrameWrite = { [unowned self] id, timeout, _ in
+                answers(beginAnswer[id], within: timeout)
+                    ? .ready(.noop(windowID: id)) : .failed(.cannotComplete)
+            }
+            return io
         }
     }
 
@@ -1067,6 +1092,138 @@ final class TiledDragTransactionTests: XCTestCase {
         XCTAssertEqual(TiledDragReleasePolicy.resolve(monitorDisabled: false, scratchpadVisible: true,
                                                       visibleWorkspace: { 4 }),
                        .refused("scratchpad visible"))
+    }
+
+    // MARK: - AX timeout recovery
+
+    func testAcrossTreesSlowPositionWriteGetsOneLongerTryAndCommits() {
+        let (tree, context, target, frames) = crossFixture()
+        let fake = FakeAX(frames: frames)
+        let transaction = TiledDragTransaction(ioFactory: fake.factory)
+        guard case let .captured(snapshot) = transaction.capture(
+            draggedID: 1, tree: tree, context: context, generation: 1,
+            currentContext: { context }) else { return XCTFail("capture failed") }
+        let release = CGRect(origin: CGPoint(x: 1300, y: 100), size: frames[1]!.size)
+        fake.frames[1] = release
+        // Messages, live: a position write refused at the 100 ms call timeout
+        fake.positionWriteAnswer[1] = 0.15
+        let slot = frames[11]!
+
+        guard case let .acrossTrees(.committed(_, actual, progress), cross) = transaction.dropAcrossTrees(
+            snapshot, into: target, pointer: CGPoint(x: slot.midX, y: slot.maxY - 2),
+            swapRequested: false, releaseFrame: release, currentContext: { context }) else {
+            return XCTFail("the longer try must land the drop")
+        }
+        XCTAssertEqual(fake.slowCallTimeouts, [0.1, 0.25])
+        XCTAssertTrue(progress.candidateVerified)
+        XCTAssertEqual(cross.moves, [1: 2])
+        XCTAssertEqual(actual[1], fake.frames[1])
+        XCTAssertTrue(target.context.usableFrame.contains(fake.frames[1]!))
+    }
+
+    func testAcrossTreesRollbackThatTimesOutGetsOneLongerTryAndVerifies() {
+        let (tree, context, target, frames) = crossFixture()
+        let fake = FakeAX(frames: frames)
+        let transaction = TiledDragTransaction(ioFactory: fake.factory)
+        guard case let .captured(snapshot) = transaction.capture(
+            draggedID: 1, tree: tree, context: context, generation: 1,
+            currentContext: { context }) else { return XCTFail("capture failed") }
+        let release = CGRect(origin: CGPoint(x: 1300, y: 100), size: frames[1]!.size)
+        fake.frames[1] = release
+        // the release screen refuses outright, then the dragged window's
+        // rollback times out on the read that opens its writes, as Messages did
+        fake.writeErrors = [.failure]
+        fake.beginAnswer[1] = 0.15
+        let slot = frames[11]!
+
+        let outcome = transaction.dropAcrossTrees(
+            snapshot, into: target, pointer: CGPoint(x: slot.midX, y: slot.maxY - 2),
+            swapRequested: false, releaseFrame: release, currentContext: { context })
+
+        guard case let .acrossTrees(.rejectedRestored(reason, restored), _) = outcome else {
+            return XCTFail("the longer try must verify the rollback, got \(outcome)")
+        }
+        XCTAssertEqual(reason, .sizing(.writeFailed(10, .failure)))
+        XCTAssertEqual(fake.slowCallTimeouts, [0.1, 0.25])
+        XCTAssertEqual(fake.frames, frames)
+        XCTAssertEqual(restored, frames)
+    }
+
+    func testSameTreeDropSlowPositionWriteGetsOneLongerTryAndCommits() {
+        let (tree, _, context) = fixture()
+        let fake = FakeAX(frames: layoutFrames(tree, context))
+        let transaction = TiledDragTransaction(ioFactory: fake.factory)
+        guard case let .captured(snapshot) = transaction.capture(
+            draggedID: 1, tree: tree, context: context, generation: 1,
+            currentContext: { context }) else { return XCTFail("capture failed") }
+        fake.positionWriteAnswer[2] = 0.15
+
+        guard case .committed = transaction.drop(snapshot, mode: .insert(targetID: 2, edge: .left),
+                                                 currentContext: { context }) else {
+            return XCTFail("the longer try must land the drop")
+        }
+        XCTAssertEqual(fake.slowCallTimeouts, [0.1, 0.25])
+    }
+
+    func testSettleReadThatTimesOutGetsOneLongerTry() {
+        let (tree, _, context) = fixture()
+        let frames = layoutFrames(tree, context)
+        let fake = FakeAX(frames: frames)
+        let transaction = TiledDragTransaction(ioFactory: fake.factory)
+        guard case let .captured(snapshot) = transaction.capture(
+            draggedID: 1, tree: tree, context: context, generation: 1,
+            currentContext: { context }) else { return XCTFail("capture failed") }
+        fake.positionReadAnswer[1] = 0.15
+
+        // unmoved, once the longer read answers
+        guard case .ignored = transaction.dropRelease(snapshot, mode: nil,
+                                                      currentContext: { context }) else {
+            return XCTFail("the longer read must classify the release")
+        }
+        XCTAssertEqual(fake.slowCallTimeouts, [0.1, 0.25])
+        XCTAssertTrue(fake.writes.isEmpty)
+    }
+
+    func testTimeoutRecoveryIsOptInAndLeavesAnInstantRefusalAlone() {
+        let frames: [CGWindowID: CGRect] = [1: CGRect(x: 0, y: 0, width: 400, height: 300)]
+        let targets = [FrameSizingAttempt.Target(windowID: 1,
+                                                 frame: CGRect(x: 10, y: 10, width: 400, height: 300))]
+        let bounds = CGRect(x: 0, y: 0, width: 1200, height: 800)
+
+        let slow = FakeAX(frames: frames)
+        slow.positionWriteAnswer[1] = 0.15
+        let plain = FrameSizingTransaction(
+            attempt: FrameSizingAttempt(io: slow.factory(windows: [:], current: { 1 })))
+            .candidate(targets: targets, usableFrame: bounds, gap: 8, generation: 1)
+        XCTAssertEqual(plain.verdict, .rejected(.writeFailed(1, .cannotComplete)))
+        XCTAssertEqual(slow.slowCallTimeouts, [0.1], "off unless the caller asks")
+
+        // a cannotComplete that comes straight back is AX refusing, not a timeout
+        let quick = FakeAX(frames: frames)
+        quick.writeErrors = [.success, .cannotComplete]
+        let refused = FrameSizingTransaction(
+            attempt: FrameSizingAttempt(io: quick.factory(windows: [:], current: { 1 })),
+            recoversTimeouts: true)
+            .candidate(targets: targets, usableFrame: bounds, gap: 8, generation: 1)
+        XCTAssertEqual(refused.verdict, .rejected(.writeFailed(1, .cannotComplete)))
+        XCTAssertEqual(quick.writes.count, 1, "no second try")
+    }
+
+    func testTimeoutRecoveryBudgetMatchesTheVerifiedLayoutsAndKeepsAScaleBudget() {
+        let relaxed = FrameSizingConfiguration().withTimeoutRecoveryBudget
+        XCTAssertEqual(relaxed.deadline, 0.75)
+        XCTAssertEqual(relaxed.perCallTimeout, 0.25)
+        let scaled = FrameSizingConfiguration().withScaleChangeBudget.withTimeoutRecoveryBudget
+        XCTAssertEqual(scaled.deadline, FrameSizingConfiguration().scaleChangeDeadline)
+        XCTAssertEqual(scaled.perCallTimeout, 0.25)
+    }
+
+    func testFailureTracesPrintRawAXCodes() {
+        XCTAssertEqual(FrameSizingFailure.writeFailed(77705, .cannotComplete).trace,
+                       "writeFailed(77705, -25204)")
+        XCTAssertEqual(TiledDragFailure.sizing(.readFailed(71889, .cannotComplete)).trace,
+                       "sizing(readFailed(71889, -25204))")
+        XCTAssertEqual(TiledDragFailure.preflight(.noTarget).trace, "preflight(noTarget)")
     }
 
     /// The same three-window source as `fixture`, next to a two-window

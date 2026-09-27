@@ -770,10 +770,9 @@ class TilingEngine {
         let outcome: TiledDragDropOutcome
         var crossTarget: CrossMonitorTarget?
         if case let .crossMonitor(pointer, swapRequested) = mode {
+            // crossMonitorTarget logs why it declined
             guard let target = crossMonitorTarget(for: snapshot, currentLocation: currentLocation,
                                                   releaseLocation: releaseLocation) else {
-                hyprLog(.notice, .tiling, "tiled drag across monitors: no tree on the release screen"
-                        + " takes \(snapshot.draggedID) — restoring")
                 return dropTiledDrag(snapshot, mode: nil, currentLocation: currentLocation)
             }
             crossTarget = target
@@ -865,11 +864,24 @@ class TilingEngine {
         releaseLocation: @escaping () -> (workspace: Int, screen: NSScreen,
                                           floatingIDs: Set<CGWindowID>)?
     ) -> CrossMonitorTarget? {
-        guard snapshot.context.workspace != Self.scratchpadWorkspace,
-              let source = currentLocation(),
-              let release = releaseLocation(),
-              release.workspace != Self.scratchpadWorkspace,
-              release.workspace != snapshot.context.workspace else { return nil }
+        func decline(_ reason: String) -> CrossMonitorTarget? {
+            hyprLog(.notice, .tiling, "tiled drag across monitors declined: dragged=\(snapshot.draggedID) "
+                    + "reason=\(reason) — restoring as a release with no target")
+            return nil
+        }
+        guard snapshot.context.workspace != Self.scratchpadWorkspace else {
+            return decline("the source is the scratchpad")
+        }
+        guard let source = currentLocation() else { return decline("the source location is gone") }
+        guard let release = releaseLocation() else {
+            return decline("no release location (see the refusal above)")
+        }
+        guard release.workspace != Self.scratchpadWorkspace else {
+            return decline("the release workspace is the scratchpad")
+        }
+        guard release.workspace != snapshot.context.workspace else {
+            return decline("the release workspace ws\(release.workspace) is the source's")
+        }
         let live = trees[TilingKey(workspace: release.workspace, screen: release.screen)]
         let tree = live ?? BSPTree()
         let generation = snapshot.generation
@@ -880,9 +892,22 @@ class TilingEngine {
                                          floatingIDs: location.floatingIDs, sourceTree: tree,
                                          mapped: live != nil)
         }
-        guard tree !== snapshot.sourceTree, let context = currentContext(),
-              context.physicalDisplayID != snapshot.context.physicalDisplayID,
-              context.floatingIDs.isDisjoint(with: context.memberIDs) else { return nil }
+        guard tree !== snapshot.sourceTree else { return decline("the release tree is the source tree") }
+        guard let context = currentContext() else {
+            return decline("no single screen for display \(physicalDisplayID(for: release.screen)) "
+                           + "or its ws\(release.workspace) tree changed")
+        }
+        guard context.physicalDisplayID != snapshot.context.physicalDisplayID else {
+            return decline("the release display \(context.physicalDisplayID) is the source's")
+        }
+        guard context.floatingIDs.isDisjoint(with: context.memberIDs) else {
+            return decline("floaters \(context.floatingIDs.intersection(context.memberIDs).sorted()) "
+                           + "are in the release tree")
+        }
+        hyprLog(.notice, .tiling, "tiled drag across monitors target: dragged=\(snapshot.draggedID) "
+                + "ws\(release.workspace) on '\(release.screen.localizedName)' "
+                + "display=\(context.physicalDisplayID) members=\(tree.allWindows.map(\.windowID)) "
+                + "tree=\(live == nil ? "none" : "live") usable=\(context.usableFrame)")
         // the release point is on another display, so a swap or a rollback
         // carries a window across. a scale change gets the longer budget,
         // as a verified layout does
@@ -1108,11 +1133,8 @@ class TilingEngine {
     )
 
     private lazy var timeoutRecoveryPoller: FrameReadbackPoller = {
-        var configuration = FrameSizingConfiguration()
-        configuration.deadline = 0.75
-        configuration.perCallTimeout = 0.25
-        return FrameReadbackPoller(
-            configuration: configuration,
+        FrameReadbackPoller(
+            configuration: FrameSizingConfiguration().withTimeoutRecoveryBudget,
             generation: { [weak self] in self?.layoutGeneration ?? UInt64.max },
             ioFactory: frameSizingIOFactory
         )
@@ -1519,7 +1541,7 @@ class TilingEngine {
         if case .accepted = restored.verdict {
             if terminal.progress.phase == .candidate,
                terminal.progress.timeoutShapedCannotComplete,
-               Self.isDirectCannotComplete(reason),
+               reason.isDirectCannotComplete,
                layoutGeneration == generation {
                 hyprLog(.notice, .tiling, "verified layout AX timeout recovery: reason=\(reason) ids="
                         + "[" + windows.map { String($0.windowID) }.joined(separator: ", ") + "]")
@@ -1573,13 +1595,6 @@ class TilingEngine {
                          restorationAttempted: true,
                          actualFrames: restored.actualFrames,
                          progress: progress)
-    }
-
-    private static func isDirectCannotComplete(_ failure: FrameSizingFailure) -> Bool {
-        switch failure {
-        case .writeFailed(_, .cannotComplete), .readFailed(_, .cannotComplete): true
-        default: false
-        }
     }
 
     /// Rebuild a private batch after its first write taught stricter minima.
