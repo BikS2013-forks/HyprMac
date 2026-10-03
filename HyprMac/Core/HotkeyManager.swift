@@ -59,6 +59,14 @@ class HotkeyManager {
     private var hyprKey: HyprKey = .capsLock
     private var pressedModifierKeyCodes: Set<UInt16> = []
 
+    /// Keyboards whose own Caps Lock is down, from `PhysicalCapsLockMonitor`.
+    /// Empty when the monitor is not running, so events alone decide then.
+    private var physicalCapsLockDown: Set<PhysicalCapsLockMonitor.DeviceID> = []
+    /// macOS released F18 while a keyboard still held Caps Lock, so this
+    /// press goes on until the keyboard itself lets go: no event will.
+    private var hyprHeldByKeyboard = false
+    private var physicalMonitor: PhysicalCapsLockMonitor?
+
     private var keybinds: [Keybind] = Keybind.defaults
     private var tilingEnabled = true
     // O(1) lookup: packed key = (keyCode << 16) | modifiers.rawValue
@@ -122,6 +130,7 @@ class HotkeyManager {
         defer { stateLock.unlock() }
         hyprKey = key
         hyprKeyDown = false
+        hyprHeldByKeyboard = false
         pressedModifierKeyCodes.removeAll()
         hyprLog(.debug, .lifecycle, "hypr key set to \(key.displayName)")
     }
@@ -160,6 +169,11 @@ class HotkeyManager {
         stateLock.unlock()
         let source = CFMachPortCreateRunLoopSource(nil, tap, 0)
         runLoopSource = source
+        // the keyboards' own Caps Lock, on the tap's thread so it is ordered
+        // with the tap's events and a busy main thread cannot delay it. the
+        // permission check stays here on main: it can prompt
+        let monitor = hyprKey.usesCapsLockRemap && PhysicalCapsLockMonitor.accessGranted()
+            ? makePhysicalMonitor() : nil
 
         // dedicated run loop so a busy main thread can never delay
         // keystroke delivery. published before start() returns so stop()
@@ -167,14 +181,17 @@ class HotkeyManager {
         let ready = DispatchSemaphore(value: 0)
         let thread = Thread { [weak self] in
             self?.tapRunLoop = CFRunLoopGetCurrent()
+            let monitorOpen = monitor?.open(on: CFRunLoopGetCurrent()) ?? false
             CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
             CGEvent.tapEnable(tap: tap, enable: true)
             ready.signal()
             CFRunLoopRun()
+            if monitorOpen { monitor?.close() }
         }
         thread.name = "HyprMac.EventTap"
         thread.qualityOfService = .userInteractive
         tapThread = thread
+        physicalMonitor = monitor
         thread.start()
         ready.wait()
 
@@ -199,9 +216,12 @@ class HotkeyManager {
         runLoopSource = nil
         tapRunLoop = nil
         tapThread = nil
+        physicalMonitor = nil
         stateLock.lock()
         eventTap = nil
         hyprKeyDown = false
+        hyprHeldByKeyboard = false
+        physicalCapsLockDown.removeAll()
         pressedModifierKeyCodes.removeAll()
         stateLock.unlock()
     }
@@ -252,7 +272,34 @@ class HotkeyManager {
             hyprLog(.notice, .hotkey, "resetting stuck hyprKeyDown after tap interruption")
         }
         setHyprKeyDown(false)
+        hyprHeldByKeyboard = false
+        // a keyboard release during the gap is lost too
+        physicalCapsLockDown.removeAll()
         pressedModifierKeyCodes.removeAll()
+    }
+
+    private func makePhysicalMonitor() -> PhysicalCapsLockMonitor {
+        PhysicalCapsLockMonitor(
+            onKey: { [weak self] device, down in self?.notePhysicalCapsLock(device: device, down: down) },
+            onRemoval: { [weak self] device in self?.notePhysicalCapsLock(device: device, down: false) }
+        )
+    }
+
+    /// A keyboard's own Caps Lock went down or up (or the keyboard went
+    /// away, which counts as up). Ends a press that macOS released early
+    /// once no keyboard holds Caps Lock any more. Runs on the tap thread.
+    func notePhysicalCapsLock(device: PhysicalCapsLockMonitor.DeviceID, down: Bool) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        if down {
+            physicalCapsLockDown.insert(device)
+        } else {
+            physicalCapsLockDown.remove(device)
+        }
+        guard hyprHeldByKeyboard, physicalCapsLockDown.isEmpty else { return }
+        hyprHeldByKeyboard = false
+        hyprLog(.notice, .hotkey, "hypr ↑ from the keyboard — Caps Lock let go after an early release")
+        setHyprKeyDown(false)
     }
 
     /// A mouse press while Hypr is held (a Hypr+drag swap) makes the press a
@@ -300,8 +347,20 @@ class HotkeyManager {
                     hyprPressedAt = ProcessInfo.processInfo.systemUptime
                     hyprPressUsed = false
                 }
+                hyprHeldByKeyboard = false
                 setHyprKeyDown(true)
             } else if type == .keyUp {
+                // letting go of Ctrl while Caps Lock is held makes macOS
+                // release F18 right then, and the real release sends no
+                // event. a keyboard still holding Caps Lock says this one is
+                // early: keep the press, and let the keyboard end it
+                if hyprKeyDown, hyprKey.usesCapsLockRemap, !physicalCapsLockDown.isEmpty {
+                    if !hyprHeldByKeyboard {
+                        hyprLog(.notice, .hotkey, "hypr ↑ ignored — a keyboard still holds Caps Lock")
+                    }
+                    hyprHeldByKeyboard = true
+                    return nil
+                }
                 if hyprKeyDown, hyprKey.usesCapsLockRemap,
                    Self.isBareTap(heldFor: ProcessInfo.processInfo.systemUptime - hyprPressedAt,
                                   used: hyprPressUsed) {

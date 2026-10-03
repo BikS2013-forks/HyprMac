@@ -584,6 +584,37 @@ before starting the other.
 Mappings set per keyboard with `hidutil --matching` are not in this list,
 and HyprMac does not read or change them.
 
+### Early F18 release on a Ctrl release
+
+With the remap active, letting go of Ctrl while Caps Lock is still held
+makes macOS send an F18 key-up at that moment: hardware-sourced, 0.2 ms
+before the Ctrl `flagsChanged`, with Ctrl still in its flags. The real
+release later sends no event at all. Other modifiers do not do this.
+Seen live on 2026-10-04 on the built-in keyboard: Hypr+Shift+Ctrl, Ctrl
+let go, and the rest of the chord matched as plain Shift+key. Ignoring
+that key-up from events alone would leave Hypr stuck on, since nothing
+reports the real release. `CGEventSource.keyState(.hidSystemState)` for
+F18 goes up at the same moment, so it cannot tell either.
+
+`PhysicalCapsLockMonitor` reads Caps Lock (usage 0x39) from every keyboard
+through `IOHIDManager`, beneath the remap. Only Caps Lock values are
+delivered. It runs on the event tap's thread, so its values and the tap's
+events are ordered there and a busy main thread cannot delay them. Events
+stay in charge; the reading only vetoes one thing:
+
+- An F18 key-up while a keyboard still reports Caps Lock down is ignored
+  (`hypr ↑ ignored`), and the press ends when the last keyboard holding
+  Caps Lock lets go or goes away (`hypr ↑ from the keyboard`).
+- A keyboard that never reports Caps Lock (remapped in its own firmware)
+  never vetoes, so events decide as before.
+- It needs Input Monitoring. Without it, or for any other Hypr key, the
+  monitor does not start and events decide as before. The permission is
+  checked on main, never on the tap's thread, because the prompt can
+  block and the tap holds every keystroke while its thread is busy.
+- A tap interruption (sleep, wake, lock, tap disabled) clears the reading
+  along with the Hypr state, so a release lost in the gap cannot hold
+  Hypr on. Tests: `CapsLockEarlyReleaseTests`.
+
 ## Permissions
 
 - **Accessibility** (System Settings → Privacy → Accessibility) —

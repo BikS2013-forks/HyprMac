@@ -41,6 +41,16 @@
 
 ## Completed
 
+- **2026-10-04 — Releasing Ctrl mid-chord dropped the Hypr key.** Holding Caps Lock + Shift + Ctrl
+  and letting go of Ctrl made macOS send an F18 key-up right then (hardware-sourced, 0.2 ms before
+  the Ctrl release) while Caps Lock was still held, and no event at the real release, so the rest
+  of the chord matched as Shift+key. Only Ctrl does it. HyprMac now also reads each keyboard's Caps
+  Lock through `IOHIDManager` (`PhysicalCapsLockMonitor`, needs Input Monitoring) and ignores an
+  F18 release while a keyboard still holds the key; the keyboard's own release ends the press.
+  Without the reading, events decide as before. Design in `docs/architecture.md` ("Early F18
+  release on a Ctrl release"); tests in `CapsLockEarlyReleaseTests`. Checked live 02:27–02:28:
+  early releases ignored, chords kept matching, keyboard releases ended Hypr, bare taps toggled.
+
 - **2026-10-04 — Hypr resize snapped back on iTerm2 windows.** iTerm2 answers a size write in
   160–740 ms (measured over AX). HyprMac's 0.1 s call timeout gave up, the rollback gave up the same
   way (`-25204`, `cannotComplete`), the 0.25 s relaxed retry never ran because it needs a verified
