@@ -169,6 +169,20 @@ struct FrameSizingConfiguration {
         relaxed.perCallTimeout = max(perCallTimeout, 0.25)
         return relaxed
     }
+
+    /// This configuration for an app whose frame setters have outlasted the
+    /// per-call timeout, which the engine learns per process. iTerm2, live:
+    /// a size write answered in 160–740 ms, so the 0.1 s call and the
+    /// 0.25 s recovery both gave up while the write still landed later.
+    /// The sample limit grows with the deadline, as for a scale change.
+    var withSlowAppBudget: FrameSizingConfiguration {
+        var slow = self
+        slow.deadline = max(deadline, 2.0)
+        slow.perCallTimeout = max(perCallTimeout, 1.0)
+        slow.maximumAttempts = max(maximumAttempts,
+                                   Int((slow.deadline / pollInterval).rounded(.up)))
+        return slow
+    }
 }
 
 /// Two windows that sit on top of each other. Only the restoration phase

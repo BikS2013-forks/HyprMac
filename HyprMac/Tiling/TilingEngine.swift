@@ -1378,6 +1378,39 @@ class TilingEngine {
         )
     }()
 
+    private lazy var slowAppPoller = readbackPoller.withSlowAppBudget()
+
+    /// Processes whose frame calls have outlasted the 0.1 s call timeout.
+    /// A layout touching any of their windows runs every pass, rollback
+    /// included, with `withSlowAppBudget`, so it waits for the answer
+    /// instead of rolling back a write the app is still applying. A process
+    /// that times out even at that budget is hung, not slow, and is dropped
+    /// so it cannot stall the main thread on every layout. In memory only.
+    private(set) var slowFrameApps: Set<pid_t> = []
+
+    /// Learn from a pass that ended on an AX messaging timeout: the owner of
+    /// the window that timed out is slow, or, if the pass already ran with
+    /// the slow budget, hung.
+    private func noteFrameTimeout(_ reason: FrameSizingFailure,
+                                  progress: FrameSizingAttempt.Progress,
+                                  windows: [HyprWindow], slowBudget: Bool) {
+        guard reason.isDirectCannotComplete, progress.timeoutShapedCannotComplete else { return }
+        let windowID: CGWindowID
+        switch reason {
+        case let .writeFailed(id, _), let .readFailed(id, _): windowID = id
+        default: return
+        }
+        guard let pid = windows.first(where: { $0.windowID == windowID })?.ownerPID else { return }
+        if slowBudget {
+            guard slowFrameApps.remove(pid) != nil else { return }
+            hyprLog(.notice, .tiling, "slow frame app dropped: pid=\(pid) wid=\(windowID) "
+                    + "timed out at the slow budget — treating it as hung")
+        } else if slowFrameApps.insert(pid).inserted {
+            hyprLog(.notice, .tiling, "slow frame app learned: pid=\(pid) wid=\(windowID) "
+                    + "reason=\(reason.trace)")
+        }
+    }
+
     /// `applyVerifiedLayout` plus the unverified-geometry bookkeeping for
     /// the key that owns the tree. Every production path goes through
     /// this; the plain call stays for tests that hand it a loose tree.
@@ -1597,6 +1630,10 @@ class TilingEngine {
                                             newcomerIDs: Set<CGWindowID>) -> LayoutApplicationOutcome {
         let windows = tree.allWindows
         let restorationFrame = suppliedRestorationFrame ?? rect
+        // every pass of a layout touching a known slow app, capture and
+        // rollback included, waits for it on the slow budget
+        let slowApp = windows.contains { slowFrameApps.contains($0.ownerPID) }
+        let basePoller = slowApp ? slowAppPoller : readbackPoller
         let originalFrames: [CGWindowID: CGRect]
         if let suppliedOriginalFrames {
             guard suppliedOriginalFrames.count == windows.count,
@@ -1609,7 +1646,7 @@ class TilingEngine {
             }
             originalFrames = suppliedOriginalFrames
         } else {
-            let captured = readbackPoller.captureFrames(windows, generation: generation)
+            let captured = basePoller.captureFrames(windows, generation: generation)
             guard case .accepted = captured.verdict,
                   captured.actualFrames.count == windows.count else {
                 let missing = windows.first { captured.actualFrames[$0.windowID] == nil }
@@ -1630,7 +1667,7 @@ class TilingEngine {
         // it. that pass, and a rollback carrying it back, get the longer
         // budget; nothing else does.
         let scaleChanges = scaleChanges(originalFrames, destination: rect)
-        let poller = scaleChanges.isEmpty ? readbackPoller : readbackPoller.withScaleChangeBudget()
+        let poller = scaleChanges.isEmpty ? basePoller : basePoller.withScaleChangeBudget()
         if !scaleChanges.isEmpty {
             hyprLog(.notice, .tiling, "verified layout scale change: ids=["
                     + scaleChanges.keys.sorted().map { id in
@@ -1718,6 +1755,7 @@ class TilingEngine {
                 + " phase=\(terminal.progress.phase.rawValue)"
                 + Self.offTargetTrace(terminalLayouts, actual: terminal.actualFrames)
                 + " actual=\(terminal.actualFrames)")
+        noteFrameTimeout(reason, progress: terminal.progress, windows: windows, slowBudget: slowApp)
         // the admission recovery's last retry. the app did not answer in time,
         // which is not a refusal, so the frames it was sent stay where they
         // are and the caller publishes the tree unverified. a rollback here
@@ -1770,69 +1808,111 @@ class TilingEngine {
         // only a rollback that carries a window back across the scale
         // boundary is slow for the same reason the candidate was
         let restoresAcrossScales = originals.contains { scaleChanges[$0.0.windowID] != nil }
-        let restorationPoller = restoresAcrossScales ? poller : readbackPoller
+        let restorationPoller = restoresAcrossScales ? poller : basePoller
         let restored = restorationPoller.applyRestoration(originals, usableFrame: restorationFrame,
                                                           gap: gapSize, generation: generation)
         var progress = candidateProgress
         progress.restoration = restored.progress
         progress.restorationOverlaps = restored.overlaps
+        let candidateTimedOut = terminal.progress.phase == .candidate
+            && terminal.progress.timeoutShapedCannotComplete
+            && reason.isDirectCannotComplete
         if case .accepted = restored.verdict {
-            if terminal.progress.phase == .candidate,
-               terminal.progress.timeoutShapedCannotComplete,
-               reason.isDirectCannotComplete,
-               layoutGeneration == generation {
+            // a known slow app already ran on the slow budget, which the
+            // relaxed retry would only shorten
+            if !slowApp, candidateTimedOut, layoutGeneration == generation {
                 hyprLog(.notice, .tiling, "verified layout AX timeout recovery: reason=\(reason) ids="
                         + "[" + windows.map { String($0.windowID) }.joined(separator: ", ") + "]")
                 let relaxedPoller = scaleChanges.isEmpty
                     ? timeoutRecoveryPoller : timeoutRecoveryPoller.withScaleChangeBudget()
-                let relaxedRestorationPoller = restoresAcrossScales
-                    ? relaxedPoller : timeoutRecoveryPoller
-                let retry = relaxedPoller.applyLayout(
-                    firstLayouts, usableFrame: rect, gap: gapSize, generation: generation
-                )
-                if case .accepted = retry.verdict {
-                    hyprLog(.notice, .tiling, "verified layout AX timeout recovery accepted")
-                    return .accepted(actualFrames: retry.actualFrames,
-                                     progress: FrameSizingProgressReport(candidate: retry.progress))
-                }
-
-                var retryProgress = FrameSizingProgressReport(candidate: retry.progress)
-                let retryReason = retry.verdict.failure ?? .attemptsExhausted
-                hyprLog(.notice, .tiling,
-                        "verified layout AX timeout recovery refused: reason=\(retryReason)"
-                        + Self.offTargetTrace(firstLayouts, actual: retry.actualFrames))
-                guard layoutGeneration == generation else {
-                    return .degraded(candidateReason: .superseded,
-                                     restorationReason: nil,
-                                     restorationAttempted: false,
-                                     actualFrames: retry.actualFrames,
-                                     progress: retryProgress)
-                }
-                let retryRestoration = relaxedRestorationPoller.applyRestoration(
-                    originals, usableFrame: restorationFrame, gap: gapSize,
-                    generation: generation
-                )
-                retryProgress.restoration = retryRestoration.progress
-                retryProgress.restorationOverlaps = retryRestoration.overlaps
-                if case .accepted = retryRestoration.verdict {
-                    return .rejectedRestored(reason: retryReason,
-                                             actualFrames: retryRestoration.actualFrames,
-                                             progress: retryProgress)
-                }
-                return .degraded(candidateReason: retryReason,
-                                 restorationReason: retryRestoration.verdict.failure,
-                                 restorationAttempted: true,
-                                 actualFrames: retryRestoration.actualFrames,
-                                 progress: retryProgress)
+                return timeoutRecovery("AX timeout recovery", layouts: firstLayouts,
+                                       originals: originals, windows: windows,
+                                       poller: relaxedPoller,
+                                       restorationPoller: restoresAcrossScales
+                                           ? relaxedPoller : timeoutRecoveryPoller,
+                                       slowBudget: false, usableFrame: rect,
+                                       restorationFrame: restorationFrame, generation: generation)
             }
             return .rejectedRestored(reason: reason, actualFrames: restored.actualFrames,
                                      progress: progress)
+        }
+        // the rollback timed out too. an app that answers neither in time is
+        // slow, not refusing: AX gave up waiting, but both batches are still
+        // queued in the app and land in order, so the windows drift back to
+        // their originals while the layout reads as failed. one retry that
+        // waits for the answer lands on the candidate instead.
+        if !slowApp, candidateTimedOut, restored.progress.timeoutShapedCannotComplete,
+           restored.verdict.failure?.isDirectCannotComplete == true,
+           layoutGeneration == generation {
+            hyprLog(.notice, .tiling, "verified layout slow app recovery: reason=\(reason.trace) "
+                    + "restoration=\(restored.verdict.failure?.trace ?? "nil") ids=["
+                    + windows.map { String($0.windowID) }.joined(separator: ", ") + "]")
+            let slowPoller = scaleChanges.isEmpty
+                ? slowAppPoller : slowAppPoller.withScaleChangeBudget()
+            return timeoutRecovery("slow app recovery", layouts: firstLayouts,
+                                   originals: originals, windows: windows,
+                                   poller: slowPoller,
+                                   restorationPoller: restoresAcrossScales ? slowPoller : slowAppPoller,
+                                   slowBudget: true, usableFrame: rect,
+                                   restorationFrame: restorationFrame, generation: generation)
         }
         return .degraded(candidateReason: reason,
                          restorationReason: restored.verdict.failure,
                          restorationAttempted: true,
                          actualFrames: restored.actualFrames,
                          progress: progress)
+    }
+
+    /// One more run of a timed-out candidate on a longer budget, and if that
+    /// fails too, one rollback on the same budget. `slowBudget` marks a
+    /// retry on the slow-app budget, whose own timeout means the app is hung.
+    private func timeoutRecovery(_ label: String, layouts: [(HyprWindow, CGRect)],
+                                 originals: [(HyprWindow, CGRect)], windows: [HyprWindow],
+                                 poller: FrameReadbackPoller,
+                                 restorationPoller: FrameReadbackPoller,
+                                 slowBudget: Bool, usableFrame rect: CGRect,
+                                 restorationFrame: CGRect,
+                                 generation: UInt64) -> LayoutApplicationOutcome {
+        let retry = poller.applyLayout(layouts, usableFrame: rect, gap: gapSize,
+                                       generation: generation)
+        if case .accepted = retry.verdict {
+            hyprLog(.notice, .tiling, "verified layout \(label) accepted")
+            return .accepted(actualFrames: retry.actualFrames,
+                             progress: FrameSizingProgressReport(candidate: retry.progress))
+        }
+
+        var retryProgress = FrameSizingProgressReport(candidate: retry.progress)
+        let retryReason = retry.verdict.failure ?? .attemptsExhausted
+        hyprLog(.notice, .tiling,
+                "verified layout \(label) refused: reason=\(retryReason)"
+                + Self.offTargetTrace(layouts, actual: retry.actualFrames))
+        if slowBudget {
+            noteFrameTimeout(retryReason, progress: retry.progress, windows: windows,
+                             slowBudget: true)
+        }
+        guard layoutGeneration == generation else {
+            return .degraded(candidateReason: .superseded,
+                             restorationReason: nil,
+                             restorationAttempted: false,
+                             actualFrames: retry.actualFrames,
+                             progress: retryProgress)
+        }
+        let retryRestoration = restorationPoller.applyRestoration(
+            originals, usableFrame: restorationFrame, gap: gapSize,
+            generation: generation
+        )
+        retryProgress.restoration = retryRestoration.progress
+        retryProgress.restorationOverlaps = retryRestoration.overlaps
+        if case .accepted = retryRestoration.verdict {
+            return .rejectedRestored(reason: retryReason,
+                                     actualFrames: retryRestoration.actualFrames,
+                                     progress: retryProgress)
+        }
+        return .degraded(candidateReason: retryReason,
+                         restorationReason: retryRestoration.verdict.failure,
+                         restorationAttempted: true,
+                         actualFrames: retryRestoration.actualFrames,
+                         progress: retryProgress)
     }
 
     /// Rebuild a private batch after its first write taught stricter minima.

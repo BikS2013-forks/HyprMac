@@ -69,6 +69,13 @@ struct FrameReadbackPoller {
                             generation: generation, ioFactory: ioFactory)
     }
 
+    /// The same poller with the slow-app budget, for a pass that lays out a
+    /// window whose app has outlasted the per-call timeout.
+    func withSlowAppBudget() -> FrameReadbackPoller {
+        FrameReadbackPoller(configuration: configuration.withSlowAppBudget,
+                            generation: generation, ioFactory: ioFactory)
+    }
+
     var deadline: TimeInterval { configuration.deadline }
 
     func applyLayout(_ layouts: [(HyprWindow, CGRect)], usableFrame: CGRect,

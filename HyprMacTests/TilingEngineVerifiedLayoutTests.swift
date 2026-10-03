@@ -163,6 +163,76 @@ final class TilingEngineVerifiedLayoutTests: XCTestCase {
         XCTAssertEqual(fixture.trace.restorationApplications, 1)
     }
 
+    func testSlowAppWhoseRollbackAlsoTimesOutRecoversOnTheSlowBudget() {
+        let fixture = slowAppFixture(latency: 0.4)
+
+        let outcome = fixture.engine.applyVerifiedLayout(
+            fixture.tree, in: fixture.usable, generation: fixture.generation,
+            originalFrames: fixture.originals
+        )
+
+        guard case let .accepted(frames, _) = outcome else {
+            return XCTFail("expected the slow-budget retry to land the layout, got \(outcome)")
+        }
+        XCTAssertEqual(frames, fixture.targets)
+        XCTAssertEqual(fixture.trace.frames, fixture.targets)
+        XCTAssertEqual(fixture.engine.slowFrameApps, [slowAppPID])
+        XCTAssertEqual(fixture.trace.restorationSizeWrites, 1)
+        XCTAssertEqual(fixture.trace.maximumTimeout, 1.0, accuracy: 0.001)
+    }
+
+    func testKnownSlowAppLaysOutOnTheSlowBudgetWithoutRollingBack() {
+        let fixture = slowAppFixture(latency: 0.4)
+        _ = fixture.engine.applyVerifiedLayout(
+            fixture.tree, in: fixture.usable, generation: fixture.generation,
+            originalFrames: fixture.originals
+        )
+        XCTAssertEqual(fixture.engine.slowFrameApps, [slowAppPID])
+        fixture.trace.frames = fixture.originals
+        fixture.trace.restorationSizeWrites = 0
+        fixture.trace.timedOutCalls = 0
+
+        let outcome = fixture.engine.applyVerifiedLayout(
+            fixture.tree, in: fixture.usable,
+            generation: fixture.engine.beginLayoutGeneration(),
+            originalFrames: fixture.originals
+        )
+
+        guard case .accepted = outcome else {
+            return XCTFail("expected a known slow app to verify first time, got \(outcome)")
+        }
+        XCTAssertEqual(fixture.trace.frames, fixture.targets)
+        XCTAssertEqual(fixture.trace.timedOutCalls, 0)
+        XCTAssertEqual(fixture.trace.restorationSizeWrites, 0)
+    }
+
+    func testAppThatTimesOutAtTheSlowBudgetIsDroppedAsHung() {
+        let fixture = slowAppFixture(latency: 5)
+
+        let outcome = fixture.engine.applyVerifiedLayout(
+            fixture.tree, in: fixture.usable, generation: fixture.generation,
+            originalFrames: fixture.originals
+        )
+
+        guard case let .degraded(reason, _, attempted, _, _) = outcome else {
+            return XCTFail("expected a hung app to degrade, got \(outcome)")
+        }
+        XCTAssertEqual(reason, .writeFailed(901, .cannotComplete))
+        XCTAssertTrue(attempted)
+        XCTAssertTrue(fixture.engine.slowFrameApps.isEmpty)
+    }
+
+    func testAppSlowOnlyOnceStaysOnTheSlowBudgetAfterRelaxedRecovery() {
+        let fixture = timeoutRecoveryFixture(mode: .readTimeout)
+
+        _ = fixture.engine.applyVerifiedLayout(
+            fixture.tree, in: fixture.usable, generation: fixture.generation,
+            originalFrames: fixture.originals
+        )
+
+        XCTAssertEqual(fixture.engine.slowFrameApps, [fixture.window.ownerPID])
+    }
+
     func testCellQuantizedWindowTilesWithoutRestoringSiblings() {
         let first = makeWindow(id: 501)
         let second = makeWindow(id: 502)
@@ -943,6 +1013,93 @@ private final class TimeoutRecoveryTrace {
                 }
                 return .restored
             }
+        )
+    }
+}
+
+private let slowAppPID: pid_t = 4242
+
+private struct SlowAppFixture {
+    let tree: BSPTree
+    let engine: TilingEngine
+    let trace: SlowAppTrace
+    let usable: CGRect
+    let originals: [CGWindowID: CGRect]
+    let targets: [CGWindowID: CGRect]
+    let generation: UInt64
+}
+
+private func slowAppFixture(latency: TimeInterval) -> SlowAppFixture {
+    let window = makeWindow(id: 901, pid: slowAppPID)
+    let tree = BSPTree()
+    XCTAssertTrue(tree.insert(window, maxDepth: 2))
+    let usable = CGRect(x: -1080, y: -96, width: 1080, height: 1890)
+    let originals: [CGWindowID: CGRect] = [
+        901: CGRect(x: -648, y: -88, width: 640, height: 933)
+    ]
+    let targets = Dictionary(uniqueKeysWithValues: tree.layout(
+        in: usable, gap: TilingConfig.defaultGap, padding: TilingConfig.defaultOuterPadding
+    ).map { ($0.0.windowID, $0.1) })
+    let trace = SlowAppTrace(frames: originals, original: originals[901]!, latency: latency)
+    let engine = TilingEngine(
+        displayManager: DisplayManager(),
+        frameSizingIOFactory: { _, generation in trace.io(generation: generation) }
+    )
+    return SlowAppFixture(tree: tree, engine: engine, trace: trace, usable: usable,
+                          originals: originals, targets: targets,
+                          generation: engine.beginLayoutGeneration())
+}
+
+/// An app whose size writes take `latency` to answer, the way iTerm2
+/// reflows a terminal. A call whose timeout runs out first comes back
+/// `cannotComplete` at the timeout, and the write still lands: AX stopped
+/// waiting, the app did not drop it.
+private final class SlowAppTrace {
+    var frames: [CGWindowID: CGRect]
+    var restorationSizeWrites = 0
+    var timedOutCalls = 0
+    var maximumTimeout: TimeInterval = 0
+    private var now: TimeInterval = 0
+    private let original: CGRect
+    private let latency: TimeInterval
+
+    init(frames: [CGWindowID: CGRect], original: CGRect, latency: TimeInterval) {
+        self.frames = frames
+        self.original = original
+        self.latency = latency
+    }
+
+    func io(generation: @escaping () -> UInt64) -> FrameSizingIO {
+        FrameSizingIO(
+            setMessagingTimeout: { [self] _, timeout in
+                maximumTimeout = max(maximumTimeout, timeout)
+                return .success
+            },
+            writeSize: { [self] id, size, timeout in
+                maximumTimeout = max(maximumTimeout, timeout)
+                if size == original.size { restorationSizeWrites += 1 }
+                var frame = frames[id] ?? .zero
+                frame.size = size
+                frames[id] = frame
+                guard timeout >= latency else {
+                    timedOutCalls += 1
+                    now += timeout
+                    return .cannotComplete
+                }
+                now += latency
+                return .success
+            },
+            writePosition: { [self] id, position, _ in
+                var frame = frames[id] ?? .zero
+                frame.origin = position
+                frames[id] = frame
+                return .success
+            },
+            readPosition: { [self] id, _ in (.success, frames[id]?.origin) },
+            readSize: { [self] id, _ in (.success, frames[id]?.size) },
+            now: { [self] in now },
+            sleep: { [self] interval in now += interval },
+            currentGeneration: generation
         )
     }
 }

@@ -28,7 +28,10 @@
    LayoutTreeSerializeTests, ScratchpadLayerLayoutTests, TilingEngineMembershipTransactionTests,
    TilingEngineSwapRevalidationTests, TilingEngineTiledDragTests, WorkspaceBatchMoveTests,
    WorkspaceFollowTests. Cause not investigated. Because one crash aborts an `All` run, run classes
-   one by one until it is fixed.
+   one by one until it is fixed. Run test by test (2026-10-04, `f7de082`): 123 of their tests crash,
+   416 pass, and one fails on unmodified code as well:
+   `TilingEngineMembershipTransactionTests/testSecondTargetFailureWithParkedOriginalsPublishesNothingAndWritesNoParkedFrame`
+   (`written` is `[901, 902]`, expected `[901, 902, 903]`).
 
 4. **`scripts/test-isolated.sh` cannot load the test bundle on this Mac.** It exports
    `DYLD_LIBRARY_PATH` and then runs `xcrun xctest`. `xcrun` lives in `/usr/bin`, so macOS strips
@@ -37,6 +40,18 @@
    environment. A fix would be to resolve the xctest path with `xcrun -f` inside the script.
 
 ## Completed
+
+- **2026-10-04 — Hypr resize snapped back on iTerm2 windows.** iTerm2 answers a size write in
+  160–740 ms (measured over AX). HyprMac's 0.1 s call timeout gave up, the rollback gave up the same
+  way (`-25204`, `cannotComplete`), the 0.25 s relaxed retry never ran because it needs a verified
+  rollback, and both queued writes still landed in order, so every resize ended back at the old
+  split (107 failed writes in the log, all iTerm2). The engine now learns slow apps per process
+  and gives their layouts a 1 s call / 2 s deadline budget, with one slow-budget retry when both
+  the candidate and its rollback time out. An app that times out even then is dropped as hung.
+  Design in `docs/tiling-algorithm.md`; tests in `TilingEngineVerifiedLayoutTests`. Each iTerm2
+  resize still stalls HyprMac's main thread for as long as iTerm2 takes. Checked live 02:03:
+  iTerm2 was learned slow on the startup retile, then 14 Hypr resizes all held (ratio stepped
+  0.45 → 0.65 and back) with iTerm2 size writes succeeding in 168–202 ms.
 
 - **2026-10-04 — Caps Lock works as Caps Lock again when tapped alone.** With Caps Lock remapped to
   F18 as the Hypr key it never toggled. A bare tap (no other key, modifier or mouse press, released

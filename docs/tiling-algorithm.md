@@ -197,6 +197,30 @@ on the settle read, the release screen's read, each candidate and each
 rollback. A `cannotComplete` that comes back at once is AX refusing, and
 gets no second try.
 
+Some apps are slow at every resize, not just after a display hop. iTerm2,
+live: a size write answered in 160–740 ms, so the 0.1 s call gave up, the
+rollback gave up the same way, and both writes still landed in order. Every
+Hypr resize of a terminal snapped back to the old split. So the engine
+learns slow apps per process (`TilingEngine.slowFrameApps`):
+
+- A candidate that ends on a timeout-shaped `cannotComplete` marks the
+  owner of that window slow.
+- When the rollback times out the same way, the layout gets one more try
+  on the slow-app budget (`withSlowAppBudget`: 1 s per call, 2 s deadline),
+  and, if that fails, one rollback on the same budget. Logged as
+  `verified layout slow app recovery`.
+- Every later layout that touches a slow app's window runs every pass on
+  that budget, capture and rollback included, and skips the 0.25 s relaxed
+  retry, which would only shorten it.
+- A process that times out even at the slow-app budget is hung, not slow,
+  and is dropped (`slow frame app dropped`), so it cannot stall the main
+  thread on every layout.
+
+The cost is main-thread time: the budget waits as long as the app takes,
+so each slow-app resize stalls HyprMac for that long. The set lives in
+memory only. The tiled drag keeps its own 0.25 s recovery and does not use
+it.
+
 A pass that moves a window onto a screen with a different backing scale
 factor gets a 1-second deadline instead, with the sample limit raised to
 match. The engine compares the scale of the screen holding most of each
