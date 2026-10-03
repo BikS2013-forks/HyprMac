@@ -13,6 +13,18 @@ private struct TilingKey: Hashable {
         self.workspace = workspace
         self.screenID = Int(screen.frame.origin.x * 10000 + screen.frame.origin.y)
     }
+
+    init(workspace: Int, screenID: Int) {
+        self.workspace = workspace
+        self.screenID = screenID
+    }
+}
+
+/// Where a tree waits while its native Space (macOS desktop) is not the
+/// active one on its screen.
+private struct NativeSpaceParkKey: Hashable {
+    let key: TilingKey
+    let space: UInt64
 }
 
 private struct TiledDragOccluderContext: Equatable {
@@ -97,6 +109,22 @@ class TilingEngine {
         /// it never recovers until an accepted layout drops the record —
         /// because from then on nobody knows where the incumbents are.
         var restorationVerifiedThroughout: Bool
+    }
+
+    /// Where a window sent to a dedicated workspace came from: the source
+    /// tree as it stood with the window still in its slot, or nil when the
+    /// window was floating there and had no slot.
+    private struct DedicatedReturn {
+        let source: TilingKey
+        let destination: Int
+        let tree: BSPTree?
+    }
+
+    /// A tree set aside with the per-key state that belongs to it.
+    private struct NativeSpaceParkedTree {
+        let tree: BSPTree
+        let unverified: UnverifiedRecord?
+        let pendingInserted: [CGWindowID]?
     }
 
     /// What one tiling pass did with the windows it had just inserted.
@@ -216,6 +244,16 @@ class TilingEngine {
     /// Set by any non-accepted attempt, cleared by an accepted one or by
     /// lifecycle cleanup. Nothing in here advertises an intended rect.
     private var unverified: [TilingKey: UnverifiedRecord] = [:]
+    /// Active native Space (macOS desktop) per screen as of the last
+    /// `syncNativeSpaces`. Keyed by `TilingKey.screenID`.
+    private var nativeSpaceByScreen: [Int: UInt64] = [:]
+    /// Trees of native Spaces that are not active on their screen. Kept out
+    /// of `trees` so nothing — the gone path's `removeWindowID`, a retile —
+    /// can touch them while their windows are off screen.
+    private var nativeSpaceParkedTrees: [NativeSpaceParkKey: NativeSpaceParkedTree] = [:]
+    /// Per window moved by Hypr+F, the layout it left. Read by the second
+    /// Hypr+F to put the window back in its slot.
+    private var dedicatedReturns: [CGWindowID: DedicatedReturn] = [:]
     let displayManager: DisplayManager
 
     /// Gap between adjacent tiles, in pixels. Default from
@@ -332,6 +370,67 @@ class TilingEngine {
         for workspace in Array(admittedWindowIDs.keys) {
             admittedWindowIDs[workspace]?.remove(windowID)
         }
+        // a forgotten or recycled id has no slot to go back to
+        dedicatedReturns.removeValue(forKey: windowID)
+    }
+
+    // MARK: - dedicated workspace return
+
+    /// Keep the `(workspace, screen)` layout `window` is about to leave for
+    /// a dedicated workspace, with the window still in its slot. Call before
+    /// its membership is removed. A window that was not tiled there (a
+    /// floater) has no slot; only where it came from is kept.
+    func rememberDedicatedReturn(_ window: HyprWindow, fromWorkspace workspace: Int,
+                                 toWorkspace destination: Int, screen: NSScreen) {
+        let key = TilingKey(workspace: workspace, screen: screen)
+        let slot = trees[key].flatMap { $0.contains(window) ? $0.deepClone() : nil }
+        dedicatedReturns[window.windowID] = DedicatedReturn(
+            source: key, destination: destination, tree: slot)
+    }
+
+    /// The workspace `windowID` came from, when it is still on the dedicated
+    /// workspace Hypr+F sent it to. A record whose window has since moved
+    /// elsewhere is dropped.
+    func dedicatedReturnWorkspace(for windowID: CGWindowID, currentWorkspace: Int) -> Int? {
+        guard let record = dedicatedReturns[windowID] else { return nil }
+        guard record.destination == currentWorkspace else {
+            dedicatedReturns.removeValue(forKey: windowID)
+            return nil
+        }
+        return record.source.workspace
+    }
+
+    /// Put the kept layout back as the source workspace's tree, `window` in
+    /// its old slot with every ratio it had. Only when the source tree still
+    /// holds exactly the windows it had without `window`: anything opened or
+    /// closed there since makes the kept shape wrong, and the caller falls
+    /// back to an ordinary move. The record is spent either way.
+    ///
+    /// Tree only. The caller moves the assignment and shows the workspace,
+    /// whose retile then finds every window in the tree and inserts nothing.
+    func restoreDedicatedReturn(_ window: HyprWindow, screen: NSScreen) -> Bool {
+        guard let record = dedicatedReturns.removeValue(forKey: window.windowID) else { return false }
+        guard record.source == TilingKey(workspace: record.source.workspace, screen: screen) else {
+            hyprLog(.notice, .tiling, "dedicated return: \(window.windowID) is on another screen now — ordinary move")
+            return false
+        }
+        guard let keptTree = record.tree else { return false }
+        let kept = Set(keptTree.allWindows.map(\.windowID))
+        let live = Set(trees[record.source]?.allWindows.map(\.windowID) ?? [])
+        guard kept.contains(window.windowID), live == kept.subtracting([window.windowID]) else {
+            hyprLog(.notice, .tiling, "dedicated return: ws\(record.source.workspace) changed while"
+                    + " \(window.windowID) was away (kept=\(kept.sorted()) live=\(live.sorted())) — ordinary move")
+            return false
+        }
+        invalidatePendingLayout()
+        if let tree = trees[record.source] {
+            tree.root = keptTree.root
+        } else {
+            trees[record.source] = keptTree
+        }
+        admit([window.windowID], toWorkspace: record.source.workspace)
+        hyprLog(.notice, .tiling, "dedicated return: \(window.windowID) back in its slot on ws\(record.source.workspace)")
+        return true
     }
 
     /// Defensive cleanup — drop `windowID` from whichever BSP tree
@@ -350,6 +449,82 @@ class TilingEngine {
             t.root.pruneEmptyNodes()
             return
         }
+    }
+
+    /// One screen's active native Space, as read from the window server.
+    struct NativeSpaceReading: Equatable {
+        let screen: NSScreen
+        let space: UInt64
+    }
+
+    /// Follow the active native Space (macOS desktop) of each screen.
+    ///
+    /// Windows on an inactive native Space drop out of the on-screen window
+    /// list, so without this the discovery gone path pulls them out of
+    /// their trees and they come back as re-inserts, which resets every
+    /// user-set split ratio. Instead, when a screen's Space changes, every
+    /// tree on that screen (scratchpad excepted) is parked under the Space
+    /// it belonged to, and the trees parked for the new Space take their
+    /// place. Returning windows then find their slots and ratios intact.
+    ///
+    /// Must run before the discovery diff of a snapshot taken on the new
+    /// Space. The first reading for a screen only records it. Parked trees
+    /// of Spaces not in `existingSpaces` (deleted desktops) are dropped.
+    ///
+    /// - Returns: `true` when any screen switched Space.
+    @discardableResult
+    func syncNativeSpaces(_ readings: [NativeSpaceReading], existingSpaces: Set<UInt64>) -> Bool {
+        var switched = false
+        for reading in readings {
+            let screenID = TilingKey(workspace: 0, screen: reading.screen).screenID
+            let previous = nativeSpaceByScreen[screenID]
+            nativeSpaceByScreen[screenID] = reading.space
+            guard let previous, previous != reading.space else { continue }
+            switched = true
+            invalidatePendingLayout()
+            pendingSwapRevert = nil
+
+            var parked = 0
+            for key in trees.keys where key.screenID == screenID
+                && key.workspace != Self.scratchpadWorkspace {
+                guard let tree = trees.removeValue(forKey: key) else { continue }
+                let entry = NativeSpaceParkedTree(
+                    tree: tree,
+                    unverified: unverified.removeValue(forKey: key),
+                    pendingInserted: pendingInsertedWindowIDs.removeValue(forKey: key))
+                guard !tree.allWindows.isEmpty || entry.unverified != nil else { continue }
+                nativeSpaceParkedTrees[NativeSpaceParkKey(key: key, space: previous)] = entry
+                parked += 1
+            }
+
+            var restored = 0
+            for (parkKey, entry) in nativeSpaceParkedTrees
+            where parkKey.space == reading.space && parkKey.key.screenID == screenID {
+                nativeSpaceParkedTrees.removeValue(forKey: parkKey)
+                trees[parkKey.key] = entry.tree
+                if let record = entry.unverified { unverified[parkKey.key] = record }
+                if let ids = entry.pendingInserted { pendingInsertedWindowIDs[parkKey.key] = ids }
+                restored += 1
+            }
+
+            hyprLog(.notice, .tiling, "native space change: sid=\(screenID) space \(previous) → \(reading.space)"
+                    + " — parked \(parked) tree(s), restored \(restored)")
+        }
+
+        let stale = nativeSpaceParkedTrees.keys.filter { !existingSpaces.contains($0.space) }
+        for parkKey in stale {
+            nativeSpaceParkedTrees.removeValue(forKey: parkKey)
+            hyprLog(.notice, .tiling, "native space \(parkKey.space) is gone — dropped its parked ws\(parkKey.key.workspace) tree")
+        }
+        return switched
+    }
+
+    /// Window ids of the tree parked for `(workspace, screen, space)`, in
+    /// tree order. Read-only; tests and the state dump use it.
+    func parkedNativeSpaceWindowIDs(forWorkspace workspace: Int, screen: NSScreen,
+                                    space: UInt64) -> [CGWindowID]? {
+        let key = NativeSpaceParkKey(key: TilingKey(workspace: workspace, screen: screen), space: space)
+        return nativeSpaceParkedTrees[key]?.tree.allWindows.map(\.windowID)
     }
 
     /// The bound a fit check should honour for `window`.
@@ -1089,6 +1264,22 @@ class TilingEngine {
                              homeScreenForWorkspace: (Int) -> NSScreen?) {
         // resolution and usable bounds can change without changing a tree key.
         invalidatePendingLayout()
+        // parked native-Space trees are keyed by screen origin like the live
+        // ones. this notification also fires when nothing moved (Dock, menu
+        // bar, resolution), so a parked tree stays while its screen is still
+        // its workspace's home. one whose screen left is dropped rather than
+        // migrated — the Space ids of a reconnected display are not stable —
+        // and its windows rejoin as ordinary returns on the next poll.
+        let liveScreenIDs = Set(currentScreens.map { TilingKey(workspace: 0, screen: $0).screenID })
+        nativeSpaceByScreen = nativeSpaceByScreen.filter { liveScreenIDs.contains($0.key) }
+        let strandedParks = nativeSpaceParkedTrees.keys.filter { parkKey in
+            let home = homeScreenForWorkspace(parkKey.key.workspace)
+            return home.map { TilingKey(workspace: 0, screen: $0).screenID } != parkKey.key.screenID
+        }
+        for parkKey in strandedParks { nativeSpaceParkedTrees.removeValue(forKey: parkKey) }
+        if !strandedParks.isEmpty {
+            hyprLog(.notice, .lifecycle, "display change: dropped \(strandedParks.count) parked native-space tree(s) whose screen left")
+        }
         var migrations: [(old: TilingKey, dest: NSScreen)] = []
         var orphans: [TilingKey] = []
 
@@ -1968,8 +2159,12 @@ class TilingEngine {
             }
         }
 
+        // an insert only adds a split under the leaf it lands on, and that
+        // split starts at the default (BSPNode.insert). splits the user sized
+        // keep their ratio: clearing them all here reset the whole layout
+        // every time an app reopened a window under a new id (Outlook does it
+        // to its main window) or a dialog-like window came and went.
         if !insertedWindows.isEmpty {
-            t.root.clearUserSetRatios()
             t.root.resetSplitRatios()
         }
         t.root.applySavedRatios()
@@ -2617,6 +2812,30 @@ class TilingEngine {
         if layoutGeneration == generation { t.restore(snapshot) }
     }
 
+    /// Mirror the `(workspace, screen)` layout left↔right, keeping every
+    /// split's widths. Applied through the ordinary verified retile; a
+    /// rejected layout puts the tree back as it was.
+    ///
+    /// - Returns: `false` when the tree has no side-by-side split to flip or
+    ///   the flipped layout was rejected.
+    @discardableResult
+    func flipWorkspace(onWorkspace workspace: Int, screen: NSScreen) -> Bool {
+        let key = TilingKey(workspace: workspace, screen: screen)
+        guard let t = trees[key] else { return false }
+        let rect = layoutRect(for: key, screen: screen)
+        let snapshot = t.snapshot()
+        let topology = t.topologySnapshot()
+        let generation = invalidatePendingLayout()
+        guard t.mirrorHorizontally(in: rect, gap: gapSize, padding: outerPadding) else { return false }
+        let outcome = retile(key: key, screen: screen, generation: generation)
+        if case .accepted = outcome { return true }
+        if layoutGeneration == generation {
+            t.restore(topology)
+            t.restore(snapshot)
+        }
+        return false
+    }
+
     /// Resize the focused window by moving the nearest matching-axis split
     /// boundary in `direction`. Walks from the leaf upward to find the first
     /// ancestor whose split direction matches the resize axis, then shifts
@@ -3000,18 +3219,25 @@ class TilingEngine {
                         positionRead.0 != .success ? positionRead.0 : sizeRead.0))
                 }
                 let actual = CGRect(origin: actualPosition, size: actualSize)
+                stableSamples[window.windowID] = Self.parkStableSamples(
+                    after: stableSamples[window.windowID, default: 0],
+                    previous: lastFrames[window.windowID], actual: actual,
+                    original: original, displayFrames: displayFrames)
                 lastFrames[window.windowID] = actual
-                let sizeStable = abs(actual.width - original.width) <= 1
-                    && abs(actual.height - original.height) <= 1
-                if sizeStable && Self.isHiddenParkedFrame(actual, on: displayFrames) {
-                    stableSamples[window.windowID, default: 0] += 1
-                } else {
-                    stableSamples[window.windowID] = 0
-                }
                 pending = pending || stableSamples[window.windowID, default: 0] < 2
             }
             if !pending {
                 guard layoutGeneration == prepared.generation else { return .degraded(.superseded) }
+                let resized = windows.filter { window in
+                    guard let original = prepared.originals[window.windowID],
+                          let actual = lastFrames[window.windowID] else { return false }
+                    return !Self.sameSize(actual, original)
+                }
+                if !resized.isEmpty {
+                    hyprLog(.notice, .workspace, "position-only park: macOS resized hidden windows"
+                            + " [\(resized.map { String($0.windowID) }.joined(separator: ", "))]"
+                            + " to fit the parking display — accepted, their frames are restored on reveal")
+                }
                 hyprLog(.debug, .workspace, "verified position-only park: ids="
                         + "[\(windows.map(\.windowID).sorted().map(String.init).joined(separator: ", "))]"
                         + " frames=\(lastFrames) hidden=true")
@@ -3022,6 +3248,32 @@ class TilingEngine {
         let failed = windows.first { stableSamples[$0.windowID, default: 0] < 2 }
         hyprLog(.notice, .workspace, "position-only park rejected: frames=\(lastFrames) hidden=false")
         return .degraded(.geometryMismatch(failed?.windowID ?? 0))
+    }
+
+    /// The stable-sample count for one parking readback.
+    ///
+    /// A sample counts only while the window is hidden (at most one pixel
+    /// visible on every display). macOS keeps a parked window's size on most
+    /// layouts, and that sample counts straight away. When the parking display
+    /// is shorter than the window, macOS also shrinks it to fit and pins it to
+    /// that display's top; that sample counts only once the frame matches the
+    /// previous reading, so a still-settling resize is not taken as parked. The
+    /// resize is harmless: tiled windows are laid out again on reveal and
+    /// floaters get their saved original frame back.
+    static func parkStableSamples(after count: Int, previous: CGRect?, actual: CGRect,
+                                  original: CGRect, displayFrames: [CGRect]) -> Int {
+        guard isHiddenParkedFrame(actual, on: displayFrames) else { return 0 }
+        if sameSize(actual, original) { return count + 1 }
+        guard let previous, sameFrame(previous, actual) else { return 0 }
+        return count + 1
+    }
+
+    private static func sameSize(_ a: CGRect, _ b: CGRect) -> Bool {
+        abs(a.width - b.width) <= 1 && abs(a.height - b.height) <= 1
+    }
+
+    private static func sameFrame(_ a: CGRect, _ b: CGRect) -> Bool {
+        sameSize(a, b) && abs(a.minX - b.minX) <= 1 && abs(a.minY - b.minY) <= 1
     }
 
     static func isHiddenParkedFrame(_ frame: CGRect, on displayFrames: [CGRect],

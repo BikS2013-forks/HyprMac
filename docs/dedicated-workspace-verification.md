@@ -55,6 +55,20 @@ back. Ordinary tiling and restoration retain their strict geometry checks.
 The focused window also stays put when it is the only assigned workspace
 window, whether tiled or floating. The website reducer matches that rule.
 
+## Follow-up: parking on a shorter display (2026-10-03)
+
+The parking corner is on the rightmost display. When that display is
+shorter than a source window (a 982pt laptop beside a 1440pt monitor),
+macOS shrinks the parked window to fit and pins it to that display's top:
+1268×1322 came back as 1268×949 at y=491, one pixel visible. The
+preserved-size rule rejected it, so every Hypr+F rolled back with the
+error flash. `TilingEngine.parkStableSamples` now accepts a hidden window
+whose size changed once two readings return the same frame. A visible
+window still rejects. The resize is harmless: tiled windows are laid out
+again on reveal, and floaters get their captured original frame back
+through `setSavedFloatingFrame`. The park logs
+`position-only park: macOS resized hidden windows […]` at `.notice`.
+
 ## Source
 
 Implementation branch: `feature/fullscreen-workspace-shortcut`.

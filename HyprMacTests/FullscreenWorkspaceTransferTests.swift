@@ -268,6 +268,41 @@ final class FullscreenWorkspaceOrchestratorTests: XCTestCase {
             CGRect(x: 1500, y: 930, width: 600, height: 500), on: [display]))
     }
 
+    // live case, 2026-10-03: the parking corner is on a laptop display 949pt
+    // tall. macOS shrank a 1268x1322 window to 1268x949 and pinned it to that
+    // display's top, one pixel visible. it is hidden; only the size changed.
+    func testParkingAcceptsAHiddenWindowMacOSResizedOnceItSettles() {
+        let laptop = CGRect(x: 2560, y: 458, width: 1512, height: 982)
+        let monitor = CGRect(x: 0, y: 0, width: 2560, height: 1440)
+        let original = CGRect(x: 8, y: 38, width: 1268, height: 1322)
+        let parked = CGRect(x: 4071, y: 491, width: 1268, height: 949)
+
+        let first = TilingEngine.parkStableSamples(after: 0, previous: nil, actual: parked,
+                                                   original: original, displayFrames: [monitor, laptop])
+        XCTAssertEqual(first, 0, "a resized frame counts only once it repeats")
+        let second = TilingEngine.parkStableSamples(after: first, previous: parked, actual: parked,
+                                                    original: original, displayFrames: [monitor, laptop])
+        let third = TilingEngine.parkStableSamples(after: second, previous: parked, actual: parked,
+                                                   original: original, displayFrames: [monitor, laptop])
+        XCTAssertEqual(third, 2, "two settled hidden readings park it")
+    }
+
+    func testParkingStillRejectsAResizedWindowThatStaysVisible() {
+        let laptop = CGRect(x: 2560, y: 458, width: 1512, height: 982)
+        let original = CGRect(x: 8, y: 38, width: 1268, height: 1322)
+        let visible = CGRect(x: 3000, y: 491, width: 1268, height: 949)
+        XCTAssertEqual(TilingEngine.parkStableSamples(after: 1, previous: visible, actual: visible,
+                                                      original: original, displayFrames: [laptop]), 0)
+    }
+
+    func testParkingCountsAPreservedSizeSliverRightAway() {
+        let display = CGRect(x: 0, y: 0, width: 1600, height: 1000)
+        let original = CGRect(x: 100, y: 100, width: 600, height: 500)
+        let parked = CGRect(x: 1599, y: 930, width: 600, height: 500)
+        XCTAssertEqual(TilingEngine.parkStableSamples(after: 0, previous: nil, actual: parked,
+                                                      original: original, displayFrames: [display]), 1)
+    }
+
     func testParkingFailureRestoresFramesAndLeavesOwnershipUntouched() throws {
         let screen = TransferScreen(x: 0)
         let display = DisplayManager(screenSource: { [screen] })

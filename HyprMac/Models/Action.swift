@@ -32,6 +32,9 @@ enum Action: Equatable {
     case moveWindowToMonitor(Direction)
     case toggleFloating
     case toggleSplit
+    /// Mirror the focused window's workspace left↔right, keeping every
+    /// split's widths, so a stacked side moves across as a group.
+    case flipWorkspace
     case showKeybinds
     case showWorkspaceOverview
     case launchApp(bundleID: String)
@@ -97,6 +100,7 @@ extension Action: Codable {
         case moveWindowToMonitor    = "moveWorkspaceToMonitor"
         case toggleFloating
         case toggleSplit
+        case flipWorkspace
         case showKeybinds
         case showWorkspaceOverview
         case launchApp
@@ -169,6 +173,7 @@ extension Action: Codable {
             self = .launchApp(bundleID: try inner.decode(String.self, forKey: .bundleID))
         case .toggleFloating: self = .toggleFloating
         case .toggleSplit:    self = .toggleSplit
+        case .flipWorkspace:  self = .flipWorkspace
         case .showKeybinds:   self = .showKeybinds
         case .showWorkspaceOverview: self = .showWorkspaceOverview
         case .focusMenuBar:   self = .focusMenuBar
@@ -235,6 +240,8 @@ extension Action: Codable {
             _ = c.nestedContainer(keyedBy: PayloadKey.self, forKey: .toggleFloating)
         case .toggleSplit:
             _ = c.nestedContainer(keyedBy: PayloadKey.self, forKey: .toggleSplit)
+        case .flipWorkspace:
+            _ = c.nestedContainer(keyedBy: PayloadKey.self, forKey: .flipWorkspace)
         case .showKeybinds:
             _ = c.nestedContainer(keyedBy: PayloadKey.self, forKey: .showKeybinds)
         case .showWorkspaceOverview:

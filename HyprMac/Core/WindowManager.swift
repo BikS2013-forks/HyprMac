@@ -424,6 +424,9 @@ class WindowManager {
         // CGWindowID against the last discovery snapshot before falling back
         // to a full AX walk.
         accessibility.cachedWindowLookup = { [weak self] wid in self?.stateCache.cachedWindows[wid] }
+        accessibility.offSpaceWindowIDs = { [weak self] ids in
+            self?.spaceManager.offSpaceWindowIDs(ids) ?? []
+        }
 
         // wire up floating controller — closure handles for WM-side helpers.
         floatingController.animatedRetile = { [weak self] prepare in
@@ -2020,6 +2023,9 @@ class WindowManager {
             hyprLog(.notice, .lifecycle, "retile deferred mid-display-transition")
             return []
         }
+        if windows == nil, let spaces = nativeSpaceReadings() {
+            tilingEngine.syncNativeSpaces(spaces.readings, existingSpaces: spaces.all)
+        }
         let allWindows = windows ?? accessibility.getAllWindows()
         tilingEngine.primeMinimumSizes(allWindows)
 
@@ -2470,7 +2476,8 @@ class WindowManager {
         switch action {
         case .switchWorkspace, .cycleWorkspace, .focusDirection, .focusFloating,
              .focusMenuBar, .showKeybinds, .showWorkspaceOverview, .launchApp,
-             .runCommand, .saveLayout, .resizeDirection, .swapDirection, .toggleSplit:
+             .runCommand, .saveLayout, .resizeDirection, .swapDirection, .toggleSplit,
+             .flipWorkspace:
             return false
         default: return true
         }
@@ -2781,6 +2788,24 @@ class WindowManager {
         return result
     }
 
+    // MARK: - native Spaces
+
+    /// The active native Space of each screen, plus every Space that exists,
+    /// from one window-server read. A screen whose display CGS does not list
+    /// gets no reading and keeps its trees as they are. `nil` when CGS does
+    /// not answer.
+    private func nativeSpaceReadings() -> (readings: [TilingEngine.NativeSpaceReading], all: Set<UInt64>)? {
+        guard let spaces = spaceManager.activeSpaces() else { return nil }
+        // "Displays have separate Spaces" off: one Space set spans every screen
+        let shared = spaces.currentByDisplay.count == 1 ? spaces.currentByDisplay.values.first : nil
+        let readings = displayManager.screens.compactMap { screen -> TilingEngine.NativeSpaceReading? in
+            let own = SpaceManager.displayUUID(for: screen).flatMap { spaces.currentByDisplay[$0] }
+            guard let space = own ?? shared else { return nil }
+            return TilingEngine.NativeSpaceReading(screen: screen, space: space)
+        }
+        return (readings, spaces.allSpaces)
+    }
+
     // MARK: - poll
 
     /// Run a single discovery diff and hand the result to the dispatcher's
@@ -2798,7 +2823,20 @@ class WindowManager {
         // a hypothetical direct call landing mid-drag.
         guard !mouseButtonDown else { return }
 
+        // the native Space is read on both sides of the snapshot: a desktop
+        // switch landing in between would diff one Space's windows against
+        // the other's trees and pull the departing windows out of them
+        let spacesBefore = nativeSpaceReadings()
         let allWindows = accessibility.getAllWindows()
+        let spacesAfter = nativeSpaceReadings()
+        if let spacesBefore, let spacesAfter, spacesBefore.readings != spacesAfter.readings {
+            hyprLog(.debug, .discovery, "native space changed during the snapshot — re-polling")
+            pollingScheduler.schedule(after: 0.1)
+            return
+        }
+        if let spacesAfter {
+            tilingEngine.syncNativeSpaces(spacesAfter.readings, existingSpaces: spacesAfter.all)
+        }
         let now = Date()
         let gap = lastPollAt.map { "\(Int(now.timeIntervalSince($0) * 1000))ms since last" } ?? "first poll"
         lastPollAt = now
@@ -3034,10 +3072,16 @@ class WindowManager {
         }
     }
 
-    /// Active Space changed — most commonly because the user entered or
-    /// left a fullscreen app's Space. Re-evaluate chrome visibility from
-    /// the new focus target.
+    /// Active Space changed — the user switched native desktops, or entered
+    /// or left a fullscreen app's Space. Follow it in the trees, then
+    /// re-evaluate chrome visibility from the new focus target.
     @objc private func activeSpaceDidChange(_ notification: Notification) {
+        // swap the trees to the new desktop before any poll sees its
+        // windows, then diff it right away
+        if let spaces = nativeSpaceReadings(),
+           tilingEngine.syncNativeSpaces(spaces.readings, existingSpaces: spaces.all) {
+            pollingScheduler.schedule(after: 0.05)
+        }
         if isFullscreenSuppressed(focused: currentFocusedWindow()) {
             focusBorder.hide()
             focusBorder.hideFloatingBorders()

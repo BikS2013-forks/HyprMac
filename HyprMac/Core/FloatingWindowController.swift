@@ -398,22 +398,14 @@ final class FloatingWindowController {
                 tilingEngine.removeWindow(window, fromWorkspace: workspace)
 
                 let screenRect = displayManager.cgRect(for: screen)
-                if let original = stateCache.originalFrames[window.windowID],
-                   original.isSubstantiallyVisible(on: screenRect) {
-                    window.placeFloating(original, reason: "float toggle, original frame",
-                                         on: screen, displayManager: displayManager)
-                } else if let current = window.frame {
-                    let centeredOrigin = CGPoint(
-                        x: screenRect.midX - current.width / 2,
-                        y: screenRect.midY - current.height / 2
-                    )
-                    window.placeFloating(CGRect(origin: centeredOrigin, size: current.size),
-                                         reason: "float toggle, centered (no usable original)",
+                let target = Self.toggledFloatingFrame(in: screenRect)
+                if let current = window.frame {
+                    window.placeFloating(target, reason: "float toggle, centered at 60%",
                                          on: screen, from: current, displayManager: displayManager)
                 } else {
                     // unreadable frame: move only, as before. there is no
                     // real size to write or clamp
-                    let size = window.size ?? CGSize(width: 800, height: 600)
+                    let size = window.size ?? target.size
                     window.position = CGPoint(x: screenRect.midX - size.width / 2,
                                               y: screenRect.midY - size.height / 2)
                     hyprLog(.notice, .floating, "floating frame write: wid=\(window.windowID)"
@@ -421,6 +413,19 @@ final class FloatingWindowController {
                 }
             }
         }
+    }
+
+    /// Where a tiled window goes when toggled to floating: centered in the
+    /// screen's usable area, `TilingConfig.floatingToggleScreenFraction` of
+    /// its width and of its height. An app with a larger minimum size grows
+    /// past it; `placeFloating` keeps the result on screen.
+    static func toggledFloatingFrame(in screenRect: CGRect) -> CGRect {
+        let fraction = TilingConfig.floatingToggleScreenFraction
+        let size = CGSize(width: (screenRect.width * fraction).rounded(),
+                          height: (screenRect.height * fraction).rounded())
+        return CGRect(x: (screenRect.midX - size.width / 2).rounded(),
+                      y: (screenRect.midY - size.height / 2).rounded(),
+                      width: size.width, height: size.height)
     }
 
     /// The float→tile insertion, with one explicit revalidation behind it.

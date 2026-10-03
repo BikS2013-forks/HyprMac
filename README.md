@@ -71,7 +71,8 @@ permissions, and the recommended macOS settings.
 You'll feel at home. The differences are mostly macOS being macOS:
 
 - **Tiling:** BSP dwindle, like Hyprland's default layout. New windows split the focused one,
-  and **Hypr + J** flips the split direction. Drag a tiled window by its title bar onto another
+  **Hypr + J** flips the split direction, and **Hypr + Shift + J** mirrors the whole workspace
+  left to right, keeping each side's width. Drag a tiled window by its title bar onto another
   tile's edge to insert it there, or hold Hypr while dragging to swap the two. The tile can be on
   another monitor, and an empty workspace there takes the window whole. A highlight shows where
   the window will land before you let go.
@@ -79,7 +80,8 @@ You'll feel at home. The differences are mostly macOS being macOS:
   **Hypr + O**. macOS has no public API for this, so HyprMac keeps its own virtual workspaces and
   hides the other workspaces' windows when you switch.
 - **Hypr + F:** native macOS fullscreen spawns its own Space and wrecks the layout, so HyprMac
-  gives the window a dedicated empty workspace on its display instead.
+  gives the window a dedicated empty workspace on its display instead. Press it again on that
+  window to send it back to its old workspace, in the same slot and at the same size.
 - **Focus follows mouse:** there if you want it, with an adjustable hover rate.
 - **Hypr key:** Caps Lock by default. Settings → Keys also offers backslash, F13–F20, and
   Option or Command on either side. If you pick the left Option or Command key, that key plus
@@ -109,10 +111,11 @@ Everything below is configurable in Settings → Keys. The full reference lives 
 | `Hypr + Shift + 1–9` / `Hypr + Shift + 0` | Move window to workspace 1–9 / workspace 10 |
 | `Hypr + Ctrl + Shift + 1–9` / `Hypr + Ctrl + Shift + 0` | Move window to workspace 1–9 / 10 and switch there with it |
 | `Hypr + Tab` / `Hypr + Shift + Tab` | Cycle occupied workspaces on this monitor |
-| `Hypr + F` | Move window to a dedicated workspace on its display |
-| `Hypr + T` | Toggle floating and tiled |
+| `Hypr + F` | Move window to a dedicated workspace on its display; again to send it back |
+| `Hypr + T` | Toggle floating and tiled (a window set floating is centered at 60% of the screen) |
 | `Hypr + Shift + T` | Cycle focus through floating windows |
 | `Hypr + J` | Toggle split direction |
+| `Hypr + Shift + J` | Flip workspace left/right |
 | `Hypr + S` / `Hypr + Shift + S` | Toggle scratchpad / send window to scratchpad |
 | `Hypr + W` | Close window |
 | `Hypr + P` | Pause or resume tiling |

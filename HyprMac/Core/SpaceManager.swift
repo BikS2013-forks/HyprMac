@@ -121,6 +121,76 @@ class SpaceManager {
         return result
     }
 
+    /// One window-server read of the native Space layout: the active Space
+    /// per display (fullscreen Spaces included) and every Space that exists.
+    /// `nil` when CGS does not answer.
+    struct ActiveSpaces: Equatable {
+        /// Display UUID → active Space. A single "Main" entry when
+        /// "Displays have separate Spaces" is off.
+        let currentByDisplay: [String: CGSSpaceID]
+        let allSpaces: Set<CGSSpaceID>
+    }
+
+    func activeSpaces() -> ActiveSpaces? {
+        let conn = _CGSDefaultConnection()
+        guard let cfArray = CGSCopyManagedDisplaySpaces(conn),
+              let displaySpaces = cfArray as? [[String: Any]] else { return nil }
+
+        func spaceID(_ space: [String: Any]) -> CGSSpaceID? {
+            (space["ManagedSpaceID"] as? CGSSpaceID) ?? (space["id64"] as? CGSSpaceID)
+        }
+
+        var current: [String: CGSSpaceID] = [:]
+        var all: Set<CGSSpaceID> = []
+        for display in displaySpaces {
+            guard let displayID = display["Display Identifier"] as? String else { continue }
+            if let active = display["Current Space"] as? [String: Any], let sid = spaceID(active) {
+                current[displayID] = sid
+            }
+            for space in display["Spaces"] as? [[String: Any]] ?? [] {
+                if let sid = spaceID(space) { all.insert(sid) }
+            }
+        }
+        return ActiveSpaces(currentByDisplay: current, allSpaces: all)
+    }
+
+    /// Every native Space `windowID` belongs to. Empty when the window
+    /// server does not say.
+    func spaces(forWindow windowID: CGWindowID) -> Set<CGSSpaceID> {
+        let conn = _CGSDefaultConnection()
+        let winArray = [NSNumber(value: windowID)] as CFArray
+        guard let cfArray = CGSCopySpacesForWindows(conn, kCGSAllSpacesMask, winArray),
+              let spaces = cfArray as? [NSNumber] else { return [] }
+        return Set(spaces.map { $0.uint64Value })
+    }
+
+    /// Of `windowIDs`, the ones whose every Space is inactive — windows on
+    /// another desktop. A window with no reported Space, or on a Space that
+    /// is active on any display, is kept. Empty when CGS does not answer.
+    func offSpaceWindowIDs(_ windowIDs: [CGWindowID]) -> Set<CGWindowID> {
+        guard let active = activeSpaces() else { return [] }
+        return Self.offSpaceWindowIDs(windowIDs, activeSpaces: Set(active.currentByDisplay.values),
+                                      spacesForWindow: spaces(forWindow:))
+    }
+
+    /// The pure half of `offSpaceWindowIDs`.
+    static func offSpaceWindowIDs(_ windowIDs: [CGWindowID], activeSpaces: Set<CGSSpaceID>,
+                                  spacesForWindow: (CGWindowID) -> Set<CGSSpaceID>) -> Set<CGWindowID> {
+        Set(windowIDs.filter { id in
+            let spaces = spacesForWindow(id)
+            return !spaces.isEmpty && spaces.isDisjoint(with: activeSpaces)
+        })
+    }
+
+    /// Display UUID the window server uses for `screen`, matching the
+    /// "Display Identifier" key of `CGSCopyManagedDisplaySpaces`.
+    static func displayUUID(for screen: NSScreen) -> String? {
+        guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
+              let uuid = CGDisplayCreateUUIDFromDisplayID(number.uint32Value)?.takeRetainedValue()
+        else { return nil }
+        return CFUUIDCreateString(nil, uuid) as String
+    }
+
     /// Space ID for desktop `number` (1-indexed across all displays).
     /// Returns `nil` when the number is out of range.
     func spaceID(forDesktop number: Int) -> CGSSpaceID? {

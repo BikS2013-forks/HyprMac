@@ -25,7 +25,9 @@ workspace model: manage workspaces entirely in userspace via off-screen window h
 
 ### Known tradeoffs
 - 1px window sliver visible in screen corner (macOS won't allow fully off-screen windows)
-- macOS Spaces are bypassed entirely — use 1 Space per monitor
+- macOS Spaces are not managed (HyprMac never moves windows between them); 1 Space per monitor is
+  simplest. Each Space keeps its own tile trees, so switching desktops keeps the layout — see
+  "Native Spaces" in `docs/architecture.md`
 - No switch animation (instant, like Hyprland)
 
 ### Key design decisions

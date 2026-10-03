@@ -44,6 +44,10 @@ enum TilingConfig {
     // step size for keyboard-driven resize (resizeDirection action).
     static let resizeStep: CGFloat = 0.05
 
+    // a tiled window toggled to floating is centered on its screen and sized
+    // to this fraction of the usable width and height.
+    static let floatingToggleScreenFraction: CGFloat = 0.6
+
     // MARK: - min-size memory
 
     // slack on min-size conflict comparisons in BSPTree.adjustForMinSizes.

@@ -64,6 +64,14 @@ class AccessibilityManager {
     /// already matched on a prior pass. `nil` (unwired) forces the walk.
     var cachedWindowLookup: ((CGWindowID) -> HyprWindow?)?
 
+    /// Of the given window ids, the ones that sit only on inactive native
+    /// Spaces. Wired by `WindowManager` to the window server's Space
+    /// membership. During a desktop switch the on-screen list briefly holds
+    /// both desktops' windows; without this a snapshot taken then would put
+    /// the other desktop's windows into this desktop's tree. `nil` (unwired)
+    /// keeps every window.
+    var offSpaceWindowIDs: (([CGWindowID]) -> Set<CGWindowID>)?
+
     private func cgWindowsByPID() -> [pid_t: [CGWindowInfo]] {
         let now = CFAbsoluteTimeGetCurrent()
         if now - cgWindowCacheTime < cgWindowCacheTTL && !cgWindowCacheData.isEmpty {
@@ -446,6 +454,10 @@ class AccessibilityManager {
             }
         }
         quickLookVerdicts = quickLookVerdicts.filter { quickLookSeen.contains($0.key) }
+        if let offSpace = offSpaceWindowIDs?(windows.map(\.windowID)), !offSpace.isEmpty {
+            hyprLog(.debug, .discovery, "off-space windows left out of the snapshot: \(offSpace.sorted())")
+            windows.removeAll { offSpace.contains($0.windowID) }
+        }
         return windows
     }
 

@@ -324,10 +324,15 @@ class BSPNode {
             return []
         }
 
-        let halfGap = gap / 2
-        let dir = direction(for: rect)
+        let (leftRect, rightRect) = childRects(in: rect, gap: gap)
+        return l.layout(in: leftRect, gap: gap) + r.layout(in: rightRect, gap: gap)
+    }
 
-        switch dir {
+    /// The rects of the left/top and right/bottom children within `rect`,
+    /// with half the gap taken from each side of the boundary.
+    func childRects(in rect: CGRect, gap: CGFloat) -> (CGRect, CGRect) {
+        let halfGap = gap / 2
+        switch direction(for: rect) {
         case .horizontal:
             let mid = rect.origin.x + rect.width * splitRatio
             let leftRect = CGRect(
@@ -342,7 +347,7 @@ class BSPNode {
                 width: rect.maxX - mid - halfGap,
                 height: rect.height
             )
-            return l.layout(in: leftRect, gap: gap) + r.layout(in: rightRect, gap: gap)
+            return (leftRect, rightRect)
 
         case .vertical:
             let mid = rect.origin.y + rect.height * splitRatio
@@ -358,7 +363,30 @@ class BSPNode {
                 width: rect.width,
                 height: rect.maxY - mid - halfGap
             )
-            return l.layout(in: topRect, gap: gap) + r.layout(in: bottomRect, gap: gap)
+            return (topRect, bottomRect)
         }
+    }
+
+    /// Mirror this subtree left↔right within `rect`: every side-by-side
+    /// split swaps its children and takes `1 - splitRatio`, so each half
+    /// keeps its width and only changes side. Top/bottom splits stay put,
+    /// their subtrees mirrored. Every child keeps its rect's size, so
+    /// dwindle resolves the same direction everywhere afterwards.
+    ///
+    /// The ratio bounds are symmetric around 0.5, so `1 - splitRatio` never
+    /// clamps. A leaf's ratio memory (`savedChildWasLeft`) is left as is.
+    ///
+    /// - Returns: `true` when at least one split was flipped.
+    @discardableResult
+    func mirrorHorizontally(in rect: CGRect, gap: CGFloat) -> Bool {
+        guard let l = left, let r = right else { return false }
+        let (leftRect, rightRect) = childRects(in: rect, gap: gap)
+        let leftFlipped = l.mirrorHorizontally(in: leftRect, gap: gap)
+        let rightFlipped = r.mirrorHorizontally(in: rightRect, gap: gap)
+        guard direction(for: rect) == .horizontal else { return leftFlipped || rightFlipped }
+        left = r
+        right = l
+        splitRatio = 1 - splitRatio
+        return true
     }
 }

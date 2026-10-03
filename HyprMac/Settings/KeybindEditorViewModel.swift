@@ -32,6 +32,7 @@ final class KeybindEditorViewModel: ObservableObject {
         case moveWindowToMonitor    = "Move Window to Monitor"
         case toggleFloating         = "Toggle Floating"
         case toggleSplit            = "Toggle Split"
+        case flipWorkspace          = "Flip Workspace"
         case showKeybinds           = "Show Keybinds"
         case showWorkspaceOverview  = "Show Workspace Overview"
         case launchApp              = "Launch App"
@@ -76,6 +77,7 @@ final class KeybindEditorViewModel: ObservableObject {
         case .moveWindowToMonitor(let d):    selectedAction = .moveWindowToMonitor;    directionParam = d
         case .toggleFloating:                selectedAction = .toggleFloating
         case .toggleSplit:                   selectedAction = .toggleSplit
+        case .flipWorkspace:                 selectedAction = .flipWorkspace
         case .showKeybinds:                  selectedAction = .showKeybinds
         case .showWorkspaceOverview:         selectedAction = .showWorkspaceOverview
         case .launchApp(let b):              selectedAction = .launchApp;              bundleIDParam = b
@@ -113,6 +115,7 @@ final class KeybindEditorViewModel: ObservableObject {
         case .moveWindowToMonitor:    action = .moveWindowToMonitor(directionParam)
         case .toggleFloating:         action = .toggleFloating
         case .toggleSplit:            action = .toggleSplit
+        case .flipWorkspace:          action = .flipWorkspace
         case .showKeybinds:           action = .showKeybinds
         case .showWorkspaceOverview:  action = .showWorkspaceOverview
         case .launchApp:              action = .launchApp(bundleID: bundleIDParam)

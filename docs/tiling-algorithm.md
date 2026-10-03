@@ -83,8 +83,14 @@ the boundary on it: `savedSplitRatio`, `savedChildWasLeft`, and
 window on the side the old one vacated and stashes the ratio in
 `pendingSplitRatio` / `pendingSplitOverride`.
 `TilingEngine.updateTreeMembership` calls `applySavedRatios` last, after
-`clearUserSetRatios` and `resetSplitRatios`, so the restored boundary
-survives the reset and comes back flagged `userSetRatio`.
+`resetSplitRatios`, so the restored boundary survives the reset and comes
+back flagged `userSetRatio`.
+
+An insert no longer clears the other splits' `userSetRatio`. It only adds
+a split under the leaf it lands on, and that split starts at the default.
+Clearing every flag on any insert reset the whole layout each time an app
+reopened a window under a new id (Outlook's main window) or a mail or
+reminder window came and went. Swaps still clear them.
 
 Three limits are deliberate:
 
@@ -93,7 +99,9 @@ Three limits are deliberate:
   `resetSplitRatios`. Remembering those would pin a fudge forever.
 - **Only leaves.** An internal sibling already carries its own split.
   Saving the outer ratio onto it would push the boundary into an
-  unrelated pair of windows.
+  unrelated pair of windows. The cost: a window that leaves beside a
+  stack loses its boundary, and its replacement lands at the dwindle tip
+  (see `Issues - Pending Items.md`).
 - **Only the pending fields are consumed.** A node that inherited a
   leaf's saved boundary on the way up is never a restore target, so a
   promoted subtree keeps the split it already had.

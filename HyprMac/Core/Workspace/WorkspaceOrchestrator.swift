@@ -94,6 +94,10 @@ final class WorkspaceOrchestrator {
     /// owned by its physical display, switch there, and leave it as the sole
     /// tile. Destination geometry and source parking are verified before any
     /// workspace ownership changes.
+    ///
+    /// A toggle: pressed again on a window that is still alone on the
+    /// dedicated workspace it was sent to, it takes the window back to its
+    /// old workspace and slot (`returnFromDedicatedWorkspace`).
     func moveToNextEmptyWorkspace() {
         guard let focused = actualFocusedWindow(),
               let cached = stateCache.cachedWindows[focused.windowID],
@@ -119,6 +123,14 @@ final class WorkspaceOrchestrator {
         focused.isFloating = stateCache.floatingWindowIDs.contains(focused.windowID)
 
         let sourceIDs = workspaceManager.windowIDs(onWorkspace: sourceWorkspace)
+        // the second Hypr+F on a window Hypr+F sent here takes it back
+        if sourceIDs.subtracting(stateCache.hiddenWindowIDs) == [focused.windowID],
+           let origin = tilingEngine.dedicatedReturnWorkspace(for: focused.windowID,
+                                                               currentWorkspace: sourceWorkspace) {
+            returnFromDedicatedWorkspace(focused, from: sourceWorkspace, to: origin,
+                                         screen: initialPhysicalScreen)
+            return
+        }
         // A dedicated workspace already containing only the focused window is
         // the desired end state. Repeated Hypr+F is therefore a no-op, even if
         // that sole window is currently floating.
@@ -262,6 +274,9 @@ final class WorkspaceOrchestrator {
                 workspaceManager.setSavedFloatingFrame(original, for: window.windowID)
             }
         }
+        // before the removal, while the source tree still holds its slot
+        tilingEngine.rememberDedicatedReturn(focused, fromWorkspace: sourceWorkspace,
+                                             toWorkspace: destination, screen: physicalScreen)
         tilingEngine.removeWindowMembershipOnly(focused, fromWorkspace: sourceWorkspace)
         stateCache.floatingWindowIDs.remove(focused.windowID)
         workspaceManager.clearSavedFloatingFrame(for: focused.windowID)
@@ -284,6 +299,27 @@ final class WorkspaceOrchestrator {
         updateFocusBorder(focused)
         NotificationCenter.default.post(name: .hyprMacWorkspaceChanged, object: nil)
         onDidSwitch(destination, physicalScreen)
+    }
+
+    /// Hypr+F's way back: `window` returns from its dedicated workspace to
+    /// `source`, in the slot and at the ratios it left, and the switch shows
+    /// it there. When the source workspace changed meanwhile, or its home is
+    /// another screen now, it falls back to an ordinary move-and-follow,
+    /// which places the window like any arrival.
+    private func returnFromDedicatedWorkspace(_ window: HyprWindow, from dedicated: Int,
+                                              to source: Int, screen: NSScreen) {
+        let sameHome = workspaceManager.homeScreenForWorkspace(source).map {
+            workspaceManager.screenID(for: $0) == workspaceManager.screenID(for: screen)
+        } == true
+        guard sameHome, tilingEngine.restoreDedicatedReturn(window, screen: screen) else {
+            hyprLog(.notice, .workspace, "Hypr+F back: \(window.windowID) ws\(dedicated) → ws\(source) as an ordinary move")
+            moveToWorkspace(source, follow: true)
+            return
+        }
+        hyprLog(.notice, .workspace, "Hypr+F back: \(window.windowID) ws\(dedicated) → ws\(source), old slot")
+        tilingEngine.removeWindowMembershipOnly(window, fromWorkspace: dedicated)
+        workspaceManager.moveWindow(window.windowID, toWorkspace: source)
+        switchWorkspace(source, preferredWindowID: window.windowID)
     }
 
     private func rejectTransfer(_ window: HyprWindow, message: String) {

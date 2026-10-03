@@ -93,6 +93,10 @@ extension Keybind {
         binds.append(Keybind(keyCode: UInt16(kVK_ANSI_J), modifiers: .hypr,
                              action: .toggleSplit))
 
+        // hypr + shift + j: mirror the workspace left↔right
+        binds.append(Keybind(keyCode: UInt16(kVK_ANSI_J), modifiers: [.hypr, .shift],
+                             action: .flipWorkspace))
+
         // hypr + k: show keybinds
         binds.append(Keybind(keyCode: UInt16(kVK_ANSI_K), modifiers: .hypr,
                              action: .showKeybinds))

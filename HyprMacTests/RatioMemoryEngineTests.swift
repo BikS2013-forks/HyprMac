@@ -106,4 +106,45 @@ final class RatioMemoryEngineTests: XCTestCase {
         XCTAssertEqual(tree()?.root.userSetRatio, false,
                        "and it must not come back pinned")
     }
+
+    // MARK: - inserts keep the user's other splits
+
+    func testANewWindowKeepsTheUsersRatioOnExistingSplits() {
+        let (w1, w2) = tileTwoWithUserRatio(0.7)
+
+        engine.prepareTileLayout([w1, w2, makeWindow(id: 3)], onWorkspace: 1, screen: screen)
+
+        XCTAssertEqual(tree()?.root.splitRatio ?? 0, 0.7, accuracy: 0.001,
+                       "the split the user sized is untouched by an insert below it")
+        XCTAssertEqual(tree()?.root.userSetRatio, true)
+        XCTAssertEqual(tree()?.allWindows.count, 3)
+    }
+
+    // live case: Outlook closed its main window (left column) and reopened
+    // it under a new id. the stack beside it keeps its own user ratio. the
+    // column boundary itself is not remembered: BSPNode.remove only keeps a
+    // boundary when the surviving sibling is a leaf (pending item in
+    // "Issues - Pending Items.md").
+    func testAWindowReopenedUnderANewIDKeepsTheStacksRatio() {
+        let w1 = makeWindow(id: 1), w2 = makeWindow(id: 2), w3 = makeWindow(id: 3)
+        engine.prepareTileLayout([w1, w2, w3], onWorkspace: 1, screen: screen)
+        guard let root = tree()?.root, let inner = root.right, !inner.isLeaf else {
+            return XCTFail("expected 1 | (2 / 3)")
+        }
+        root.splitRatio = 0.4; root.userSetRatio = true
+        inner.splitRatio = 0.3; inner.userSetRatio = true
+
+        // 1 vanishes on one poll, its replacement arrives on the next
+        engine.prepareTileLayout([w2, w3], onWorkspace: 1, screen: screen)
+        engine.prepareTileLayout([w2, w3, makeWindow(id: 4)], onWorkspace: 1, screen: screen)
+
+        XCTAssertTrue(userSetRatios(tree()?.root).contains { abs($0 - 0.3) < 0.001 },
+                      "the stack's own split survives the gone + new pair")
+    }
+
+    private func userSetRatios(_ node: BSPNode?) -> [CGFloat] {
+        guard let node, !node.isLeaf else { return [] }
+        return (node.userSetRatio ? [node.splitRatio] : [])
+            + userSetRatios(node.left) + userSetRatios(node.right)
+    }
 }

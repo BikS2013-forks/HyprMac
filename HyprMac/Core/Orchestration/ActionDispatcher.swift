@@ -293,6 +293,8 @@ final class ActionDispatcher {
             toggleFloating()
         case .toggleSplit:
             toggleSplit()
+        case .flipWorkspace:
+            flipWorkspace()
         case .showKeybinds:
             keybindOverlay.toggle(keybinds: config.keybinds)
         case .showWorkspaceOverview:
@@ -347,6 +349,7 @@ final class ActionDispatcher {
         case .moveWindowToMonitor: return "moveWindowToMonitor"
         case .toggleFloating:      return "toggleFloating"
         case .toggleSplit:         return "toggleSplit"
+        case .flipWorkspace:       return "flipWorkspace"
         case .showKeybinds:        return "showKeybinds"
         case .showWorkspaceOverview: return "showWorkspaceOverview"
         case .launchApp:           return "launchApp"
@@ -788,6 +791,22 @@ final class ActionDispatcher {
         hyprLog(.debug, .orchestration, "toggleSplit on '\(focused.title ?? "?")'")
 
         tilingEngine.toggleSplit(focused, onWorkspace: workspace, screen: screen)
+        if workspace == ScratchpadController.workspace { scratchpadLayoutChanged() }
+        updatePositionCache()
+    }
+
+    /// Mirror the focused window's workspace left↔right. Beeps when there
+    /// is nothing side by side to flip or the flipped layout was refused.
+    private func flipWorkspace() {
+        guard let focused = currentFocusedWindow(),
+              let (workspace, screen) = tilingContext(for: focused) else { return }
+
+        hyprLog(.debug, .orchestration, "flipWorkspace ws\(workspace) from '\(focused.title ?? "?")'")
+
+        guard tilingEngine.flipWorkspace(onWorkspace: workspace, screen: screen) else {
+            NSSound.beep()
+            return
+        }
         if workspace == ScratchpadController.workspace { scratchpadLayoutChanged() }
         updatePositionCache()
     }

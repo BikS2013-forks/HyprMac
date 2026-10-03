@@ -17,6 +17,7 @@ enum Action: Equatable {
     case moveWindowToMonitor(Direction)
     case toggleFloating
     case toggleSplit
+    case flipWorkspace
     case showKeybinds
     case showWorkspaceOverview
     case launchApp(bundleID: String)
@@ -55,6 +56,18 @@ ignores keyboard autorepeat. It selects the actual AX-focused managed window,
 not the cursor's monitor, and moves it to the next empty workspace anchored to
 its physical display. See the README for eligibility and rejection behavior.
 
+The action is a toggle. On commit, `TilingEngine.rememberDedicatedReturn`
+keeps a clone of the source tree with the window still in its slot (only the
+source workspace for a floater). Pressing Hypr+F again on that window while it
+is still alone on that dedicated workspace runs
+`WorkspaceOrchestrator.returnFromDedicatedWorkspace`: if the source tree holds
+exactly the windows it had without this one, the clone becomes the source
+tree, the window is reassigned, and the switch lays it out in its old slot at
+its old ratios. If anything opened or closed there meanwhile, or the window was
+a floater, it falls back to `moveToWorkspace(source, follow: true)`. Moving the
+window anywhere else, or the window going away, drops the record. Logs:
+`Hypr+F back: … old slot` / `… as an ordinary move`.
+
 Regular workspace IDs are 1–10. The physical 0 key maps to ID 10:
 Hypr+0 switches, and Hypr+Shift+0 sends. Their wire values remain
 `{"switchDesktop":{"_0":10}}` and `{"moveToDesktop":{"_0":10}}`.
@@ -69,6 +82,20 @@ Custom and conflicting bindings survive unchanged. Startup/reload migration is
 idempotent and is persisted on the next normal settings save; no schema-version
 flag is added. An explicitly chosen binding identical to a legacy default cannot
 be distinguished from that default.
+
+## Flip workspace
+
+`flipWorkspace` defaults to Hypr+Shift+J and encodes as
+`{"flipWorkspace":{}}`. It mirrors the focused window's workspace
+left↔right (`TilingEngine.flipWorkspace` → `BSPTree.mirrorHorizontally`):
+every side-by-side split swaps its children and takes `1 - splitRatio`,
+so each side keeps its width and a stacked side moves across as a group.
+Top/bottom splits stay where they are. The flip goes through the ordinary
+verified retile; a refused layout restores the tree's topology and ratios
+and beeps, and so does a workspace with nothing side by side. Pressing it
+twice gives back the original layout. Hypr+Shift+J was free, so
+`mergeNewDefaults` injects it into existing configs unless the user bound
+that chord. No schema change.
 
 ## Move and follow
 

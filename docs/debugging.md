@@ -1145,6 +1145,26 @@ lock that outlasted the 4-second hold and the three mass-gone skips marked
 every window hidden, and the unlock rebuilt each tree in reading order with
 default ratios.
 
+### Sizes reset after switching macOS desktops
+
+Each native Space keeps its own trees (see "Native Spaces" in
+`docs/architecture.md`). A desktop switch should log, at `.notice` under
+`tiling`:
+
+```
+native space change: sid=<screen> space <old> → <new> — parked N tree(s), restored M
+```
+
+followed by the usual `window hidden` / `window returned` discovery
+lines. If `restored` is 0 on a return trip, the tree was never parked:
+check for `display change: dropped … parked native-space tree(s) whose screen left` or
+`native space <id> is gone` in between. If the switch line is missing,
+CGS did not report the screen's display (look for its UUID in
+`defaults read com.apple.spaces`). A `discovery retile: gone=[…]` for
+the departing windows *before* the switch line means the poll ran ahead
+of the Space change; the snapshot guard logs
+`native space changed during the snapshot — re-polling` at `.debug`.
+
 ### "Why isn't this window managed?" (filtered windows, Quick Look)
 
 Discovery keeps only what `WindowAdmissionFilter` admits: standard windows

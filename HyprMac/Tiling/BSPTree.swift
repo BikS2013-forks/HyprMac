@@ -614,6 +614,42 @@ class BSPTree {
         return Snapshot(states: states)
     }
 
+    /// Every internal node's child links, for rewinding a topology change
+    /// (`mirrorHorizontally`) that `Snapshot` does not capture. Restore it
+    /// before the knob snapshot.
+    struct TopologySnapshot {
+        fileprivate let links: [(node: BSPNode, left: BSPNode?, right: BSPNode?)]
+    }
+
+    func topologySnapshot() -> TopologySnapshot {
+        var links: [(node: BSPNode, left: BSPNode?, right: BSPNode?)] = []
+        func walk(_ node: BSPNode) {
+            links.append((node, node.left, node.right))
+            if let left = node.left { walk(left) }
+            if let right = node.right { walk(right) }
+        }
+        walk(root)
+        return TopologySnapshot(links: links)
+    }
+
+    func restore(_ topology: TopologySnapshot) {
+        for link in topology.links {
+            link.node.left = link.left
+            link.node.right = link.right
+            link.left?.parent = link.node
+            link.right?.parent = link.node
+        }
+    }
+
+    /// Mirror the whole layout left↔right in `rect` (outer padding applied
+    /// here, as in `layout`). See `BSPNode.mirrorHorizontally`.
+    ///
+    /// - Returns: `true` when the tree had a side-by-side split to flip.
+    @discardableResult
+    func mirrorHorizontally(in rect: CGRect, gap: CGFloat, padding: CGFloat) -> Bool {
+        root.mirrorHorizontally(in: rect.insetBy(dx: padding, dy: padding), gap: gap)
+    }
+
     func restore(_ snapshot: Snapshot) {
         for state in snapshot.states {
             state.node.splitRatio = state.splitRatio

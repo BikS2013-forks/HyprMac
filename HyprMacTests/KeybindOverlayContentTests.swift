@@ -51,7 +51,9 @@ final class KeybindOverlayContentTests: XCTestCase {
 
     func testFilterKeepsMatchingRowsInSectionOrder() {
         let filtered = sections(filter: "work")
-        XCTAssertEqual(filtered.map(\.category), [.workspaces, .system])
+        XCTAssertEqual(filtered.map(\.category), [.windowManagement, .workspaces, .system])
+        XCTAssertEqual(rows(.windowManagement, in: filtered).map(\.description),
+                       ["Flip Workspace Left/Right"])
         XCTAssertEqual(rows(.workspaces, in: filtered).map(\.description), [
             "Switch to workspace N",
             "Move window to workspace N",

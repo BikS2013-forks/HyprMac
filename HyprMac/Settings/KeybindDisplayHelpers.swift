@@ -54,6 +54,8 @@ extension Keybind {
             return "macwindow.and.cursorarrow"
         case .toggleSplit:
             return "rectangle.split.2x1"
+        case .flipWorkspace:
+            return "arrow.left.and.right"
         case .showKeybinds:
             return "keyboard"
         case .showWorkspaceOverview:
@@ -109,6 +111,7 @@ extension Keybind {
         case .moveWindowToMonitor(let d):   return "Move Window to \(d.rawValue.capitalized) Monitor"
         case .toggleFloating:               return "Toggle Floating"
         case .toggleSplit:                  return "Toggle Split Direction"
+        case .flipWorkspace:                return "Flip Workspace Left/Right"
         case .showKeybinds:                 return "Show Keybind Overlay"
         case .showWorkspaceOverview:        return "Show Workspace Overview"
         case .launchApp(let b):             return "Launch \(appDisplayName(for: b))"

@@ -291,13 +291,60 @@ toggle.
 
 ## Workspaces
 
-HyprMac maintains ten virtual workspaces in userspace. macOS native
-Spaces are bypassed — use one native Space per monitor. Inactive
+HyprMac maintains ten virtual workspaces in userspace. They are the
+intended way to switch; one native Space per monitor is still the
+simplest setup. Native Spaces (macOS desktops) are tolerated rather than
+managed: HyprMac never moves windows between them, but it follows the
+active one so a desktop switch does not cost the layout (see "Native
+Spaces" below). Inactive
 workspaces park their windows at a single global hide position: 1 px
 inside the bottom-right corner of the **rightmost** monitor (a 1 px
 sliver remains visible; macOS limitation). The rightmost edge has no
 neighbor, so the parked window's off-screen extension never overlaps
 another monitor and macOS's rescale-to-neighbor bug cannot fire.
+
+### Native Spaces
+
+Windows on an inactive native Space leave the on-screen window list, so
+discovery reads them as hidden and the gone path drops them from their
+trees. Before `TilingEngine.syncNativeSpaces` existed, switching desktops
+and back re-inserted them with default ratios, losing every resize.
+
+Now every discovery poll reads the active Space of each screen
+(`SpaceManager.activeSpaces`, one `CGSCopyManagedDisplaySpaces` call)
+before and after its AX snapshot. A poll whose two readings differ is
+dropped and re-run 0.1 s later. Otherwise the engine syncs before the
+diff: when a screen's Space changed, every tree on that screen except the
+scratchpad's is parked under the Space it belonged to, with its unverified
+mark and pending inserts, and the trees parked for the new Space take its
+place. Parked trees sit outside `trees`, so `removeWindowID` and retiles
+cannot touch them. `activeSpaceDidChangeNotification` runs the same sync
+early and schedules a poll, and `tileAllVisibleSpaces` syncs before its
+own AX read.
+
+- Every AX snapshot (`AccessibilityManager.getAllWindows`) leaves out
+  windows whose native Spaces are all inactive
+  (`SpaceManager.offSpaceWindowIDs`, one `CGSCopySpacesForWindows` call
+  per window). During the switch animation the on-screen list holds both
+  desktops' windows; the second live run caught a pass that inserted the
+  other desktop's windows into the current tree, which cleared its user
+  ratios. Space membership does not change during the animation.
+- The first reading for a screen only records it, so the first switch
+  after launch still rebuilds the arriving desktop once.
+- Workspace assignment is unchanged: both desktops' windows share the
+  HyprMac workspace showing on that screen, each with its own tree.
+- Screens map to CGS displays by display UUID. With "Displays have
+  separate Spaces" off, CGS reports one `Main` entry, which applies to
+  every screen. A screen with no reading keeps its trees.
+- `handleDisplayChange` keeps a parked tree while its screen is still its
+  workspace's home. `screenParametersChanged` also fires for Dock, menu bar
+  and resolution changes, and the first version dropped every parked tree on
+  it, which a live check caught. A tree whose screen left is dropped, not
+  migrated, because the Space ids of a reconnected display are not stable.
+  Parked trees of deleted desktops are dropped on the next sync.
+- A window moved to another desktop through Mission Control leaves the
+  old desktop's parked tree when that tree is restored and its membership
+  pass runs.
 
 Every workspace is **statically anchored** to a home screen:
 `enabledScreens[(N - 1) % enabledScreens.count]`, left to right.
