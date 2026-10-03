@@ -41,6 +41,13 @@
 
 ## Completed
 
+- **2026-10-04 — Keyboard resize for floating windows.** Hypr+Ctrl+Shift+arrows did nothing on a
+  floating window (the dispatcher skipped floaters). It now grows (→ ↓) or shrinks (← ↑) the
+  window by 5% of the usable area around its center, kept on screen, never below 200 pt. Design
+  in `docs/keybinds-and-actions.md` ("Resize a floating window"); tests in
+  `FloatingKeyboardResizeTests`. Checked live 02:43: an iTerm2 floater grew 54 pt per press with
+  its center unchanged.
+
 - **2026-10-04 — Releasing Ctrl mid-chord dropped the Hypr key.** Holding Caps Lock + Shift + Ctrl
   and letting go of Ctrl made macOS send an F18 key-up right then (hardware-sourced, 0.2 ms before
   the Ctrl release) while Caps Lock was still held, and no event at the real release, so the rest

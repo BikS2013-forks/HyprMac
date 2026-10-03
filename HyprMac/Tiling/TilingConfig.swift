@@ -48,6 +48,10 @@ enum TilingConfig {
     // to this fraction of the usable width and height.
     static let floatingToggleScreenFraction: CGFloat = 0.6
 
+    // a keyboard resize never shrinks a floating window below this, unless
+    // it was already smaller.
+    static let floatingResizeMinDimension: CGFloat = 200
+
     // MARK: - min-size memory
 
     // slack on min-size conflict comparisons in BSPTree.adjustForMinSizes.

@@ -122,6 +122,19 @@ twice gives back the original layout. Hypr+Shift+J was free, so
 `mergeNewDefaults` injects it into existing configs unless the user bound
 that chord. No schema change.
 
+## Resize a floating window
+
+`resizeDirection` moves the split between tiled windows. A floating window has
+no split, so on one it sizes the window itself
+(`FloatingWindowController.keyboardResizedFrame`): → and ↓ grow the width and
+height by `TilingConfig.resizeStep` (5%) of the usable area, ← and ↑ shrink
+them, around the window's center. A window that would grow past the screen's
+edge moves back inside instead. None grows past the usable area or shrinks below
+`TilingConfig.floatingResizeMinDimension` (200 pt) unless it was already
+smaller. The origin is not rounded, so repeated presses do not walk the center.
+The write goes through `placeFloating` and logs `reason=keyboard resize <dir>`.
+Same action and wire key, no schema change. Tests: `FloatingKeyboardResizeTests`.
+
 ## Move and follow
 
 `moveToWorkspaceAndFollow(N)` moves the focused window to workspace N and

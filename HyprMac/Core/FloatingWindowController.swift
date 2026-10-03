@@ -428,6 +428,29 @@ final class FloatingWindowController {
                       width: size.width, height: size.height)
     }
 
+    /// Where a floating window goes on a keyboard resize: → and ↓ grow its
+    /// width and height by `TilingConfig.resizeStep` of the usable area, ←
+    /// and ↑ shrink them, around the window's center. A window that would
+    /// grow past the screen's edge moves back inside instead, and none grows
+    /// past the usable area or shrinks below `floatingResizeMinDimension`
+    /// (unless already smaller).
+    static func keyboardResizedFrame(_ frame: CGRect, direction: Direction,
+                                     in usable: CGRect) -> CGRect {
+        let stepX = (usable.width * TilingConfig.resizeStep).rounded()
+        let stepY = (usable.height * TilingConfig.resizeStep).rounded()
+        let floor = TilingConfig.floatingResizeMinDimension
+        var size = frame.size
+        switch direction {
+        case .right: size.width += stepX
+        case .left: size.width = max(size.width - stepX, min(frame.width, floor))
+        case .down: size.height += stepY
+        case .up: size.height = max(size.height - stepY, min(frame.height, floor))
+        }
+        // not rounded: a half point per press would walk the center away
+        let origin = CGPoint(x: frame.midX - size.width / 2, y: frame.midY - size.height / 2)
+        return CGRect(origin: origin, size: size).clamped(into: usable)
+    }
+
     /// The float→tile insertion, with one explicit revalidation behind it.
     ///
     /// When the tree refuses the window and the fit check says learned bounds

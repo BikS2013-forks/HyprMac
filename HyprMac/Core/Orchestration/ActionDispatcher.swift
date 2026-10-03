@@ -828,12 +828,28 @@ final class ActionDispatcher {
 
     /// Resize the focused tiled window in a cardinal direction.
     private func resizeInDirection(_ direction: Direction) {
-        guard let focused = currentFocusedWindow(),
-              !stateCache.floatingWindowIDs.contains(focused.windowID),
-              let (workspace, screen) = tilingContext(for: focused) else { return }
+        guard let focused = currentFocusedWindow() else { return }
+        if stateCache.floatingWindowIDs.contains(focused.windowID) {
+            resizeFloating(focused, direction: direction)
+            return
+        }
+        guard let (workspace, screen) = tilingContext(for: focused) else { return }
 
         tilingEngine.resizeInDirection(focused, direction: direction, onWorkspace: workspace, screen: screen)
         if workspace == ScratchpadController.workspace { scratchpadLayoutChanged() }
+        updatePositionCache()
+    }
+
+    /// A floating window has no split to move, so the keyboard resize sizes
+    /// the window itself (`FloatingWindowController.keyboardResizedFrame`).
+    private func resizeFloating(_ window: HyprWindow, direction: Direction) {
+        guard let frame = window.frame,
+              let screen = displayManager.screen(containingMostOf: frame) else { return }
+        let target = FloatingWindowController.keyboardResizedFrame(
+            frame, direction: direction, in: displayManager.cgRect(for: screen))
+        guard target != frame else { return }
+        window.placeFloating(target, reason: "keyboard resize \(direction.rawValue)", on: screen,
+                             from: frame, displayManager: displayManager)
         updatePositionCache()
     }
 
