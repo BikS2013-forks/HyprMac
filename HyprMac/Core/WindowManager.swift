@@ -400,6 +400,16 @@ class WindowManager {
             // will target. shown regardless of focus-border setting.
             self.showFocusBracketsForCurrentFocus()
         }
+        // Caps Lock as the Hypr key still works as Caps Lock when tapped on
+        // its own. Paused or not, on a disabled desktop or not: it is the
+        // user's keyboard, not a HyprMac action
+        hotkeyManager.onCapsLockTap = {
+            if let on = CapsLockState.toggle() {
+                hyprLog(.notice, .hotkey, "caps lock tap → caps lock \(on ? "on" : "off")")
+            } else {
+                hyprLog(.notice, .hotkey, "caps lock tap: the HID system refused the toggle")
+            }
+        }
         hotkeyManager.onHyprKeyUp = { [weak self] in
             self?.hyprHeld = false
             self?.focusBrackets.hide()
@@ -1051,6 +1061,8 @@ class WindowManager {
         }
         mouseDownMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
             guard let self else { return }
+            // a Hypr+click or Hypr+drag is a chord, not a Caps Lock tap
+            if self.hyprHeld { self.hotkeyManager.noteHyprPressUsed() }
             self.mouseDragLifecycle.beginPress(hyprHeld: self.hyprHeld)
             self.mouseDownFloatingWindowID = 0
             self.mouseDownFloatingFrame = nil

@@ -87,7 +87,8 @@ You'll feel at home. The differences are mostly macOS being macOS:
   gives the window a dedicated empty workspace on its display instead. Press it again on that
   window to send it back to its old workspace, in the same slot and at the same size.
 - **Focus follows mouse:** there if you want it, with an adjustable hover rate.
-- **Hypr key:** Caps Lock by default. Settings → Keys also offers backslash, F13–F20, and
+- **Hypr key:** Caps Lock by default. Tapped on its own (released within half a second, no other
+  key or click) it still turns Caps Lock on and off. Settings → Keys also offers backslash, F13–F20, and
   Option or Command on either side. If you pick the left Option or Command key, that key plus
   a key HyprMac uses goes to HyprMac, so type shortcuts like ⌘S or ⌘T with the right-hand
   key. Shift and Control are not offered because many default shortcuts add them to Hypr. Tab

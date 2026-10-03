@@ -38,6 +38,12 @@
 
 ## Completed
 
+- **2026-10-04 — Caps Lock works as Caps Lock again when tapped alone.** With Caps Lock remapped to
+  F18 as the Hypr key it never toggled. A bare tap (no other key, modifier or mouse press, released
+  within `HotkeyManager.bareTapMaxDuration` = 0.5 s) now flips the state through
+  `IOHIDSetModifierLockState` (`CapsLockState.toggle`). Only for the Caps Lock Hypr key; works while
+  paused and on disabled desktops. Tests in `CapsLockTapTests`. Not yet checked live.
+
 - **2026-10-03 — A full workspace floats new windows instead of spilling.** At capacity, a new
   (unpinned) window floats on the workspace it was opened on rather than going to the next workspace
   with room, which could be on the other display. Pinned apps keep spilling. Tests in

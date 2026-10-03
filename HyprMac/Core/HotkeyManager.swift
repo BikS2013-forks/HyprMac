@@ -40,8 +40,22 @@ class HotkeyManager {
     /// Fires when the Hypr key transitions from down to up.
     var onHyprKeyUp: (() -> Void)?
 
+    /// Fires on main when Caps Lock, as the Hypr key, was tapped on its own:
+    /// pressed and released within `bareTapMaxDuration` with no other key
+    /// and no mouse press in between. The remap turned Caps Lock into F18,
+    /// so this is where its own toggle comes back.
+    var onCapsLockTap: (() -> Void)?
+
+    /// Longest press that still counts as a tap. Holding Hypr longer and
+    /// letting go without a chord is a change of mind, not a Caps Lock.
+    static let bareTapMaxDuration: TimeInterval = 0.5
+
     // physical key currently acting as the logical Hypr modifier
     fileprivate var hyprKeyDown = false
+    /// When the current Hypr press began, and whether anything else
+    /// happened during it (another key, a modifier, a mouse press).
+    private var hyprPressedAt: TimeInterval = 0
+    private var hyprPressUsed = false
     private var hyprKey: HyprKey = .capsLock
     private var pressedModifierKeyCodes: Set<UInt16> = []
 
@@ -241,6 +255,20 @@ class HotkeyManager {
         pressedModifierKeyCodes.removeAll()
     }
 
+    /// A mouse press while Hypr is held (a Hypr+drag swap) makes the press a
+    /// chord. Called from the mouse-down monitor on main.
+    func noteHyprPressUsed() {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        if hyprKeyDown { hyprPressUsed = true }
+    }
+
+    /// Whether a Hypr press was a bare tap: nothing else during it, and
+    /// released within `bareTapMaxDuration`.
+    static func isBareTap(heldFor duration: TimeInterval, used: Bool) -> Bool {
+        !used && duration >= 0 && duration <= bareTapMaxDuration
+    }
+
     /// `true` when the HID layer currently reports the Hypr key as down.
     /// Cheap syscall — one IOKit query.
     ///
@@ -267,13 +295,29 @@ class HotkeyManager {
         // track the configured physical key as our logical Hypr modifier
         if keyCode == hyprKey.keyCode {
             if type == .keyDown {
+                // autorepeat of a held key is not a new press
+                if !hyprKeyDown {
+                    hyprPressedAt = ProcessInfo.processInfo.systemUptime
+                    hyprPressUsed = false
+                }
                 setHyprKeyDown(true)
             } else if type == .keyUp {
+                if hyprKeyDown, hyprKey.usesCapsLockRemap,
+                   Self.isBareTap(heldFor: ProcessInfo.processInfo.systemUptime - hyprPressedAt,
+                                  used: hyprPressUsed) {
+                    DispatchQueue.main.async { [weak self] in self?.onCapsLockTap?() }
+                }
                 setHyprKeyDown(false)
             } else if type == .flagsChanged, hyprKey.isNativeModifier {
                 setHyprKeyDown(pressedModifierKeyCodes.contains(keyCode))
             }
             return nil // always swallow the Hypr key — it's our internal modifier
+        }
+
+        // any other key or modifier during a Hypr press makes it a chord,
+        // never a Caps Lock tap
+        if hyprKeyDown, type == .keyDown || type == .flagsChanged {
+            hyprPressUsed = true
         }
 
         // sanity check on every non-Hypr keyDown: if we think Hypr is held

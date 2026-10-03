@@ -289,3 +289,28 @@ enum KeyMappingMerge {
         return Plan(mapping: mapping, changed: true, held: [], displaced: [], restored: restored)
     }
 }
+
+/// The Caps Lock state itself. With Caps Lock remapped to F18 the key no
+/// longer toggles it; HyprMac flips it on a bare tap instead
+/// (`HotkeyManager.onCapsLockTap`).
+enum CapsLockState {
+    /// Flip Caps Lock and return the new state, or nil when the HID system
+    /// refuses (the state is then unchanged).
+    @discardableResult
+    static func toggle() -> Bool? {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(kIOHIDSystemClass))
+        guard service != 0 else { return nil }
+        defer { IOObjectRelease(service) }
+        var connect: io_connect_t = 0
+        guard IOServiceOpen(service, mach_task_self_, UInt32(kIOHIDParamConnectType), &connect) == KERN_SUCCESS else {
+            return nil
+        }
+        defer { IOServiceClose(connect) }
+        var current = false
+        guard IOHIDGetModifierLockState(connect, Int32(kIOHIDCapsLockState), &current) == KERN_SUCCESS,
+              IOHIDSetModifierLockState(connect, Int32(kIOHIDCapsLockState), !current) == KERN_SUCCESS else {
+            return nil
+        }
+        return !current
+    }
+}
