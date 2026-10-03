@@ -319,6 +319,8 @@ final class ActionDispatcher {
             resizeInDirection(dir)
         case .toggleTiling:
             break // handled by WindowManager so it remains available while paused
+        case .toggleDesktopTiling:
+            break // handled by WindowManager so it remains available on a disabled desktop
         case .runCommand(_, let command):
             commandRunner.run(command: command)
         case .saveLayout:
@@ -362,6 +364,7 @@ final class ActionDispatcher {
         case .moveToScratchpad:    return "moveToScratchpad"
         case .resizeDirection:     return "resizeDirection"
         case .toggleTiling:        return "toggleTiling"
+        case .toggleDesktopTiling: return "toggleDesktopTiling"
         case .runCommand:          return "runCommand"
         case .saveLayout:          return "saveLayout"
         case .restoreLayout:       return "restoreLayout"
@@ -397,9 +400,19 @@ final class ActionDispatcher {
         // bound for its rule's workspace whichever display it opened on
         var groups: [(workspace: Int, windows: [HyprWindow])] = []
         var openedOn: [CGWindowID: Int] = [:]
+        // a new window joins the workspace showing beside the window it was
+        // opened from, whichever display macOS put it on
+        let initiator = initiatorScreen(excluding: Set(windows.map(\.windowID)))
+        var carried: [HyprWindow] = []
         for window in windows where admittedIDs.contains(window.windowID) {
-            let screen = displayManager.screen(for: window) ?? screenUnderCursor()
-            guard !workspaceManager.isMonitorDisabled(screen) else { continue }
+            let physical = displayManager.screen(for: window) ?? screenUnderCursor()
+            guard !workspaceManager.isMonitorDisabled(physical) else { continue }
+            let screen = initiator ?? physical
+            if let initiator, initiator != physical {
+                hyprLog(.notice, .orchestration, "new window \(window.windowID) opened on \(physical.localizedName)"
+                        + " — joining \(initiator.localizedName), where the window it was opened from is")
+                carried.append(window)
+            }
             let screenWorkspace = workspaceManager.workspaceForScreen(screen)
             var workspace = screenWorkspace
             if let pinned = pinnedWorkspace(for: window) {
@@ -416,9 +429,21 @@ final class ActionDispatcher {
         }
         var landedOn: [CGWindowID: Int] = [:]
         for group in groups {
+            // a pinned app was sent to its workspace on purpose and still
+            // spills to the next one with room. anything else stays on the
+            // workspace showing where it was opened: when that is full it
+            // floats there instead of landing on another display
+            let pinnedGroup = group.windows.contains { openedOn[$0.windowID] != nil }
             let plan = assignNewWindows(group.windows, preferredWorkspace: group.workspace,
-                                        fullyForgottenIDs: fullyForgottenIDs)
+                                        fullyForgottenIDs: fullyForgottenIDs,
+                                        spillToOtherWorkspaces: pinnedGroup)
             let overflow = Set(plan.overflow)
+            if !pinnedGroup {
+                for window in group.windows where overflow.contains(window.windowID) {
+                    floatingController.floatInPlace(
+                        window, reason: "workspace ws\(group.workspace) full: new window floats")
+                }
+            }
             for (workspace, ids) in plan.assignments {
                 for id in ids where openedOn[id] != nil && !overflow.contains(id) { landedOn[id] = workspace }
             }
@@ -427,6 +452,14 @@ final class ActionDispatcher {
             for id in plan.overflow {
                 if let opened = openedOn[id] { workspaceManager.assignWindow(id, toWorkspace: opened) }
             }
+        }
+        // a tiled newcomer is moved by its tree; a floater has none, so it is
+        // carried to its workspace's display here
+        for window in carried where stateCache.floatingWindowIDs.contains(window.windowID)
+            && openedOn[window.windowID] == nil {
+            guard let workspace = workspaceManager.workspaceFor(window.windowID) else { continue }
+            workspaceOrchestrator.placePinnedFloater(window, onWorkspace: workspace, fromWorkspace: nil,
+                                                     reason: "new window, display of its opener")
         }
         var landings: [PinnedLanding] = []
         for window in windows {
@@ -444,15 +477,36 @@ final class ActionDispatcher {
         return Self.pinFollowTarget(landings, focusedWindowID: currentFocusedWindow()?.windowID)
     }
 
+    /// The display of the window that was focused when new windows appeared:
+    /// the window they were most likely opened from (a link clicked, a menu
+    /// command, a Hypr+Enter). macOS does not say which window opened which,
+    /// so this is the best signal there is. nil when that window is unknown,
+    /// itself new, hidden, or on a workspace that is not showing; the caller
+    /// then keeps the display the window opened on.
+    private func initiatorScreen(excluding newIDs: Set<CGWindowID>) -> NSScreen? {
+        for id in [focusController.lastFocusedID, focusController.previousFocusedID]
+        where id != 0 && !newIDs.contains(id) {
+            guard !stateCache.hiddenWindowIDs.contains(id),
+                  let workspace = workspaceManager.workspaceFor(id),
+                  workspace != ScratchpadController.workspace,
+                  workspaceManager.isWorkspaceVisible(workspace),
+                  let home = workspaceManager.homeScreenForWorkspace(workspace),
+                  !workspaceManager.isMonitorDisabled(home) else { continue }
+            return home
+        }
+        return nil
+    }
+
     @discardableResult
     private func assignNewWindows(_ windows: [HyprWindow], preferredWorkspace: Int,
-                                  fullyForgottenIDs: Set<CGWindowID>) -> RetileAllPlan {
+                                  fullyForgottenIDs: Set<CGWindowID>,
+                                  spillToOtherWorkspaces: Bool) -> RetileAllPlan {
         let byID = Dictionary(windows.map { ($0.windowID, $0) },
                               uniquingKeysWith: { first, _ in first })
         let plan = RetileAllPlanner.admit(
             windowIDs: windows.map(\.windowID),
             preferredWorkspace: preferredWorkspace,
-            eligibleWorkspaces: Array(Constants.workspaceRange),
+            eligibleWorkspaces: spillToOtherWorkspaces ? Array(Constants.workspaceRange) : [preferredWorkspace],
             existingAssignments: Self.existingAssignmentsForAdmission(
                 workspaceManager.regularWorkspaceWindowIDs(),
                 fullyForgottenIDs: fullyForgottenIDs

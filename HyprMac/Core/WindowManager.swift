@@ -354,6 +354,18 @@ class WindowManager {
                 return
             }
             guard self.config.enabled || action == .showKeybinds || action == .showWorkspaceOverview else { return }
+            if action == .toggleDesktopTiling {
+                self.toggleDesktopTiling()
+                return
+            }
+            // on a desktop HyprMac is off for, only actions that touch no
+            // window run: the rest would reach windows on other desktops
+            if self.isDesktopDisabled(on: self.screenUnderCursor()),
+               !Self.runsOnDisabledDesktop(action) {
+                hyprLog(.notice, .hotkey, "\(ActionDispatcher.discriminator(for: action)) refused: HyprMac is off for this desktop")
+                NSSound.beep()
+                return
+            }
             self.suppressions.suppress("mouse-focus", for: 0.15)
             self.handleAction(action)
             // a workspace switch or the scratchpad mid-drag changes where the
@@ -363,6 +375,8 @@ class WindowManager {
 
         hotkeyManager.onHyprKeyDown = { [weak self] in
             guard let self, self.config.enabled else { return }
+            // nothing here is HyprMac's to focus or bracket
+            guard !self.isDesktopDisabled(on: self.screenUnderCursor()) else { return }
             self.hyprHeld = true
             let mousePressActive = self.mouseDragLifecycle.buttonDown
             self.mouseDragLifecycle.noteHyprKeyDown()
@@ -425,7 +439,21 @@ class WindowManager {
         // to a full AX walk.
         accessibility.cachedWindowLookup = { [weak self] wid in self?.stateCache.cachedWindows[wid] }
         accessibility.offSpaceWindowIDs = { [weak self] ids in
-            self?.spaceManager.offSpaceWindowIDs(ids) ?? []
+            guard let self else { return [] }
+            let split = self.spaceManager.classifyWindows(ids, disabledDesktops: self.config.disabledDesktops)
+            // a disabled desktop's windows are left alone, except the ones
+            // HyprMac parked there for a hidden workspace: the hide corner can
+            // sit on that desktop, and losing sight of them would strand them
+            let ignored = split.onDisabled.filter { id in
+                guard let workspace = self.workspaceManager.workspaceFor(id) else { return true }
+                return self.workspaceManager.isWorkspaceVisible(workspace)
+            }
+            return split.offSpace.union(ignored)
+        }
+        discovery.offManagedDesktop = { [weak self] ids in
+            guard let self else { return [] }
+            let split = self.spaceManager.classifyWindows(ids, disabledDesktops: self.config.disabledDesktops)
+            return split.offSpace.union(split.onDisabled)
         }
 
         // wire up floating controller — closure handles for WM-side helpers.
@@ -845,6 +873,14 @@ class WindowManager {
         NotificationCenter.default.addObserver(
             self, selector: #selector(retileAllRequested),
             name: .hyprMacRetileAll, object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(toggleDesktopTilingRequested),
+            name: .hyprMacToggleDesktopTiling, object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(desktopMenuStateRequested),
+            name: .hyprMacMenuWillOpen, object: nil
         )
         NotificationCenter.default.addObserver(
             self, selector: #selector(screenParametersChanged),
@@ -1281,6 +1317,10 @@ class WindowManager {
     /// change, not on every frame.
     private func isFullscreenSuppressed(focused window: HyprWindow?) -> Bool {
         if let w = window, w.isFullscreen { return true }
+        // a desktop HyprMac is off for gets no chrome either
+        if isDesktopDisabled(on: window.flatMap(displayManager.screen(for:)) ?? screenUnderCursor()) {
+            return true
+        }
         // also check the AX-reported focused window of the frontmost app;
         // covers cases where `window` is a HyprMac-tracked tile but the
         // user has clicked into a non-tracked fullscreen overlay (some
@@ -2806,6 +2846,77 @@ class WindowManager {
         return (readings, spaces.allSpaces)
     }
 
+    // MARK: - per-desktop off switch
+
+    /// The uuid of the native desktop showing on `screen`. nil when the
+    /// window server does not say.
+    private func desktopUUID(on screen: NSScreen) -> String? {
+        guard let spaces = spaceManager.activeSpaces() else { return nil }
+        let shared = spaces.currentByDisplay.count == 1 ? spaces.currentByDisplay.values.first : nil
+        let own = SpaceManager.displayUUID(for: screen).flatMap { spaces.currentByDisplay[$0] }
+        return (own ?? shared).flatMap { spaces.uuidBySpace[$0] }
+    }
+
+    /// `true` when the user turned HyprMac off for the desktop showing on
+    /// `screen`. No window-server call while no desktop is disabled.
+    func isDesktopDisabled(on screen: NSScreen) -> Bool {
+        guard !config.disabledDesktops.isEmpty, let uuid = desktopUUID(on: screen) else { return false }
+        return config.disabledDesktops.contains(uuid)
+    }
+
+    /// Actions allowed on a disabled desktop: the ones that touch no window.
+    static func runsOnDisabledDesktop(_ action: Action) -> Bool {
+        switch action {
+        case .showKeybinds, .launchApp, .runCommand, .focusMenuBar, .toggleTiling, .toggleDesktopTiling:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Turn HyprMac off, or back on, for the desktop showing on the cursor's
+    /// screen. Off: the next snapshot leaves that desktop's windows out
+    /// (except the ones parked there for a hidden workspace), so they go
+    /// hidden, keep their workspace and stay exactly where they are. On:
+    /// they come back as returns and tile again.
+    func toggleDesktopTiling() {
+        let screen = screenUnderCursor()
+        guard let uuid = desktopUUID(on: screen) else {
+            hyprLog(.notice, .lifecycle, "desktop toggle refused: no desktop reported for \(screen.localizedName)")
+            NSSound.beep()
+            return
+        }
+        if config.disabledDesktops.contains(uuid) {
+            config.disabledDesktops.remove(uuid)
+            hyprLog(.notice, .lifecycle, "HyprMac on for desktop \(uuid) (\(screen.localizedName))")
+        } else {
+            config.disabledDesktops.insert(uuid)
+            focusBorder.hide()
+            focusBorder.hideFloatingBorders()
+            focusBrackets.hide()
+            dimmingOverlay.hideAll()
+            hyprLog(.notice, .lifecycle, "HyprMac off for desktop \(uuid) (\(screen.localizedName))")
+        }
+        refreshDesktopMenuState()
+        pollingScheduler.schedule(after: 0.05)
+    }
+
+    /// Tell the menu whether the cursor's desktop is disabled.
+    func refreshDesktopMenuState() {
+        let disabled = isDesktopDisabled(on: screenUnderCursor())
+        if MenuBarState.shared.currentDesktopDisabled != disabled {
+            MenuBarState.shared.currentDesktopDisabled = disabled
+        }
+    }
+
+    @objc private func toggleDesktopTilingRequested() {
+        toggleDesktopTiling()
+    }
+
+    @objc private func desktopMenuStateRequested() {
+        refreshDesktopMenuState()
+    }
+
     // MARK: - poll
 
     /// Run a single discovery diff and hand the result to the dispatcher's
@@ -3076,6 +3187,7 @@ class WindowManager {
     /// or left a fullscreen app's Space. Follow it in the trees, then
     /// re-evaluate chrome visibility from the new focus target.
     @objc private func activeSpaceDidChange(_ notification: Notification) {
+        refreshDesktopMenuState()
         // swap the trees to the new desktop before any poll sees its
         // windows, then diff it right away
         if let spaces = nativeSpaceReadings(),

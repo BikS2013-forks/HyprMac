@@ -58,6 +58,9 @@ enum Action: Equatable {
     case resizeDirection(Direction)
     /// Pause or resume tiling while keeping this recovery shortcut active.
     case toggleTiling
+    /// Turn HyprMac off (or back on) for the native desktop showing on the
+    /// cursor's screen. Available on a disabled desktop, like toggleTiling.
+    case toggleDesktopTiling
     /// Run a user-supplied command line directly (never through a shell).
     /// `label` is the display name shown in the keybind list and overlay;
     /// an empty label falls back to the program's basename.
@@ -113,6 +116,7 @@ extension Action: Codable {
         case moveToScratchpad
         case resizeDirection
         case toggleTiling
+        case toggleDesktopTiling
         case runCommand
         case saveLayout
         case restoreLayout
@@ -183,6 +187,7 @@ extension Action: Codable {
         case .toggleScratchpad: self = .toggleScratchpad
         case .moveToScratchpad: self = .moveToScratchpad
         case .toggleTiling: self = .toggleTiling
+        case .toggleDesktopTiling: self = .toggleDesktopTiling
         case .runCommand:
             // command is required (same as launchApp's bundleID); a missing
             // label is tolerated and decodes empty.
@@ -263,6 +268,8 @@ extension Action: Codable {
             try p.encode(d.rawValue, forKey: ._0)
         case .toggleTiling:
             _ = c.nestedContainer(keyedBy: PayloadKey.self, forKey: .toggleTiling)
+        case .toggleDesktopTiling:
+            _ = c.nestedContainer(keyedBy: PayloadKey.self, forKey: .toggleDesktopTiling)
         case .runCommand(let label, let command):
             var p = c.nestedContainer(keyedBy: PayloadKey.self, forKey: .runCommand)
             try p.encode(label, forKey: .label)

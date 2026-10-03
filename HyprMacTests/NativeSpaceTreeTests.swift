@@ -152,8 +152,27 @@ final class NativeSpaceTreeTests: XCTestCase {
             4: [spaceA, spaceB],  // on every desktop
             5: [303],             // the active Space of another display
         ]
-        let off = SpaceManager.offSpaceWindowIDs([1, 2, 3, 4, 5], activeSpaces: [spaceA, 303],
+        let split = SpaceManager.classifyWindows([1, 2, 3, 4, 5], activeSpaces: [spaceA, 303],
+                                                 disabledSpaces: [],
                                                  spacesForWindow: { membership[$0] ?? [] })
-        XCTAssertEqual(off, [2])
+        XCTAssertEqual(split.offSpace, [2])
+        XCTAssertEqual(split.onDisabled, [])
+    }
+
+    // a desktop the user turned HyprMac off for: its windows are set apart
+    // from windows on other desktops, so the caller can keep the ones it
+    // parked there
+    func testWindowsOnADisabledDesktopAreSetApart() {
+        let membership: [CGWindowID: Set<UInt64>] = [
+            1: [spaceA],          // the disabled desktop
+            2: [303],             // the other display's enabled desktop
+            3: [spaceA, 303],     // on every desktop: an enabled one still shows it
+            4: [spaceB],          // an inactive desktop
+        ]
+        let split = SpaceManager.classifyWindows([1, 2, 3, 4], activeSpaces: [spaceA, 303],
+                                                 disabledSpaces: [spaceA],
+                                                 spacesForWindow: { membership[$0] ?? [] })
+        XCTAssertEqual(split.onDisabled, [1])
+        XCTAssertEqual(split.offSpace, [4])
     }
 }

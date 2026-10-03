@@ -409,4 +409,15 @@ private struct FailableWindowRule: Decodable {
 struct SavedMonitorConfig: Codable {
     let maxSplitsPerMonitor: [String: Int]?
     let disabledMonitors: [String]?
+    /// Native desktops (macOS Spaces) HyprMac leaves alone, by the window
+    /// server's Space uuid, which survives reboots. Per machine like the
+    /// rest of this file. Absent in files written before it existed.
+    let disabledDesktops: [String]?
+
+    init(maxSplitsPerMonitor: [String: Int]?, disabledMonitors: [String]?,
+         disabledDesktops: [String]? = nil) {
+        self.maxSplitsPerMonitor = maxSplitsPerMonitor
+        self.disabledMonitors = disabledMonitors
+        self.disabledDesktops = disabledDesktops
+    }
 }

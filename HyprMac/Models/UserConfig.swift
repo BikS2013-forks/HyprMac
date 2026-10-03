@@ -59,6 +59,11 @@ class UserConfig: ObservableObject {
     @Published var disabledMonitors: Set<String> {
         didSet { persistRuntimeChange() }
     }
+    /// Native desktops HyprMac leaves alone, by Space uuid. Local to this
+    /// machine (`monitor-config.json`).
+    @Published var disabledDesktops: Set<String> {
+        didSet { persistRuntimeChange() }
+    }
     @Published var showFocusBorder: Bool {
         didSet { persistRuntimeChange() }
     }
@@ -240,6 +245,7 @@ class UserConfig: ObservableObject {
         let resolved = ConfigMigration.resolveMonitorConfig(local: monitorConfig, embedded: savedConfig)
         self.maxSplitsPerMonitor = resolved.maxSplits
         self.disabledMonitors = resolved.disabled
+        self.disabledDesktops = Set(monitorConfig?.disabledDesktops ?? [])
 
         if iCloudSyncEnabled {
             store.ensureICloudSymlinkIntegrity(snapshot: { [weak self] in self?.makeSavedConfig() ?? .empty })
@@ -248,7 +254,8 @@ class UserConfig: ObservableObject {
         if resolved.needsLocalWrite {
             store.writeSavedMonitorConfig(SavedMonitorConfig(
                 maxSplitsPerMonitor: resolved.maxSplits,
-                disabledMonitors: Array(resolved.disabled)))
+                disabledMonitors: Array(resolved.disabled),
+                disabledDesktops: Array(disabledDesktops)))
         }
 
         store.onFileChanged = { [weak self] in self?.reloadFromDisk() }
@@ -294,7 +301,8 @@ class UserConfig: ObservableObject {
         store.writeSavedConfig(makeSavedConfig())
         store.writeSavedMonitorConfig(SavedMonitorConfig(
             maxSplitsPerMonitor: maxSplitsPerMonitor,
-            disabledMonitors: Array(disabledMonitors)))
+            disabledMonitors: Array(disabledMonitors),
+            disabledDesktops: Array(disabledDesktops)))
     }
 
     private func persistRuntimeChange() {
@@ -350,6 +358,7 @@ class UserConfig: ObservableObject {
         overlayAppearance = UserConfigDefaults.overlayAppearance
         maxSplitsPerMonitor = [:]
         disabledMonitors = []
+        disabledDesktops = []
         showFocusBorder = UserConfigDefaults.showFocusBorder
         focusBorderColorHex = nil
         floatingBorderColorHex = nil
@@ -466,6 +475,7 @@ class UserConfig: ObservableObject {
         if let mc = store.loadSavedMonitorConfig() {
             maxSplitsPerMonitor = mc.maxSplitsPerMonitor ?? [:]
             disabledMonitors = Set(mc.disabledMonitors ?? [])
+            disabledDesktops = Set(mc.disabledDesktops ?? [])
         }
         // else keep current values — don't overwrite with synced defaults
 

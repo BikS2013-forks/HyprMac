@@ -749,13 +749,14 @@ final class WorkspaceOrchestrator {
     /// frame is carried onto the workspace's display, then either placed
     /// there or, when the workspace is hidden, saved for the reveal while
     /// the window parks.
-    func placePinnedFloater(_ window: HyprWindow, onWorkspace workspace: Int, fromWorkspace source: Int?) {
+    func placePinnedFloater(_ window: HyprWindow, onWorkspace workspace: Int, fromWorkspace source: Int?,
+                            reason: String = "window rule") {
         guard let home = workspaceManager.homeScreenForWorkspace(workspace) else { return }
         let id = window.windowID
         let parked = source.map { !workspaceManager.isWorkspaceVisible($0) } ?? false
         let start = parked ? workspaceManager.savedFloatingFrame(for: id) : window.frame
         let targetVisible = workspaceManager.isWorkspaceVisible(workspace)
-        hyprLog(.notice, .workspace, "window rule: floater '\(window.title ?? "?")' (\(id)) → ws\(workspace)"
+        hyprLog(.notice, .workspace, "\(reason): floater '\(window.title ?? "?")' (\(id)) → ws\(workspace)"
                 + " visible=\(targetVisible) parked=\(parked)")
         guard let start else {
             // nothing known to carry: park it, and the reveal leaves it where it is
@@ -767,7 +768,7 @@ final class WorkspaceOrchestrator {
         let carried = Self.carriedFloaterFrame(start, from: sourceRect, to: displayManager.cgRect(for: home))
         if targetVisible {
             workspaceManager.clearSavedFloatingFrame(for: id)
-            window.placeFloating(carried, reason: "window rule", on: home, from: start,
+            window.placeFloating(carried, reason: reason, on: home, from: start,
                                  displayManager: displayManager)
         } else {
             workspaceManager.setSavedFloatingFrame(carried, for: id)

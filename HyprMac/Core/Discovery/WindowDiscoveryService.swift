@@ -136,6 +136,11 @@ final class WindowDiscoveryService {
     static let interruptionCap: TimeInterval = 12 * 60 * 60
     /// injected so tests can move past the cap
     var now: () -> Date = { Date() }
+    /// Of the given ids, the windows that live on a native desktop HyprMac
+    /// is not managing right now: an inactive desktop, or one the user
+    /// disabled. Wired by `WindowManager` to the window server. Each desktop
+    /// has its own trees, so such a window holds no tile slot here.
+    var offManagedDesktop: ([CGWindowID]) -> Set<CGWindowID> = { _ in [] }
 
     private static let interruptionSpans: [String: (reason: String, begins: Bool)] = [
         "com.apple.screenIsLocked": ("locked", true),
@@ -240,6 +245,20 @@ final class WindowDiscoveryService {
         return true
     }
 
+    /// Drop the reservation of hidden windows that live on another desktop,
+    /// including ones reserved before per-desktop trees existed or before the
+    /// user switched desktops. Their slot is in their own desktop's tree;
+    /// counting them here filled this desktop's workspace with windows that
+    /// are not on it.
+    private func releaseOtherDesktopReservations() {
+        guard !stateCache.reservedHiddenWindowIDs.isEmpty else { return }
+        let released = offManagedDesktop(Array(stateCache.reservedHiddenWindowIDs))
+        guard !released.isEmpty else { return }
+        stateCache.reservedHiddenWindowIDs.subtract(released)
+        for id in released { unverifiedReservedIDs.removeValue(forKey: id) }
+        hyprLog(.notice, .discovery, "released tile slots of windows on another desktop: \(released.sorted())")
+    }
+
     /// Testable entry point. Pure with respect to AX and `NSWorkspace`:
     /// the caller supplies the snapshot and running-pid set, and this
     /// method does the diff and mutates the cache.
@@ -281,6 +300,7 @@ final class WindowDiscoveryService {
         massGoneSkips = 0
 
         reverifyUnresolvedReservations(currentIDs: currentIDs, runningPIDs: runningPIDs)
+        releaseOtherDesktopReservations()
 
         var newWindows: [HyprWindow] = []
         var newOnDisabled: Set<CGWindowID> = []
@@ -346,6 +366,7 @@ final class WindowDiscoveryService {
 
         // gone
         let gone = stateCache.knownWindowIDs.subtracting(currentIDs)
+        let onOtherDesktop = gone.isEmpty ? [] : offManagedDesktop(Array(gone))
         for id in gone {
             goneIDs.insert(id)
             // startup and Retile All register windows without a discovery
@@ -375,7 +396,9 @@ final class WindowDiscoveryService {
                 // reserves too — the safe side — but gets re-checked next cycle
                 // so a close isn't reserved forever.
                 let state = accessibility.hiddenWindowState(windowID: id, pid: pid)
-                if state != .absent {
+                // a window on another desktop is not closed, but its slot is
+                // in that desktop's tree, not this one's
+                if state != .absent && !onOtherDesktop.contains(id) {
                     stateCache.reservedHiddenWindowIDs.insert(id)
                     if state == nil { unverifiedReservedIDs[id] = 0 }
                 }
@@ -383,7 +406,9 @@ final class WindowDiscoveryService {
                     userHiddenIDs.insert(id)
                 }
                 let bundle = bundleIDForPID(pid) ?? "pid \(pid)"
-                if workspaceManager.isWindowVisible(id) {
+                if onOtherDesktop.contains(id) {
+                    hyprLog(.notice, .discovery, "window hidden (other desktop, no slot held): \(id) (\(bundle))")
+                } else if workspaceManager.isWindowVisible(id) {
                     hyprLog(.notice, .discovery, "window hidden: \(id) (\(bundle))")
                 } else {
                     hyprLog(.notice, .discovery, "window hidden (inactive ws): \(id) (\(bundle))")

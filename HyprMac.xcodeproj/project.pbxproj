@@ -133,6 +133,7 @@
 		6D69BEB2961B224657725D8A /* WelcomeContent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9EBC04818743A6F6231119AB /* WelcomeContent.swift */; };
 		6FDB52DF012B387B6593B42B /* KeyRecorderView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F397ECC53628484AA2EBD5A2 /* KeyRecorderView.swift */; };
 		6FFE4657B9BBBA48D441970F /* AXFrameWriteBatch.swift in Sources */ = {isa = PBXBuildFile; fileRef = F128E4713D085AE80F3D5B0A /* AXFrameWriteBatch.swift */; };
+		733E69FAEB42225FA5D2AD7A /* DesktopToggleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 26FC93B6A0FB24D0BB5D538F /* DesktopToggleTests.swift */; };
 		74EB88ADC96D2ACBC690C836 /* DimmingOverlayTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 556C506B51F8050F6F5E22A4 /* DimmingOverlayTests.swift */; };
 		75A6492EE898E858F5764C4D /* AppLauncherEditorSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = C6D1C99A7D03B871E0141DF0 /* AppLauncherEditorSheet.swift */; };
 		75E78E043A1A84C4342F6D2D /* DestroyRecheck.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2BA2DB7604ABD064933A5F4C /* DestroyRecheck.swift */; };
@@ -338,6 +339,7 @@
 		23F311BB92C52C2C1C3195E9 /* TiledDriftMonitorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TiledDriftMonitorTests.swift; sourceTree = "<group>"; };
 		24E5597A91D2868D1D6DA3AD /* RetileAllPlannerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RetileAllPlannerTests.swift; sourceTree = "<group>"; };
 		26E5C6E3F03B5BD56771D741 /* DwindleLayoutTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DwindleLayoutTests.swift; sourceTree = "<group>"; };
+		26FC93B6A0FB24D0BB5D538F /* DesktopToggleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesktopToggleTests.swift; sourceTree = "<group>"; };
 		2796ACDEF732F4AB5C0EC77C /* BSPTreeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BSPTreeTests.swift; sourceTree = "<group>"; };
 		27E1D4391AFE7A5802FF00C4 /* ConfigUpdateCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigUpdateCoordinatorTests.swift; sourceTree = "<group>"; };
 		298318CA91C080E2C130A4DE /* LayoutEngineTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LayoutEngineTests.swift; sourceTree = "<group>"; };
@@ -733,6 +735,7 @@
 				92C350B5FCD0242E1993F822 /* DebugLogFileTests.swift */,
 				3D2582F695A3916C54FD33B6 /* DedicatedReturnTests.swift */,
 				6B23E3313247FD77173D35DD /* DefaultKeybindsTests.swift */,
+				26FC93B6A0FB24D0BB5D538F /* DesktopToggleTests.swift */,
 				728568405C25B4DD6E5EDD9B /* DestroyRecheckTests.swift */,
 				556C506B51F8050F6F5E22A4 /* DimmingOverlayTests.swift */,
 				2D4C2638F2735ACBB733C2C4 /* DirectionalFocusGeometryTests.swift */,
@@ -1223,6 +1226,7 @@
 				9A7B1CB7BE53FAD102B90AE5 /* DebugLogFileTests.swift in Sources */,
 				A17CC2C4886105610316472E /* DedicatedReturnTests.swift in Sources */,
 				2A235468195A778CCCA51C70 /* DefaultKeybindsTests.swift in Sources */,
+				733E69FAEB42225FA5D2AD7A /* DesktopToggleTests.swift in Sources */,
 				27A937379F4BEF149A4F626F /* DestroyRecheckTests.swift in Sources */,
 				74EB88ADC96D2ACBC690C836 /* DimmingOverlayTests.swift in Sources */,
 				B1ACB629A1DDE243422217A9 /* DirectionalFocusGeometryTests.swift in Sources */,

@@ -29,6 +29,9 @@ struct MenuBarView: View {
         .padding(HyprSpacing.md)
         .frame(width: 320)
         .background(Color.hyprBackground)
+        .onAppear {
+            NotificationCenter.default.post(name: .hyprMacMenuWillOpen, object: nil)
+        }
     }
 
     // MARK: header
@@ -138,6 +141,15 @@ struct MenuBarView: View {
             MenuBarRow("Tutorial", icon: "sparkles") {
                 appDelegate.showTour()
             }
+            MenuBarRow(menuBarState.currentDesktopDisabled
+                       ? "Turn HyprMac on for this desktop" : "Turn HyprMac off for this desktop",
+                       icon: "rectangle.slash") {
+                NotificationCenter.default.post(name: .hyprMacToggleDesktopTiling, object: nil)
+            } trailing: {
+                if let binding = config.keybinds.first(where: { $0.action == .toggleDesktopTiling }) {
+                    KeybadgeView(bind: binding, fontSize: 11)
+                }
+            }
             MenuBarRow("Retile all spaces", icon: "rectangle.3.group") {
                 NotificationCenter.default.post(name: .hyprMacRetileAll, object: nil)
             } trailing: {
@@ -243,6 +255,8 @@ class MenuBarState: ObservableObject {
     @Published var scratchpadCount = 0
     /// Whether the scratchpad layer is currently summoned (filled tray).
     @Published var scratchpadVisible = false
+    /// Whether HyprMac is off for the desktop under the cursor.
+    @Published var currentDesktopDisabled = false
 }
 
 struct MenuBarMonitorSnapshot: Equatable, Identifiable {
@@ -341,6 +355,8 @@ struct WorkspaceIndicatorLabel: View {
 
 extension Notification.Name {
     static let hyprMacRetileAll = Notification.Name("hyprMacRetileAll")
+    static let hyprMacToggleDesktopTiling = Notification.Name("hyprMacToggleDesktopTiling")
+    static let hyprMacMenuWillOpen = Notification.Name("hyprMacMenuWillOpen")
     static let hyprMacWorkspaceChanged = Notification.Name("hyprMacWorkspaceChanged")
     // posted once per dispatched hotkey action; Tour's try-it hint observes it
     static let hyprMacActionDispatched = Notification.Name("hyprMacActionDispatched")

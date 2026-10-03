@@ -23,6 +23,10 @@ final class FocusStateController {
     /// focus or FFM). `0` means "no specific intent" — used as a sentinel
     /// before initial state is established or after focus is cleared.
     private(set) var lastFocusedID: CGWindowID = 0
+    /// The focus intent before `lastFocusedID`. A new window can take focus
+    /// before discovery assigns it; this still names the window the user was
+    /// in when it opened.
+    private(set) var previousFocusedID: CGWindowID = 0
     private(set) var generation: UInt64 = 0
 
     /// Pass-through to `FocusBorder.trackedWindowID`. Lets callers read
@@ -45,6 +49,7 @@ final class FocusStateController {
     func recordFocus(_ id: CGWindowID, reason: String) {
         guard lastFocusedID != id else { return }
         let prev = lastFocusedID
+        if prev != 0 { previousFocusedID = prev }
         lastFocusedID = id
         generation &+= 1
         hyprLog(.debug, .focus, "focus \(prev) → \(id) (\(reason))")

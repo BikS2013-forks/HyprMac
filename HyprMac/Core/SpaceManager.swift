@@ -129,6 +129,9 @@ class SpaceManager {
         /// "Displays have separate Spaces" is off.
         let currentByDisplay: [String: CGSSpaceID]
         let allSpaces: Set<CGSSpaceID>
+        /// Each Space's uuid. Space ids are reassigned across logins; the
+        /// uuid is what a saved per-desktop setting keys on.
+        var uuidBySpace: [CGSSpaceID: String] = [:]
     }
 
     func activeSpaces() -> ActiveSpaces? {
@@ -142,16 +145,19 @@ class SpaceManager {
 
         var current: [String: CGSSpaceID] = [:]
         var all: Set<CGSSpaceID> = []
+        var uuids: [CGSSpaceID: String] = [:]
         for display in displaySpaces {
             guard let displayID = display["Display Identifier"] as? String else { continue }
             if let active = display["Current Space"] as? [String: Any], let sid = spaceID(active) {
                 current[displayID] = sid
             }
             for space in display["Spaces"] as? [[String: Any]] ?? [] {
-                if let sid = spaceID(space) { all.insert(sid) }
+                guard let sid = spaceID(space) else { continue }
+                all.insert(sid)
+                if let uuid = space["uuid"] as? String, !uuid.isEmpty { uuids[sid] = uuid }
             }
         }
-        return ActiveSpaces(currentByDisplay: current, allSpaces: all)
+        return ActiveSpaces(currentByDisplay: current, allSpaces: all, uuidBySpace: uuids)
     }
 
     /// Every native Space `windowID` belongs to. Empty when the window
@@ -164,22 +170,39 @@ class SpaceManager {
         return Set(spaces.map { $0.uint64Value })
     }
 
-    /// Of `windowIDs`, the ones whose every Space is inactive — windows on
-    /// another desktop. A window with no reported Space, or on a Space that
-    /// is active on any display, is kept. Empty when CGS does not answer.
-    func offSpaceWindowIDs(_ windowIDs: [CGWindowID]) -> Set<CGWindowID> {
-        guard let active = activeSpaces() else { return [] }
-        return Self.offSpaceWindowIDs(windowIDs, activeSpaces: Set(active.currentByDisplay.values),
-                                      spacesForWindow: spaces(forWindow:))
+    /// Of `windowIDs`, the ones on no active desktop (`offSpace`) and the
+    /// ones whose active desktops are all ones the user disabled
+    /// (`onDisabled`, by uuid). A window with no reported Space is in
+    /// neither. Both empty when CGS does not answer.
+    func classifyWindows(_ windowIDs: [CGWindowID], disabledDesktops: Set<String>)
+        -> (offSpace: Set<CGWindowID>, onDisabled: Set<CGWindowID>) {
+        guard let active = activeSpaces() else { return ([], []) }
+        let current = Set(active.currentByDisplay.values)
+        let disabled = current.filter { space in
+            active.uuidBySpace[space].map(disabledDesktops.contains) ?? false
+        }
+        return Self.classifyWindows(windowIDs, activeSpaces: current, disabledSpaces: disabled,
+                                    spacesForWindow: spaces(forWindow:))
     }
 
-    /// The pure half of `offSpaceWindowIDs`.
-    static func offSpaceWindowIDs(_ windowIDs: [CGWindowID], activeSpaces: Set<CGSSpaceID>,
-                                  spacesForWindow: (CGWindowID) -> Set<CGSSpaceID>) -> Set<CGWindowID> {
-        Set(windowIDs.filter { id in
+    /// The pure half of `classifyWindows`.
+    static func classifyWindows(_ windowIDs: [CGWindowID], activeSpaces: Set<CGSSpaceID>,
+                                disabledSpaces: Set<CGSSpaceID>,
+                                spacesForWindow: (CGWindowID) -> Set<CGSSpaceID>)
+        -> (offSpace: Set<CGWindowID>, onDisabled: Set<CGWindowID>) {
+        var offSpace: Set<CGWindowID> = []
+        var onDisabled: Set<CGWindowID> = []
+        for id in windowIDs {
             let spaces = spacesForWindow(id)
-            return !spaces.isEmpty && spaces.isDisjoint(with: activeSpaces)
-        })
+            guard !spaces.isEmpty else { continue }
+            let activeHere = spaces.intersection(activeSpaces)
+            if activeHere.isEmpty {
+                offSpace.insert(id)
+            } else if activeHere.isSubset(of: disabledSpaces) {
+                onDisabled.insert(id)
+            }
+        }
+        return (offSpace, onDisabled)
     }
 
     /// Display UUID the window server uses for `screen`, matching the

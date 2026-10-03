@@ -45,6 +45,7 @@ final class KeybindEditorViewModel: ObservableObject {
         case moveToScratchpad       = "Send to Scratchpad"
         case resizeDirection        = "Resize Direction"
         case toggleTiling           = "Pause / Resume Tiling"
+        case toggleDesktopTiling    = "Disable / Enable on This Desktop"
         case runCommand             = "Run a command"
         case saveLayout             = "Save Layout"
         case restoreLayout          = "Restore Layout"
@@ -90,6 +91,7 @@ final class KeybindEditorViewModel: ObservableObject {
         case .moveToScratchpad:              selectedAction = .moveToScratchpad
         case .resizeDirection(let d):        selectedAction = .resizeDirection;       directionParam = d
         case .toggleTiling:                  selectedAction = .toggleTiling
+        case .toggleDesktopTiling:           selectedAction = .toggleDesktopTiling
         case .runCommand(let label, let cmd):
             selectedAction = .runCommand
             commandLabelParam = label
@@ -128,6 +130,7 @@ final class KeybindEditorViewModel: ObservableObject {
         case .moveToScratchpad:       action = .moveToScratchpad
         case .resizeDirection:        action = .resizeDirection(directionParam)
         case .toggleTiling:           action = .toggleTiling
+        case .toggleDesktopTiling:    action = .toggleDesktopTiling
         case .runCommand:
             action = .runCommand(
                 label: commandLabelParam.trimmingCharacters(in: .whitespaces),

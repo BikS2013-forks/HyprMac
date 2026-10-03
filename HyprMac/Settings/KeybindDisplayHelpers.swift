@@ -80,6 +80,8 @@ extension Keybind {
             return "arrow.up.left.and.arrow.down.right"
         case .toggleTiling:
             return "pause.circle"
+        case .toggleDesktopTiling:
+            return "rectangle.slash"
         case .runCommand:
             return "terminal"
         case .saveLayout:
@@ -124,6 +126,7 @@ extension Keybind {
         case .moveToScratchpad:             return "Send to Scratchpad"
         case .resizeDirection(let d):       return "Resize \(d.rawValue.capitalized)"
         case .toggleTiling:                 return "Pause / Resume Tiling"
+        case .toggleDesktopTiling:          return "Disable / Enable on This Desktop"
         case .runCommand(let label, let cmd): return Keybind.commandDescription(label: label, command: cmd)
         case .saveLayout:                   return "Save Layout"
         case .restoreLayout:                return "Restore Layout"

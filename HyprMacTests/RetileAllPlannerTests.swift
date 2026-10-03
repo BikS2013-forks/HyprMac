@@ -425,4 +425,32 @@ final class RetileAllPlannerTests: XCTestCase {
         XCTAssertTrue(RetileAllPlanner.shouldRemainFloating(isAutoFloat: true, isOnDisabledMonitor: false))
         XCTAssertFalse(RetileAllPlanner.shouldRemainFloating(isAutoFloat: false, isOnDisabledMonitor: false))
     }
+
+    // a new window offered only the workspace showing where it was opened:
+    // when that workspace is full it is overflow there, not an arrival on the
+    // next workspace on another display. the dispatcher floats it in place.
+    func testAFullWorkspaceWithNoSpillLeavesTheNewcomerAsOverflowThere() {
+        let plan = RetileAllPlanner.admit(
+            windowIDs: [9],
+            preferredWorkspace: 1,
+            eligibleWorkspaces: [1],
+            existingAssignments: [1: Set(1...8), 2: [20]],
+            excludedWindowIDs: [],
+            capacityForWorkspace: { _ in 8 })
+        XCTAssertEqual(plan.overflow, [9])
+        XCTAssertEqual(plan.assignments[1], [9], "it stays on its own workspace")
+        XCTAssertNil(plan.assignments[2])
+    }
+
+    func testWithSpillTheSameNewcomerMovesToTheNextWorkspace() {
+        let plan = RetileAllPlanner.admit(
+            windowIDs: [9],
+            preferredWorkspace: 1,
+            eligibleWorkspaces: [1, 2],
+            existingAssignments: [1: Set(1...8), 2: [20]],
+            excludedWindowIDs: [],
+            capacityForWorkspace: { _ in 8 })
+        XCTAssertEqual(plan.overflow, [])
+        XCTAssertEqual(plan.assignments[2], [9])
+    }
 }

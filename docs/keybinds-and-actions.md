@@ -30,6 +30,7 @@ enum Action: Equatable {
     case toggleScratchpad
     case moveToScratchpad
     case toggleTiling
+    case toggleDesktopTiling
     case runCommand(label: String, command: String)
     case saveLayout
     case restoreLayout
@@ -82,6 +83,30 @@ Custom and conflicting bindings survive unchanged. Startup/reload migration is
 idempotent and is persisted on the next normal settings save; no schema-version
 flag is added. An explicitly chosen binding identical to a legacy default cannot
 be distinguished from that default.
+
+## Disable a desktop
+
+`toggleDesktopTiling` defaults to Hypr+Shift+P and encodes as
+`{"toggleDesktopTiling":{}}`. Like `toggleTiling` it is handled by
+`WindowManager` before dispatch, so it runs on a disabled desktop. It flips
+the cursor screen's current desktop in `config.disabledDesktops`. See
+"Native Spaces" in `docs/architecture.md`.
+
+## New windows follow the window they came from
+
+`ActionDispatcher.assignNewWindows` assigns a new window to the workspace
+showing on the display of `initiatorScreen`: the screen of
+`focusController.lastFocusedID`, or of `previousFocusedID` when the new
+window already took focus. macOS does not report which window opened
+another, so focus at that moment stands in for it. When that window is
+unknown, hidden, or on a workspace not showing, the window keeps the display
+it opened on, as before. Window-rule pins still win. A tiled newcomer is
+moved by its tree; a floater is carried with `placePinnedFloater`. When that
+workspace is already full (`RetileAllPlanner.workspaceCapacity`), the window
+floats where it opened (`floatInPlace`, log `workspace wsN full: new window
+floats`) instead of spilling to the next workspace, which could be on another
+display. Windows of pinned apps still spill. Log:
+`new window … joining <screen>, where the window it was opened from is`.
 
 ## Flip workspace
 

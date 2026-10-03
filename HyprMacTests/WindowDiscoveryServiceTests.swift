@@ -384,6 +384,41 @@ final class WindowDiscoveryServiceTests: XCTestCase {
         XCTAssertTrue(cache.reservedHiddenWindowIDs.contains(12))
     }
 
+    // each native desktop has its own trees. a window the window server puts
+    // on another desktop keeps its workspace but holds no slot on this one:
+    // counted here, five such windows filled the desktop's workspace and a new
+    // mail window spilled to the laptop (2026-10-03 19:35:07).
+    func testWindowOnAnotherDesktopKeepsItsWorkspaceButHoldsNoSlot() {
+        let access = StubAccessibility()
+        access.stateAnswer = .present
+        let (svc, cache, _) = makeService(accessibility: access)
+        svc.offManagedDesktop = { ids in Set(ids.filter { $0 == 13 }) }
+        cache.knownWindowIDs = [13, 14]
+        cache.windowOwners[13] = 8300
+        cache.windowOwners[14] = 8300
+
+        _ = compute(svc, snapshot: [], runningPIDs: [8300])
+
+        XCTAssertTrue(cache.hiddenWindowIDs.isSuperset(of: [13, 14]))
+        XCTAssertFalse(cache.reservedHiddenWindowIDs.contains(13), "on another desktop")
+        XCTAssertTrue(cache.reservedHiddenWindowIDs.contains(14), "still listed, desktop unknown")
+    }
+
+    func testAnEarlierReservationIsReleasedOnceTheWindowIsOnAnotherDesktop() {
+        let (svc, cache, _) = makeService()
+        cache.knownWindowIDs = [20]
+        cache.windowOwners[20] = 8400
+        cache.windowOwners[15] = 8400
+        cache.hiddenWindowIDs = [15]
+        cache.reservedHiddenWindowIDs = [15]
+        svc.offManagedDesktop = { ids in Set(ids.filter { $0 == 15 }) }
+
+        _ = compute(svc, snapshot: [makeWindow(id: 20, pid: 8400)], runningPIDs: [8400])
+
+        XCTAssertTrue(cache.hiddenWindowIDs.contains(15), "still hidden, still its workspace's")
+        XCTAssertFalse(cache.reservedHiddenWindowIDs.contains(15))
+    }
+
     func testUnreadableHiddenWindowStopsBeingReQueriedAfterTheBudgetButStaysReserved() {
         let access = StubAccessibility()
         access.stateAnswer = nil

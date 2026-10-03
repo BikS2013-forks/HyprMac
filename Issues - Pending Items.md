@@ -38,6 +38,23 @@
 
 ## Completed
 
+- **2026-10-03 — A full workspace floats new windows instead of spilling.** At capacity, a new
+  (unpinned) window floats on the workspace it was opened on rather than going to the next workspace
+  with room, which could be on the other display. Pinned apps keep spilling. Tests in
+  `RetileAllPlannerTests`.
+
+- **2026-10-03 — New windows spilled to the other display.** All desktops on the monitor share
+  HyprMac workspace 1, and hidden windows on the other desktops still reserved tile slots, so
+  3 visible + 5 reserved filled ws1's capacity of 8 and an Outlook mail window (83869, 19:35:07)
+  went to ws2 on the laptop. Windows on another or disabled desktop no longer reserve a slot.
+  Tests in `WindowDiscoveryServiceTests`.
+
+- **2026-10-03 — Per-desktop off switch and new-window placement.** `toggleDesktopTiling`
+  (Hypr+Shift+P, menu bar row) and new windows joining the initiator's display. Design in
+  `docs/architecture.md` ("Native Spaces") and `docs/keybinds-and-actions.md`. Not yet checked live.
+  Known limits: windows an app opens on its own (e.g. reminders) follow whatever window had focus;
+  a desktop's uuid is what is saved, so recreating a desktop in Mission Control makes a new one.
+
 - **2026-10-03 — Hypr+F (move to dedicated workspace) always rolled back.** Parking the source
   workspace's other windows required their size unchanged, but the parking corner sits on the laptop
   display (949pt usable), which is shorter than the windows, so macOS shrank them and the park was

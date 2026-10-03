@@ -109,6 +109,10 @@ extension Keybind {
         binds.append(Keybind(keyCode: UInt16(kVK_ANSI_P), modifiers: .hypr,
                              action: .toggleTiling))
 
+        // hypr + shift + p: turn HyprMac off or on for the current desktop
+        binds.append(Keybind(keyCode: UInt16(kVK_ANSI_P), modifiers: [.hypr, .shift],
+                             action: .toggleDesktopTiling))
+
         // hypr + f: move focused window to the next empty workspace
         binds.append(Keybind(keyCode: UInt16(kVK_ANSI_F), modifiers: .hypr,
                              action: .moveToNextEmptyWorkspace))

@@ -329,6 +329,24 @@ own AX read.
   desktops' windows; the second live run caught a pass that inserted the
   other desktop's windows into the current tree, which cleared its user
   ratios. Space membership does not change during the animation.
+- **Capacity is per desktop.** A window that vanishes because it is on
+  another (or a disabled) desktop goes hidden and keeps its workspace, but
+  does not reserve a tile slot (`WindowDiscoveryService.offManagedDesktop`).
+  Reservations made earlier are released on each poll. Counted, the other
+  desktops' windows filled the shared workspace's capacity and new windows
+  spilled to the next workspace on another display.
+- **Disabled desktops.** `config.disabledDesktops` (Space uuids, local
+  `monitor-config.json`) lists desktops HyprMac leaves alone. The snapshot
+  filter (`SpaceManager.classifyWindows`) sets their windows apart, and
+  `WindowManager` drops them, except windows assigned to a hidden HyprMac
+  workspace: the global hide corner can sit on a disabled desktop, and
+  losing sight of parked windows would strand them. Turning a desktop off
+  sends its tiled windows to hidden (assignment kept, frames untouched);
+  turning it on brings them back as returns. On a disabled desktop the
+  focus border, brackets and dimming are suppressed
+  (`isFullscreenSuppressed`), and only actions that touch no window run
+  (`WindowManager.runsOnDisabledDesktop`). Toggle: `toggleDesktopTiling`
+  (Hypr+Shift+P) or the menu bar row.
 - The first reading for a screen only records it, so the first switch
   after launch still rebuilds the arriving desktop once.
 - Workspace assignment is unchanged: both desktops' windows share the

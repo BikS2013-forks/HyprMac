@@ -78,7 +78,11 @@ You'll feel at home. The differences are mostly macOS being macOS:
   the window will land before you let go.
 - **Workspaces:** ten of them (keys 1–9 and 0), plus a scratchpad and an overview on
   **Hypr + O**. macOS has no public API for this, so HyprMac keeps its own virtual workspaces and
-  hides the other workspaces' windows when you switch.
+  hides the other workspaces' windows when you switch. A new window joins the workspace beside
+  the window it was opened from, even if macOS put it on another display. When that workspace
+  already holds its maximum of tiles, the new window opens floating instead of moving elsewhere.
+- **macOS desktops:** each desktop keeps its own layout. **Hypr + Shift + P** (or the menu bar)
+  turns HyprMac off for the desktop you are on: its windows are left exactly where you put them.
 - **Hypr + F:** native macOS fullscreen spawns its own Space and wrecks the layout, so HyprMac
   gives the window a dedicated empty workspace on its display instead. Press it again on that
   window to send it back to its old workspace, in the same slot and at the same size.
@@ -119,6 +123,7 @@ Everything below is configurable in Settings → Keys. The full reference lives 
 | `Hypr + S` / `Hypr + Shift + S` | Toggle scratchpad / send window to scratchpad |
 | `Hypr + W` | Close window |
 | `Hypr + P` | Pause or resume tiling |
+| `Hypr + Shift + P` | Turn HyprMac off or on for the current macOS desktop |
 | `Hypr + K` | Show the keybind overlay |
 | `Hypr + O` | Show workspace overview |
 | `Hypr + Ctrl + S` / `Hypr + Ctrl + R` | Save / restore the layout for this display setup |
